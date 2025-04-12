@@ -1,0 +1,22 @@
+[package]
+name = "artemis-light"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+## async
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1.44", features = ["full"] }
+tokio-stream = { version = "0.1", features = ['sync'] }
+jsonrpsee = { version = "0.24", features = ["client", "async-client"] }
+alloy = { git = "https://github.com/alloy-rs/alloy", features = [
+    "full",
+    "node-bindings",
+]}
+## misc
+anyhow = "1.0.97"
+tracing = "0.1.41"
+serde = { version = "1.0.219", features = ["derive"] }
