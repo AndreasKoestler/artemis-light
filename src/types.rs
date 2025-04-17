@@ -64,6 +64,32 @@ where
         Ok(Box::pin(stream))
     }
 }
+/// FilterCollectorMap is a wrapper around a [Collector] that maps outgoing
+/// events to a different type.
+pub struct FilterCollectorMap<E, F> {
+    collector: Box<dyn Collector<E>>,
+    f: F,
+}
+impl<E, F> FilterCollectorMap<E, F> {
+    pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
+        Self { collector, f }
+    }
+}
+
+#[async_trait]
+impl<E1, E2, F> Collector<E2> for FilterCollectorMap<E1, F>
+where
+    E1: Send + Sync + DeserializeOwned + 'static,
+    E2: Send + Sync + DeserializeOwned + 'static,
+    F: Fn(E1) -> Option<E2> + Send + Sync + Clone + 'static,
+{
+    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
+        let stream = self.collector.get_event_stream().await?;
+        let f = self.f.clone();
+        let stream = stream.filter_map(f);
+        Ok(Box::pin(stream))
+    }
+}
 
 /// ExecutorMap is a wrapper around an [Executor] that maps incoming
 /// actions to a different type.
