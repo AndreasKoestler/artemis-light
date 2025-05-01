@@ -10,3 +10,9 @@ pub mod log_collector;
 
 /// This collector listens to a stream of new pending transactions.
 pub mod mempool_collector;
+
+/// This collector listens to a stream of new events.
+pub mod event_collector;
+
+/// This module contains syntax extensions for the `Collector` trait.
+pub mod collector_ext;

@@ -5,6 +5,7 @@ use jsonrpsee::core::DeserializeOwned;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
+use tokio_stream::StreamMap;
 
 use crate::collectors::block_collector::NewBlock;
 
@@ -91,6 +92,46 @@ where
     }
 }
 
+pub struct CollectorMerge<C1, C2> {
+    this: C1,
+    other: C2,
+}
+
+impl<C1, C2> CollectorMerge<C1, C2> {
+    pub fn new(this: C1, other: C2) -> Self {
+        Self { this, other }
+    }
+}
+
+#[async_trait]
+impl<C1, C2, E> Collector<E> for CollectorMerge<C1, C2>
+where
+    C1: Collector<E> + Send + Sync + 'static,
+    C2: Collector<E> + Send + Sync + 'static,
+    E: Send + Sync + DeserializeOwned + 'static,
+{
+    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
+        let this_stream = self.this.get_event_stream().await?;
+        let other_stream = self.other.get_event_stream().await?;
+
+        let merged = Box::pin(this_stream.merge(other_stream)) as CollectorStream<'_, E>;
+        Ok(merged)
+    }
+}
+
+#[async_trait]
+impl<E: 'static, C: Collector<E>> Collector<E> for Vec<Box<C>> {
+    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
+        let mut smap = StreamMap::new();
+        for (id, collector) in self.iter().enumerate() {
+            let stream = collector.get_event_stream().await?;
+            smap.insert(id, stream);
+        }
+        let stream = Box::pin(smap.map(|(_, v)| v)) as CollectorStream<'_, E>;
+        Ok(stream)
+    }
+}
+
 /// ExecutorMap is a wrapper around an [Executor] that maps incoming
 /// actions to a different type.
 pub struct ExecutorMap<A, F> {
@@ -123,7 +164,7 @@ where
 /// Convenience enum containing all the events that can be emitted by collectors.
 pub enum Events {
     NewBlock(NewBlock),
-    Transaction(Transaction),
+    Transaction(Box<Transaction>),
 }
 
 /// Convenience enum containing all the actions that can be executed by executors.

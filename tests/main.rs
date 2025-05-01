@@ -21,9 +21,9 @@ use alloy::node_bindings::{Anvil, AnvilInstance};
 pub async fn spawn_anvil() -> Result<(impl Provider, AnvilInstance)> {
     let anvil = Anvil::new().block_time(1).chain_id(1337).try_spawn()?;
     let rpc_url = anvil.ws_endpoint();
-    println!("RPC URL: {}", rpc_url);
+    println!("RPC URL: {rpc_url}");
     let ws = WsConnect::new(&rpc_url);
-    let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    let provider = ProviderBuilder::new().on_ws(ws).await?;
     Ok((provider, anvil))
 }
 
