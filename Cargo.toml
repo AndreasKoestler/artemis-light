@@ -15,7 +15,7 @@ jsonrpsee = { version = "0.24", features = ["client", "async-client"] }
 alloy = { git = "https://github.com/alloy-rs/alloy", features = [
     "full",
     "node-bindings",
-], tag = "v0.13.0" }
+] }
 ## misc
 anyhow = "1.0.97"
 tracing = "0.1.41"

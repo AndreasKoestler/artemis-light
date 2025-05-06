@@ -7,11 +7,11 @@ use tokio_stream::StreamExt;
 /// A collector that listens for new blockchain event logs based on a [Event],
 /// and generates a stream of events of type `E`.
 pub struct EventCollector<P, E> {
-    event: Event<(), P, E>,
+    event: Event<P, E>,
 }
 
 impl<P, E> EventCollector<P, E> {
-    pub fn new(event: Event<(), P, E>) -> Self {
+    pub fn new(event: Event<P, E>) -> Self {
         Self { event }
     }
 }
