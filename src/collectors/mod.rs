@@ -3,16 +3,22 @@
 //! a stream of new blocks, and turn them into a stream of `NewBlock` events.
 
 /// This collector listens to a stream of new blocks.
-pub mod block_collector;
+mod block_collector;
 
 /// This collector listens to a stream of new event logs.
-pub mod log_collector;
+mod log_collector;
 
 /// This collector listens to a stream of new pending transactions.
-pub mod mempool_collector;
+mod mempool_collector;
 
 /// This collector listens to a stream of new events.
-pub mod event_collector;
+mod event_collector;
 
 /// This module contains syntax extensions for the `Collector` trait.
-pub mod collector_ext;
+mod collector_ext;
+
+pub use block_collector::*;
+pub use collector_ext::*;
+pub use event_collector::*;
+pub use log_collector::*;
+pub use mempool_collector::*;

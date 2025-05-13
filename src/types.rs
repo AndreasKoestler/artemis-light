@@ -7,7 +7,7 @@ use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::StreamMap;
 
-use crate::collectors::block_collector::NewBlock;
+use crate::collectors::NewBlock;
 
 use crate::executors::mempool_executor::SubmitTxToMempool;
 

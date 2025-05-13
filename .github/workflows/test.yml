@@ -1,9 +1,9 @@
 name: Rust CI
 on:
   push:
-    branches: [master]
+    branches: [master, legacy/v0.1.0]
   pull_request:
-    branches: [master]
+    branches: [master, legacy/v0.1.0]
 permissions:
   contents: read
   pages: write

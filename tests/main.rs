@@ -5,7 +5,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder, WsConnect},
 };
 use artemis_light::{
-    collectors::{block_collector::BlockCollector, mempool_collector::MempoolCollector},
+    collectors::{BlockCollector, MempoolCollector},
     executors::mempool_executor::{MempoolExecutor, SubmitTxToMempool},
     types::{Collector, Executor},
 };
