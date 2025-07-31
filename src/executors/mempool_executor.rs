@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::types::Executor;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 
 use alloy::{
@@ -49,7 +49,7 @@ where
             .client
             .estimate_gas(action.tx.clone())
             .await
-            .context("Error estimating gas usage: {}")?;
+            .map_err(|e| anyhow::anyhow!("Error estimating gas usage: {}", e))?;
 
         let bid_gas_price;
         if let Some(gas_bid_info) = action.gas_bid_info {
@@ -64,7 +64,7 @@ where
                 .client
                 .get_gas_price()
                 .await
-                .context("Error getting gas price: {}")?;
+                .map_err(|e| anyhow::anyhow!("Error getting gas price: {}", e))?;
         }
         action.tx.set_gas_price(bid_gas_price);
         let _ = self.client.send_transaction(action.tx).await?;
