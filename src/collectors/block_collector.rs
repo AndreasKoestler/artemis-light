@@ -3,7 +3,6 @@ use alloy::primitives::{BlockHash, U64};
 use alloy::providers::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Deserialize;
 
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -16,7 +15,7 @@ pub struct BlockCollector<M> {
 }
 
 /// A new block event, containing the block number and hash.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct NewBlock {
     pub hash: BlockHash,
     pub number: U64,

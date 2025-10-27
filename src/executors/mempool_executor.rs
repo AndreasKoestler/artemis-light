@@ -8,12 +8,20 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use alloy::{
-    network::TransactionBuilder, providers::Provider, rpc::types::eth::TransactionRequest,
+    network::TransactionBuilder,
+    providers::{PendingTransactionConfig, Provider},
+    rpc::types::eth::TransactionRequest,
 };
 
 /// An executor that sends transactions to the mempool.
 pub struct MempoolExecutor<M> {
     client: Arc<M>,
+}
+
+impl<M: Provider> MempoolExecutor<M> {
+    pub fn new(client: Arc<M>) -> Self {
+        Self { client }
+    }
 }
 
 /// Information about the gas bid for a transaction.
@@ -30,12 +38,7 @@ pub struct GasBidInfo {
 pub struct SubmitTxToMempool {
     pub tx: TransactionRequest,
     pub gas_bid_info: Option<GasBidInfo>,
-}
-
-impl<M: Provider> MempoolExecutor<M> {
-    pub fn new(client: Arc<M>) -> Self {
-        Self { client }
-    }
+    pub pending_tx_sender: Option<tokio::sync::mpsc::Sender<PendingTransactionConfig>>,
 }
 
 #[async_trait]
@@ -44,7 +47,7 @@ where
     M: Provider,
 {
     /// Send a transaction to the mempool.
-    async fn execute(&self, mut action: SubmitTxToMempool) -> Result<()> {
+    async fn execute(&mut self, mut action: SubmitTxToMempool) -> Result<()> {
         let gas_usage = self
             .client
             .estimate_gas(action.tx.clone())
@@ -67,7 +70,18 @@ where
                 .map_err(|e| anyhow::anyhow!("Error getting gas price: {}", e))?;
         }
         action.tx.set_gas_price(bid_gas_price);
-        let _ = self.client.send_transaction(action.tx).await?;
+        let pending_tx = self.client.send_transaction(action.tx).await?;
+
+        if let Some(pending_tx_sender) = action.pending_tx_sender {
+            let sender = pending_tx_sender;
+            let res = sender.send(pending_tx.inner().clone()).await;
+            if let Err(e) = res {
+                tracing::warn!(
+                    "Error sending pending transaction config [hash]: {:?}",
+                    e.0.tx_hash()
+                );
+            }
+        }
         Ok(())
     }
 }

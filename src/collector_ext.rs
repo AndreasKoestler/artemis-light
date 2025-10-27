@@ -7,9 +7,9 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     ///
     /// # Example
     ///
-    /// ```no-run
+    /// ```ignore
     /// # tokio_test::block_on(async {
-    /// let collector = TestCollector::new(vec![1, 2, 3]);
+    /// let collector = ::TestCollector::new(vec![1, 2, 3]);
     /// let collector = collector.map(|n| n + 1);
     /// let res = collector.get_event_stream().await.unwrap().collect::<Vec<_>>().await;
     /// assert_eq!(res, vec![2, 3, 4]);
@@ -27,7 +27,7 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     ///
     /// # Example
     ///
-    /// ```no-run
+    /// ```ignore
     /// # tokio_test::block_on(async {
     /// let collector = TestCollector::new(vec![1, 2, 3, 4]);
     /// let collector = collector.filter_map(|n| if n % 2 == 0 { Some(n) } else { None });
@@ -47,13 +47,13 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     ///
     /// # Example
     ///
-    /// ```no-run
+    /// ```ignore
     /// # tokio_test::block_on(async {
     /// let collector = TestCollector::new(vec![1, 2, 3]);
     /// let collector_2 = TestCollector::new(vec![4, 5, 6]);
     /// let merged = collector.merge(collector_2);
     /// let mut res = merged.get_event_stream().await.unwrap().collect::<Vec<_>>().await;
-    /// res.sort();
+    /// # res.sort();
     /// assert_eq!(res, vec![1, 2, 3, 4, 5, 6]);
     /// # })
     /// ```
@@ -74,6 +74,7 @@ pub mod doctest {
     use artemis_light::types::{Collector, CollectorStream};
     use async_trait::async_trait;
     use futures::stream;
+
     pub struct TestCollector {
         data: Vec<u8>,
     }

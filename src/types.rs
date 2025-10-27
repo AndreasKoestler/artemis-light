@@ -9,7 +9,7 @@ use tokio_stream::StreamMap;
 
 use crate::collectors::NewBlock;
 
-use crate::executors::mempool_executor::SubmitTxToMempool;
+use crate::executors::SubmitTxToMempool;
 
 /// A stream of events emitted by a [Collector].
 pub type CollectorStream<'a, E> = Pin<Box<dyn Stream<Item = E> + Send + 'a>>;
@@ -28,6 +28,7 @@ pub trait Strategy<E, A>: Send + Sync {
     /// onchain data.
     async fn sync_state(&mut self) -> Result<()>;
 
+    /// AWK: We probably want to return a Result here, too.
     /// Process an event, and return an action if needed.
     async fn process_event(&mut self, event: E) -> Vec<A>;
 }
@@ -36,7 +37,7 @@ pub trait Strategy<E, A>: Send + Sync {
 #[async_trait]
 pub trait Executor<A>: Send + Sync {
     /// Execute an action.
-    async fn execute(&self, action: A) -> Result<()>;
+    async fn execute(&mut self, action: A) -> Result<()>;
 }
 
 /// CollectorMap is a wrapper around a [Collector] that maps outgoing
@@ -54,8 +55,8 @@ impl<E, F> CollectorMap<E, F> {
 #[async_trait]
 impl<E1, E2, F> Collector<E2> for CollectorMap<E1, F>
 where
-    E1: Send + Sync + DeserializeOwned + 'static,
-    E2: Send + Sync + DeserializeOwned + 'static,
+    E1: Send + Sync + 'static,
+    E2: Send + Sync + 'static,
     F: Fn(E1) -> E2 + Send + Sync + Clone + 'static,
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
@@ -80,8 +81,8 @@ impl<E, F> FilterCollectorMap<E, F> {
 #[async_trait]
 impl<E1, E2, F> Collector<E2> for FilterCollectorMap<E1, F>
 where
-    E1: Send + Sync + DeserializeOwned + 'static,
-    E2: Send + Sync + DeserializeOwned + 'static,
+    E1: Send + Sync + 'static,
+    E2: Send + Sync + 'static,
     F: Fn(E1) -> Option<E2> + Send + Sync + Clone + 'static,
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
@@ -113,7 +114,6 @@ where
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
         let this_stream = self.this.get_event_stream().await?;
         let other_stream = self.other.get_event_stream().await?;
-
         let merged = Box::pin(this_stream.merge(other_stream)) as CollectorStream<'_, E>;
         Ok(merged)
     }
@@ -131,28 +131,28 @@ impl<E: 'static, C: Collector<E>> Collector<E> for Vec<Box<C>> {
         Ok(stream)
     }
 }
-
 /// ExecutorMap is a wrapper around an [Executor] that maps incoming
 /// actions to a different type.
-pub struct ExecutorMap<A, F> {
-    executor: Box<dyn Executor<A>>,
+pub struct ExecutorFilterMap<E, F> {
+    executor: E,
     f: F,
 }
 
-impl<A, F> ExecutorMap<A, F> {
-    pub fn new(executor: Box<dyn Executor<A>>, f: F) -> Self {
+impl<E, F> ExecutorFilterMap<E, F> {
+    pub fn new(executor: E, f: F) -> Self {
         Self { executor, f }
     }
 }
 
 #[async_trait]
-impl<A1, A2, F> Executor<A1> for ExecutorMap<A2, F>
+impl<A1, A2, E, F> Executor<A1> for ExecutorFilterMap<E, F>
 where
+    E: Executor<A2> + Send + Sync + 'static,
+    F: Fn(A1) -> Option<A2> + Send + Sync + Clone + 'static,
     A1: Send + Sync + 'static,
     A2: Send + Sync + 'static,
-    F: Fn(A1) -> Option<A2> + Send + Sync + Clone + 'static,
 {
-    async fn execute(&self, action: A1) -> Result<()> {
+    async fn execute(&mut self, action: A1) -> Result<()> {
         let action = (self.f)(action);
         match action {
             Some(action) => self.executor.execute(action).await,
@@ -171,4 +171,11 @@ pub enum Events {
 pub enum Actions {
     //    FlashbotsBundle(FlashbotsBundle),
     SubmitTxToMempool(SubmitTxToMempool),
+}
+
+pub trait Metrics<S> {
+    fn collect_metrics(
+        &self,
+        state: &S,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 }

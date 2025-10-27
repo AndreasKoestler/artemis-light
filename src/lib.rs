@@ -34,3 +34,13 @@ pub mod engine;
 pub mod executors;
 /// This module contains the core type definitions for Artemis.
 pub mod types;
+
+/// This module contains syntax extensions for the `Collector` trait.
+pub mod collector_ext;
+// pub use collector_ext::*;
+
+mod executor_ext;
+pub use executor_ext::*;
+
+mod strategy_ext;
+pub use strategy_ext::*;

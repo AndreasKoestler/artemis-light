@@ -3,4 +3,6 @@
 //! `SubmitTx` action and submit it to the mempool.
 
 /// This executor submits transactions to the public mempool.
-pub mod mempool_executor;
+mod mempool_executor;
+
+pub use mempool_executor::*;

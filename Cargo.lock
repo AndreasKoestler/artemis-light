@@ -945,7 +945,6 @@ dependencies = [
  "async-trait",
  "futures",
  "jsonrpsee",
- "serde",
  "tokio",
  "tokio-stream",
  "tracing",

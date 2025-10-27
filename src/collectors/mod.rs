@@ -14,11 +14,7 @@ mod mempool_collector;
 /// This collector listens to a stream of new events.
 mod event_collector;
 
-/// This module contains syntax extensions for the `Collector` trait.
-mod collector_ext;
-
 pub use block_collector::*;
-pub use collector_ext::*;
 pub use event_collector::*;
 pub use log_collector::*;
 pub use mempool_collector::*;
