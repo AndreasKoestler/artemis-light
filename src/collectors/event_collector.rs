@@ -24,7 +24,7 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
-        let stream = self.event.watch().await?.into_stream();
+        let stream = self.event.subscribe().await?.into_stream();
         let stream = stream.filter_map(|el| el.map(|(e, _)| e).ok());
         Ok(Box::pin(stream))
     }
