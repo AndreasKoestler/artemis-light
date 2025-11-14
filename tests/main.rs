@@ -7,7 +7,7 @@ use alloy::{
 use artemis_light::{
     collectors::{BlockCollector, MempoolCollector},
     executors::{MempoolExecutor, SubmitTxToMempool},
-    types::{Collector, Executor},
+    types::{ActionStream, Collector, Executor},
 };
 
 use alloy::rpc::types::eth::TransactionRequest;
@@ -93,7 +93,6 @@ async fn test_mempool_executor_sends_tx_simple() {
     let action = SubmitTxToMempool {
         tx,
         gas_bid_info: None,
-        pending_tx_sender: None,
     };
     mempool_executor.execute(action).await.unwrap();
     //Sleep to seconds so that the tx has time to be mined
@@ -166,7 +165,10 @@ async fn test_complete_flow() {
             Ok(())
         }
 
-        async fn process_event(&mut self, event: NumberEvent) -> Vec<NumberAction> {
+        async fn process_event(
+            &mut self,
+            event: NumberEvent,
+        ) -> anyhow::Result<ActionStream<'_, NumberAction>> {
             let number = event.0;
             let (tx, rx) = oneshot::channel();
 
@@ -201,10 +203,10 @@ async fn test_complete_flow() {
                 });
             });
 
-            vec![NumberAction {
+            Ok(Box::pin(futures::stream::iter(vec![NumberAction {
                 number,
                 response_tx: tx,
-            }]
+            }])))
         }
     }
 
@@ -244,8 +246,8 @@ async fn test_complete_flow() {
     let mut event_stream = collector.get_event_stream().await.unwrap();
 
     while let Some(event) = event_stream.next().await {
-        let actions = strategy.process_event(event).await;
-        for action in actions {
+        let mut actions = strategy.process_event(event).await.unwrap();
+        while let Some(action) = actions.next().await {
             executor.execute(action).await.unwrap();
         }
     }

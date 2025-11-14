@@ -1,11 +1,9 @@
 use alloy::rpc::types::Transaction;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::{Stream, StreamExt, stream::select};
 use jsonrpsee::core::DeserializeOwned;
 use std::pin::Pin;
-use tokio_stream::Stream;
-use tokio_stream::StreamExt;
-use tokio_stream::StreamMap;
 
 use crate::collectors::NewBlock;
 
@@ -13,6 +11,7 @@ use crate::executors::SubmitTxToMempool;
 
 /// A stream of events emitted by a [Collector].
 pub type CollectorStream<'a, E> = Pin<Box<dyn Stream<Item = E> + Send + 'a>>;
+pub type ActionStream<'a, A> = Pin<Box<dyn Stream<Item = A> + Send + 'a>>;
 
 /// Collector trait, which defines a source of events.
 #[async_trait]
@@ -30,7 +29,7 @@ pub trait Strategy<E, A>: Send + Sync {
 
     /// AWK: We probably want to return a Result here, too.
     /// Process an event, and return an action if needed.
-    async fn process_event(&mut self, event: E) -> Vec<A>;
+    async fn process_event(&mut self, event: E) -> Result<ActionStream<'_, A>>;
 }
 
 /// Executor trait, responsible for executing actions returned by strategies.
@@ -87,8 +86,10 @@ where
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
         let stream = self.collector.get_event_stream().await?;
-        let f = self.f.clone();
-        let stream = stream.filter_map(f);
+        let stream = stream.filter_map(move |event| {
+            let f = self.f.clone();
+            async move { f(event) }
+        });
         Ok(Box::pin(stream))
     }
 }
@@ -114,21 +115,19 @@ where
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
         let this_stream = self.this.get_event_stream().await?;
         let other_stream = self.other.get_event_stream().await?;
-        let merged = Box::pin(this_stream.merge(other_stream)) as CollectorStream<'_, E>;
-        Ok(merged)
+        let merged = Box::pin(select(this_stream, other_stream)) as CollectorStream<'_, E>;
+        Ok(Box::pin(merged))
     }
 }
 
 #[async_trait]
 impl<E: 'static, C: Collector<E>> Collector<E> for Vec<Box<C>> {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
-        let mut smap = StreamMap::new();
-        for (id, collector) in self.iter().enumerate() {
-            let stream = collector.get_event_stream().await?;
-            smap.insert(id, stream);
-        }
-        let stream = Box::pin(smap.map(|(_, v)| v)) as CollectorStream<'_, E>;
-        Ok(stream)
+        let stream = futures::stream::iter(self.iter())
+            .then(|collector| collector.get_event_stream())
+            .filter_map(|result| async { result.ok() })
+            .flatten();
+        Ok(Box::pin(stream))
     }
 }
 /// ExecutorMap is a wrapper around an [Executor] that maps incoming

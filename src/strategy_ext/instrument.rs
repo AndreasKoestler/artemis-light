@@ -1,20 +1,16 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 
-use crate::types::{Metrics, Strategy};
+use crate::types::{ActionStream, Metrics, Strategy};
 
 pub struct StrategyInstrument<S, M> {
     strategy: S,
     metrics: M,
-    ignore_errors: bool,
 }
 
 impl<S, M> StrategyInstrument<S, M> {
-    pub fn new(strategy: S, metrics: M, ignore_errors: bool) -> Self {
-        Self {
-            strategy,
-            metrics,
-            ignore_errors,
-        }
+    pub fn new(strategy: S, metrics: M) -> Self {
+        Self { strategy, metrics }
     }
 }
 
@@ -22,20 +18,19 @@ impl<S, M> StrategyInstrument<S, M> {
 impl<E, A, S, M> Strategy<E, A> for StrategyInstrument<S, M>
 where
     S: Strategy<E, A> + 'static,
-    M: Metrics<S> + Send + Sync + 'static,
+    M: Metrics<A> + Send + Sync + 'static,
     A: Send + Sync + 'static,
     E: Send + Sync + 'static,
 {
-    async fn process_event(&mut self, event: E) -> Vec<A> {
-        let res = self.strategy.process_event(event).await;
-        let _ = self.metrics.collect_metrics(&self.strategy).await;
-        res
+    async fn process_event(&mut self, event: E) -> anyhow::Result<ActionStream<'_, A>> {
+        let res = self.strategy.process_event(event).await?;
+        let res = res.then(|action| async {
+            let _ = self.metrics.collect_metrics(&action).await;
+            action
+        });
+        Ok(Box::pin(res))
     }
     async fn sync_state(&mut self) -> anyhow::Result<()> {
-        self.strategy.sync_state().await?;
-        match self.metrics.collect_metrics(&self.strategy).await {
-            Err(_) if self.ignore_errors => Ok(()),
-            res => res,
-        }
+        self.strategy.sync_state().await
     }
 }
