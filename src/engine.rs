@@ -1,9 +1,10 @@
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use tokio::sync::broadcast::{self, Sender};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::types::{Collector, Executor, Strategy};
 
@@ -146,13 +147,41 @@ where
         for collector in self.collectors {
             let event_sender = event_sender.clone();
             set.spawn(async move {
-                info!("starting collector... ");
-                let mut event_stream = collector.get_event_stream().await.unwrap();
-                while let Some(event) = event_stream.next().await {
-                    match event_sender.send(event) {
-                        Ok(_) => {}
-                        Err(e) => error!("error sending event: {}", e),
+                info!("starting collector...");
+                let mut retries = 0u32;
+                loop {
+                    let mut event_stream = match collector.get_event_stream().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            retries += 1;
+                            error!("collector stream creation failed (attempt {retries}): {e}");
+                            if retries >= 3 {
+                                error!("collector failed {retries} times, exiting process");
+                                std::process::exit(1);
+                            }
+                            tokio::time::sleep(Duration::from_secs(2u64.pow(retries))).await;
+                            continue;
+                        }
+                    };
+                    let mut received_events = false;
+                    while let Some(event) = event_stream.next().await {
+                        received_events = true;
+                        match event_sender.send(event) {
+                            Ok(_) => {}
+                            Err(e) => error!("error sending event: {e}"),
+                        }
                     }
+                    // Stream ended (WS disconnected)
+                    if received_events {
+                        retries = 0;
+                    }
+                    retries += 1;
+                    warn!("collector stream ended (attempt {retries}), retrying...");
+                    if retries >= 3 {
+                        error!("collector stream ended {retries} times, exiting process");
+                        std::process::exit(1);
+                    }
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(retries))).await;
                 }
             });
         }
