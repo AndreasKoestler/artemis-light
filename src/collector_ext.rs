@@ -4,18 +4,6 @@ use crate::types::{Collector, CollectorMap, CollectorMerge, FilterCollectorMap};
 /// This trait adds methods for transforming and combining collector streams:
 pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     /// Map events from type `E` to type `E2` using a function `f`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # tokio_test::block_on(async {
-    /// let collector = ::TestCollector::new(vec![1, 2, 3]);
-    /// let collector = collector.map(|n| n + 1);
-    /// let res = collector.get_event_stream().await.unwrap().collect::<Vec<_>>().await;
-    /// assert_eq!(res, vec![2, 3, 4]);
-    /// # })
-    /// ```
-    ///
     fn map<F, E2>(self, f: F) -> CollectorMap<E, F>
     where
         F: Fn(E) -> E2 + Send + Sync + Clone + 'static,
@@ -24,18 +12,6 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     }
 
     /// Filter and transform events from type `E` to type `E2` using a function `f`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # tokio_test::block_on(async {
-    /// let collector = TestCollector::new(vec![1, 2, 3, 4]);
-    /// let collector = collector.filter_map(|n| if n % 2 == 0 { Some(n) } else { None });
-    /// let res = collector.get_event_stream().await.unwrap().collect::<Vec<_>>().await;
-    /// assert_eq!(res, vec![2, 4]);
-    /// # })
-    /// ```
-    ///
     fn filter_map<F, E2>(self, f: F) -> FilterCollectorMap<E, F>
     where
         F: Fn(E) -> Option<E2> + Send + Sync + Clone + 'static,
@@ -44,20 +20,6 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     }
 
     /// Merge two collectors into a single collector that emits events from both.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # tokio_test::block_on(async {
-    /// let collector = TestCollector::new(vec![1, 2, 3]);
-    /// let collector_2 = TestCollector::new(vec![4, 5, 6]);
-    /// let merged = collector.merge(collector_2);
-    /// let mut res = merged.get_event_stream().await.unwrap().collect::<Vec<_>>().await;
-    /// # res.sort();
-    /// assert_eq!(res, vec![1, 2, 3, 4, 5, 6]);
-    /// # })
-    /// ```
-    ///
     fn merge<C>(self, other: C) -> CollectorMerge<Self, C>
     where
         C: Collector<E> + Send + Sync + 'static,
@@ -67,29 +29,6 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
 }
 
 impl<T: Collector<E> + 'static, E> CollectorExt<E> for T {}
-
-#[cfg(doctest)]
-pub mod doctest {
-    use anyhow::Result;
-    use artemis_light::types::{Collector, CollectorStream};
-    use async_trait::async_trait;
-    use futures::stream;
-
-    pub struct TestCollector {
-        data: Vec<u8>,
-    }
-    impl TestCollector {
-        pub fn new(data: Vec<u8>) -> Self {
-            Self { data }
-        }
-    }
-    #[async_trait]
-    impl Collector<u8> for TestCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u8>> {
-            Ok(Box::pin(stream::iter(self.data.clone())))
-        }
-    }
-}
 
 #[cfg(test)]
 mod test {

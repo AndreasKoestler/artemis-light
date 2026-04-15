@@ -6,7 +6,6 @@ use alloy::{
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
 
 /// A collector that listens for new blockchain event logs based on a [Filter],
 /// and generates a stream of [events](Log).
@@ -29,7 +28,7 @@ where
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, Log>> {
         let stream = self.provider.subscribe_logs(&self.filter).await?;
-        let stream = stream.into_stream().filter_map(Some);
+        let stream = stream.into_stream();
         Ok(Box::pin(stream))
     }
 }

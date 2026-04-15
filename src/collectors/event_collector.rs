@@ -25,7 +25,13 @@ where
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
         let stream = self.event.subscribe().await?.into_stream();
-        let stream = stream.filter_map(|el| el.map(|(e, _)| e).ok());
+        let stream = stream.filter_map(|el| match el {
+            Ok((e, _)) => Some(e),
+            Err(e) => {
+                tracing::warn!("Failed to decode event log: {}", e);
+                None
+            }
+        });
         Ok(Box::pin(stream))
     }
 }

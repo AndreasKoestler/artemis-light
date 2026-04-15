@@ -11,6 +11,7 @@ async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1.44", features = ["full"] }
 tokio-stream = { version = "0.1", features = ['sync'] }
+tokio-util = "0.7"
 jsonrpsee = { version = "0.24", features = ["client", "async-client"] }
 alloy = { version = "1.0", features = [
     "full",
@@ -19,3 +20,7 @@ alloy = { version = "1.0", features = [
 ## misc
 anyhow = "1.0.97"
 tracing = "0.1.41"
+
+[[example]]
+name = "basic_example"
+path = "examples/basic_example.rs"

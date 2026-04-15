@@ -11,6 +11,7 @@ use crate::executors::SubmitTxToMempool;
 
 /// A stream of events emitted by a [Collector].
 pub type CollectorStream<'a, E> = Pin<Box<dyn Stream<Item = E> + Send + 'a>>;
+/// A stream of actions produced by a [Strategy].
 pub type ActionStream<'a, A> = Pin<Box<dyn Stream<Item = A> + Send + 'a>>;
 
 /// Collector trait, which defines a source of events.
@@ -27,7 +28,6 @@ pub trait Strategy<E, A>: Send + Sync {
     /// onchain data.
     async fn sync_state(&mut self) -> Result<()>;
 
-    /// AWK: We probably want to return a Result here, too.
     /// Process an event, and return an action if needed.
     async fn process_event(&mut self, event: E) -> Result<ActionStream<'_, A>>;
 }
@@ -46,6 +46,7 @@ pub struct CollectorMap<E, F> {
     f: F,
 }
 impl<E, F> CollectorMap<E, F> {
+    /// Creates a new `CollectorMap` wrapping `collector` with the mapping function `f`.
     pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
         Self { collector, f }
     }
@@ -65,13 +66,14 @@ where
         Ok(Box::pin(stream))
     }
 }
-/// FilterCollectorMap is a wrapper around a [Collector] that maps outgoing
-/// events to a different type.
+/// FilterCollectorMap is a wrapper around a [Collector] that filter-maps
+/// outgoing events, discarding `None` results and unwrapping `Some`.
 pub struct FilterCollectorMap<E, F> {
     collector: Box<dyn Collector<E>>,
     f: F,
 }
 impl<E, F> FilterCollectorMap<E, F> {
+    /// Creates a new `FilterCollectorMap` wrapping `collector` with the filter-map function `f`.
     pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
         Self { collector, f }
     }
@@ -86,20 +88,23 @@ where
 {
     async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
         let stream = self.collector.get_event_stream().await?;
+        let f = self.f.clone();
         let stream = stream.filter_map(move |event| {
-            let f = self.f.clone();
+            let f = f.clone();
             async move { f(event) }
         });
         Ok(Box::pin(stream))
     }
 }
 
+/// Merges two [Collector]s into a single stream that interleaves events from both.
 pub struct CollectorMerge<C1, C2> {
     this: C1,
     other: C2,
 }
 
 impl<C1, C2> CollectorMerge<C1, C2> {
+    /// Creates a new `CollectorMerge` that interleaves events from `this` and `other`.
     pub fn new(this: C1, other: C2) -> Self {
         Self { this, other }
     }
@@ -130,14 +135,15 @@ impl<E: 'static, C: Collector<E>> Collector<E> for Vec<Box<C>> {
         Ok(Box::pin(stream))
     }
 }
-/// ExecutorMap is a wrapper around an [Executor] that maps incoming
-/// actions to a different type.
+/// A wrapper around an [Executor] that filter-maps incoming actions,
+/// silently dropping actions that map to `None`.
 pub struct ExecutorFilterMap<E, F> {
     executor: E,
     f: F,
 }
 
 impl<E, F> ExecutorFilterMap<E, F> {
+    /// Creates a new `ExecutorFilterMap` wrapping `executor` with the filter-map function `f`.
     pub fn new(executor: E, f: F) -> Self {
         Self { executor, f }
     }
@@ -172,6 +178,7 @@ pub enum Actions {
     SubmitTxToMempool(SubmitTxToMempool),
 }
 
+/// Trait for collecting runtime metrics from a stateful component.
 pub trait Metrics<S> {
     fn collect_metrics(
         &self,

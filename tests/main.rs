@@ -3,9 +3,12 @@ use alloy::{
     network::TransactionBuilder,
     primitives::U256,
     providers::{Provider, ProviderBuilder, WsConnect},
+    rpc::types::Filter,
+    signers::local::PrivateKeySigner,
+    sol,
 };
 use artemis_light::{
-    collectors::{BlockCollector, MempoolCollector},
+    collectors::{BlockCollector, EventCollector, LogCollector, MempoolCollector},
     executors::{MempoolExecutor, SubmitTxToMempool},
     types::{ActionStream, Collector, Executor},
 };
@@ -17,13 +20,38 @@ use std::sync::Arc;
 
 use alloy::node_bindings::{Anvil, AnvilInstance};
 
-/// Spawns Anvil and instantiates an Http provider.
+sol! {
+    #[sol(rpc, bytecode = "6080604052348015600e575f5ffd5b5060d980601a5f395ff3fe6080604052348015600e575f5ffd5b50600436106030575f3560e01c80633fa4f2451460345780635524107714604d575b5f5ffd5b603b5f5481565b60405190815260200160405180910390f35b605c6058366004608d565b605e565b005b5f81815560405182917f012c78e2b84325878b1bd9d250d772cfe5bda7722d795f45036fa5e1e6e303fc91a250565b5f60208284031215609c575f5ffd5b503591905056fea264697066735822122050fddb04e40945ebc7c51aef06d27a86c4aa98943b773d9ffdc789caf784441064736f6c634300081e0033")]
+    contract Emitter {
+        uint256 public value;
+
+        event ValueSet(uint256 indexed value);
+
+        function setValue(uint256 _value) external {
+            value = _value;
+            emit ValueSet(_value);
+        }
+    }
+}
+
+/// Spawns Anvil and instantiates a WS provider (no wallet).
 pub async fn spawn_anvil() -> Result<(impl Provider, AnvilInstance)> {
     let anvil = Anvil::new().block_time(1).chain_id(1337).try_spawn()?;
     let rpc_url = anvil.ws_endpoint();
     println!("RPC URL: {rpc_url}");
     let ws = WsConnect::new(&rpc_url);
     let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    Ok((provider, anvil))
+}
+
+/// Spawns Anvil and instantiates a WS provider with a wallet signer.
+pub async fn spawn_anvil_with_signer() -> Result<(impl Provider + Clone, AnvilInstance)> {
+    let anvil = Anvil::new().block_time(1).chain_id(1337).try_spawn()?;
+    let rpc_url = anvil.ws_endpoint();
+    println!("RPC URL: {rpc_url}");
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let ws = WsConnect::new(&rpc_url);
+    let provider = ProviderBuilder::new().wallet(signer).connect_ws(ws).await?;
     Ok((provider, anvil))
 }
 
@@ -101,6 +129,65 @@ async fn test_mempool_executor_sends_tx_simple() {
     assert_eq!(tx, 1);
 }
 
+/// Test that LogCollector receives logs emitted by a contract.
+#[tokio::test]
+async fn test_log_collector_receives_logs() {
+    let (provider, _anvil) = spawn_anvil_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+
+    // Deploy the Emitter contract
+    let contract = Emitter::deploy(provider.clone()).await.unwrap();
+    let contract_addr = *contract.address();
+
+    // Create a log collector filtered to this contract's address
+    let filter = Filter::new().address(contract_addr);
+    let log_collector = LogCollector::new(provider.clone(), filter);
+    let log_stream = log_collector.get_event_stream().await.unwrap();
+
+    // Call setValue to emit the ValueSet event
+    contract
+        .setValue(U256::from(42))
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+
+    // Verify the log matches
+    let log = log_stream.into_future().await.0.unwrap();
+    assert_eq!(log.address(), contract_addr);
+}
+
+/// Test that EventCollector receives typed events from a contract.
+#[tokio::test]
+async fn test_event_collector_receives_events() {
+    let (provider, _anvil) = spawn_anvil_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+
+    // Deploy the Emitter contract
+    let contract = Emitter::deploy(provider.clone()).await.unwrap();
+
+    // Create an event collector for ValueSet events
+    let event_filter = contract.ValueSet_filter();
+    let event_collector = EventCollector::new(event_filter);
+    let event_stream = event_collector.get_event_stream().await.unwrap();
+
+    // Call setValue to emit the ValueSet event
+    contract
+        .setValue(U256::from(42))
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+
+    // Verify the decoded event value
+    let ev = event_stream.into_future().await.0.unwrap();
+    assert_eq!(ev.value, U256::from(42));
+}
+
 /// Test that demonstrates a complete flow with collector, strategy, and executor
 #[tokio::test]
 async fn test_complete_flow() {
@@ -172,35 +259,31 @@ async fn test_complete_flow() {
             let number = event.0;
             let (tx, rx) = oneshot::channel();
 
-            // Spawn a thread that listens on the oneshot receiver
+            // Spawn a task that listens on the oneshot receiver
             let pending_txs = Arc::clone(&self.pending_txs);
             let successful_tx = Arc::clone(&self.successful_tx);
             let failed_tx = Arc::clone(&self.failed_tx);
 
-            std::thread::spawn(move || {
+            tokio::spawn(async move {
                 // Increment pending counter
                 pending_txs.fetch_add(1, Ordering::Relaxed);
 
-                // Wait for the response on the oneshot channel
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    match rx.await {
-                        Ok(success) => {
-                            // Decrease pending count
-                            pending_txs.fetch_sub(1, Ordering::Relaxed);
+                match rx.await {
+                    Ok(success) => {
+                        // Decrease pending count
+                        pending_txs.fetch_sub(1, Ordering::Relaxed);
 
-                            // Increase appropriate counter based on whether number was even or odd
-                            if success {
-                                successful_tx.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                failed_tx.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            pending_txs.fetch_sub(1, Ordering::Relaxed);
+                        // Increase appropriate counter based on whether number was even or odd
+                        if success {
+                            successful_tx.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            failed_tx.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                });
+                    Err(_) => {
+                        pending_txs.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
             });
 
             Ok(Box::pin(futures::stream::iter(vec![NumberAction {
@@ -261,4 +344,229 @@ async fn test_complete_flow() {
     assert_eq!(pending_txs.load(Ordering::Relaxed), 0);
     assert_eq!(successful_tx.load(Ordering::Relaxed), 5);
     assert_eq!(failed_tx.load(Ordering::Relaxed), 5);
+}
+
+// ---------------------------------------------------------------------------
+// In-process engine tests (no Anvil required)
+// ---------------------------------------------------------------------------
+
+mod engine_tests {
+    use anyhow::Result;
+    use artemis_light::engine::Engine;
+    use artemis_light::types::{ActionStream, Collector, CollectorStream, Executor, Strategy};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // -- Shared mock types --------------------------------------------------
+
+    /// A collector that emits a fixed list of u32 events.
+    struct FixedCollector {
+        items: Vec<u32>,
+    }
+
+    impl FixedCollector {
+        fn new(items: Vec<u32>) -> Self {
+            Self { items }
+        }
+    }
+
+    #[async_trait]
+    impl Collector<u32> for FixedCollector {
+        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            Ok(Box::pin(futures::stream::iter(self.items.clone())))
+        }
+    }
+
+    /// A collector that emits items forever (one per 10 ms).
+    struct InfiniteCollector;
+
+    #[async_trait]
+    impl Collector<u32> for InfiniteCollector {
+        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            let stream = futures::stream::unfold(0u32, |n| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Some((n, n + 1))
+            });
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// A collector whose `get_event_stream` always fails.
+    struct FailingCollector;
+
+    #[async_trait]
+    impl Collector<u32> for FailingCollector {
+        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            Err(anyhow::anyhow!("collector failure"))
+        }
+    }
+
+    /// Strategy that echoes every event as an action.
+    struct EchoStrategy;
+
+    #[async_trait]
+    impl Strategy<u32, u32> for EchoStrategy {
+        async fn sync_state(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+            Ok(Box::pin(futures::stream::iter(vec![event])))
+        }
+    }
+
+    /// Executor that increments a shared counter for every action it receives.
+    struct CountingExecutor {
+        count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Executor<u32> for CountingExecutor {
+        async fn execute(&mut self, _action: u32) -> Result<()> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // -- Tests --------------------------------------------------------------
+
+    /// 3 events flow through collector -> strategy -> executor; verify count.
+    #[tokio::test]
+    async fn test_engine_event_flow() {
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1, 2, 3])));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let (token, mut set) = engine.run().await.unwrap();
+
+        // The finite collector will complete; give it a moment to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+
+        while set.join_next().await.is_some() {}
+
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    /// Infinite collector + cancel token; verify all tasks exit within 2 s.
+    #[tokio::test]
+    async fn test_engine_shutdown() {
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(InfiniteCollector));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let (token, mut set) = engine.run().await.unwrap();
+
+        // Let it run briefly so some events flow.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            count.load(Ordering::SeqCst) > 0,
+            "expected some events to flow"
+        );
+
+        token.cancel();
+
+        let deadline = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+
+        assert!(
+            deadline.is_ok(),
+            "engine tasks did not shut down within 2 s"
+        );
+    }
+
+    /// Tiny channel capacity with a fast collector and slow strategy; verify
+    /// the engine doesn't crash and events still flow despite backpressure.
+    #[tokio::test]
+    async fn test_engine_backpressure() {
+        /// A collector that quickly emits many events.
+        struct BurstCollector {
+            count: u32,
+        }
+
+        #[async_trait]
+        impl Collector<u32> for BurstCollector {
+            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+                Ok(Box::pin(futures::stream::iter(0..self.count)))
+            }
+        }
+
+        /// A strategy that sleeps briefly before echoing each event.
+        struct SlowStrategy;
+
+        #[async_trait]
+        impl Strategy<u32, u32> for SlowStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                Ok(Box::pin(futures::stream::iter(vec![event])))
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default()
+            .with_event_channel_capacity(2)
+            .with_action_channel_capacity(2);
+        engine.add_collector(Box::new(BurstCollector { count: 50 }));
+        engine.add_strategy(Box::new(SlowStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let (token, mut set) = engine.run().await.unwrap();
+
+        // Give enough time for events to drain through the slow strategy.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        token.cancel();
+
+        while set.join_next().await.is_some() {}
+
+        let executed = count.load(Ordering::SeqCst);
+        assert!(
+            executed > 0,
+            "expected some events to flow despite backpressure, got 0"
+        );
+    }
+
+    /// One failing + one good collector; verify good events still flow.
+    #[tokio::test]
+    async fn test_engine_collector_failure() {
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FailingCollector));
+        engine.add_collector(Box::new(FixedCollector::new(vec![10, 20])));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let (token, mut set) = engine.run().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+
+        while set.join_next().await.is_some() {}
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "good collector's events should still flow"
+        );
+    }
 }

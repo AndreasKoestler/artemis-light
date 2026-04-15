@@ -947,6 +947,7 @@ dependencies = [
  "jsonrpsee",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 

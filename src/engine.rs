@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::types::{Collector, Executor, Strategy};
@@ -91,61 +92,125 @@ where
         self.executors.push(executor);
     }
 
-    /// The core run loop of the engine. This function will spawn a thread for
+    /// The core run loop of the engine. This function will spawn a task for
     /// each collector, strategy, and executor. It will then orchestrate the
     /// data flow between them.
-    pub async fn run(self) -> Result<JoinSet<()>, Box<dyn std::error::Error>> {
+    ///
+    /// Returns a [`CancellationToken`] that can be used to shut down the engine,
+    /// and a [`JoinSet`] that can be used to await task completion.
+    pub async fn run(mut self) -> Result<(CancellationToken, JoinSet<()>), Box<dyn std::error::Error>> {
         let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
         let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);
 
+        let token = CancellationToken::new();
         let mut set = JoinSet::new();
 
-        // Spawn executors in separate threads.
+        // Spawn executors first (they subscribe before any events flow).
         for mut executor in self.executors {
             let mut receiver = action_sender.subscribe();
+            let child = token.child_token();
             set.spawn(async move {
                 info!("starting executor... ");
                 loop {
-                    match receiver.recv().await {
-                        Ok(action) => match executor.execute(action).await {
-                            Ok(_) => {}
-                            Err(e) => error!("error executing action: {}", e),
-                        },
-                        Err(e) => error!("error receiving action: {}", e),
+                    tokio::select! {
+                        _ = child.cancelled() => {
+                            info!("executor shutting down");
+                            break;
+                        }
+                        result = receiver.recv() => {
+                            match result {
+                                Ok(action) => {
+                                    if let Err(e) = executor.execute(action).await {
+                                        error!("error executing action: {}", e);
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!("executor receiver lagged, skipped {n} messages");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    info!("action channel closed, executor shutting down");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             });
         }
 
-        // Spawn strategies in separate threads.
+        // Sync all strategies before spawning tasks so failures propagate to the caller.
+        // Cancellation is respected during sync via the token.
+        for strategy in &mut self.strategies {
+            info!("syncing strategy state...");
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err("engine cancelled during strategy sync".into());
+                }
+                result = strategy.sync_state() => {
+                    result?;
+                }
+            }
+        }
+
+        // Spawn strategies (they subscribe to events before collectors start emitting).
         for mut strategy in self.strategies {
             let mut event_receiver = event_sender.subscribe();
             let action_sender = action_sender.clone();
-            strategy.sync_state().await?;
+            let child = token.child_token();
 
             set.spawn(async move {
                 info!("starting strategy... ");
                 loop {
-                    match event_receiver.recv().await {
-                        Ok(event) => {
-                            if let Ok(mut action_stream) = strategy.process_event(event).await {
-                                while let Some(action) = action_stream.next().await {
-                                    match action_sender.send(action) {
-                                        Ok(_) => {}
-                                        Err(e) => error!("error sending action: {}", e),
+                    tokio::select! {
+                        _ = child.cancelled() => {
+                            info!("strategy shutting down");
+                            break;
+                        }
+                        result = event_receiver.recv() => {
+                            match result {
+                                Ok(event) => {
+                                    match strategy.process_event(event).await {
+                                        Ok(mut action_stream) => {
+                                            loop {
+                                                tokio::select! {
+                                                    _ = child.cancelled() => {
+                                                        info!("strategy shutting down while draining action stream");
+                                                        return;
+                                                    }
+                                                    action = action_stream.next() => {
+                                                        match action {
+                                                            Some(action) => {
+                                                                if let Err(e) = action_sender.send(action) {
+                                                                    error!("error sending action: {}", e);
+                                                                }
+                                                            }
+                                                            None => break,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => error!("error processing event: {}", e),
                                     }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!("strategy receiver lagged, skipped {n} messages");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    info!("event channel closed, strategy shutting down");
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => error!("error receiving event: {}", e),
                     }
                 }
             });
         }
 
-        // Spawn collectors in separate threads.
+        // Spawn collectors last so that all subscribers are ready before events flow.
         for collector in self.collectors {
             let event_sender = event_sender.clone();
+            let child = token.child_token();
             set.spawn(async move {
                 info!("starting collector...");
                 let mut retries = 0u32;
@@ -156,19 +221,34 @@ where
                             retries += 1;
                             error!("collector stream creation failed (attempt {retries}): {e}");
                             if retries >= 3 {
-                                error!("collector failed {retries} times, exiting process");
-                                std::process::exit(1);
+                                error!("collector failed {retries} times, giving up");
+                                return;
                             }
-                            tokio::time::sleep(Duration::from_secs(2u64.pow(retries))).await;
+                            tokio::select! {
+                                _ = child.cancelled() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(retries))) => {}
+                            }
                             continue;
                         }
                     };
                     let mut received_events = false;
-                    while let Some(event) = event_stream.next().await {
-                        received_events = true;
-                        match event_sender.send(event) {
-                            Ok(_) => {}
-                            Err(e) => error!("error sending event: {e}"),
+                    loop {
+                        tokio::select! {
+                            _ = child.cancelled() => {
+                                info!("collector shutting down");
+                                return;
+                            }
+                            event = event_stream.next() => {
+                                match event {
+                                    Some(event) => {
+                                        received_events = true;
+                                        if let Err(e) = event_sender.send(event) {
+                                            error!("error sending event: {e}");
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                     }
                     // Stream ended (WS disconnected)
@@ -181,11 +261,14 @@ where
                         error!("collector stream ended {retries} times, exiting process");
                         std::process::exit(1);
                     }
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(retries))).await;
+                    tokio::select! {
+                        _ = child.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(2u64.pow(retries))) => {}
+                    }
                 }
             });
         }
 
-        Ok(set)
+        Ok((token, set))
     }
 }
