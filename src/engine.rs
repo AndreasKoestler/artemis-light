@@ -96,9 +96,13 @@ where
     /// each collector, strategy, and executor. It will then orchestrate the
     /// data flow between them.
     ///
+    /// Collectors are started **before** strategies sync so that live events
+    /// buffer in the broadcast channel while historical sync runs. This
+    /// eliminates the gap between HTTP replay and WS subscription.
+    ///
     /// Returns a [`CancellationToken`] that can be used to shut down the engine,
     /// and a [`JoinSet`] that can be used to await task completion.
-    pub async fn run(mut self) -> Result<(CancellationToken, JoinSet<()>), Box<dyn std::error::Error>> {
+    pub async fn run(self) -> Result<(CancellationToken, JoinSet<()>), Box<dyn std::error::Error>> {
         let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
         let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);
 
@@ -138,76 +142,7 @@ where
             });
         }
 
-        // Sync all strategies before spawning tasks so failures propagate to the caller.
-        // Cancellation is respected during sync via the token.
-        for strategy in &mut self.strategies {
-            info!("syncing strategy state...");
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err("engine cancelled during strategy sync".into());
-                }
-                result = strategy.sync_state() => {
-                    result?;
-                }
-            }
-        }
-
-        // Spawn strategies (they subscribe to events before collectors start emitting).
-        for mut strategy in self.strategies {
-            let mut event_receiver = event_sender.subscribe();
-            let action_sender = action_sender.clone();
-            let child = token.child_token();
-
-            set.spawn(async move {
-                info!("starting strategy... ");
-                loop {
-                    tokio::select! {
-                        _ = child.cancelled() => {
-                            info!("strategy shutting down");
-                            break;
-                        }
-                        result = event_receiver.recv() => {
-                            match result {
-                                Ok(event) => {
-                                    match strategy.process_event(event).await {
-                                        Ok(mut action_stream) => {
-                                            loop {
-                                                tokio::select! {
-                                                    _ = child.cancelled() => {
-                                                        info!("strategy shutting down while draining action stream");
-                                                        return;
-                                                    }
-                                                    action = action_stream.next() => {
-                                                        match action {
-                                                            Some(action) => {
-                                                                if let Err(e) = action_sender.send(action) {
-                                                                    error!("error sending action: {}", e);
-                                                                }
-                                                            }
-                                                            None => break,
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => error!("error processing event: {}", e),
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!("strategy receiver lagged, skipped {n} messages");
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    info!("event channel closed, strategy shutting down");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Spawn collectors last so that all subscribers are ready before events flow.
+        // Spawn collectors so WS subscriptions are active during strategy sync.
         for collector in self.collectors {
             let event_sender = event_sender.clone();
             let child = token.child_token();
@@ -264,6 +199,73 @@ where
                     tokio::select! {
                         _ = child.cancelled() => return,
                         _ = tokio::time::sleep(Duration::from_secs(2u64.pow(retries))) => {}
+                    }
+                }
+            });
+        }
+
+        // Subscribe each strategy to the event channel before syncing so that
+        // events produced by collectors during sync are buffered in the receiver.
+        // Cancellation is respected during sync via the token.
+        for mut strategy in self.strategies {
+            let mut event_receiver = event_sender.subscribe();
+            let action_sender = action_sender.clone();
+            let child = token.child_token();
+
+            info!("syncing strategy state...");
+            tokio::select! {
+                _ = token.cancelled() => {
+                    return Err("engine cancelled during strategy sync".into());
+                }
+                result = strategy.sync_state() => {
+                    result?;
+                }
+            }
+
+            set.spawn(async move {
+                info!("starting strategy... ");
+                loop {
+                    tokio::select! {
+                        _ = child.cancelled() => {
+                            info!("strategy shutting down");
+                            break;
+                        }
+                        result = event_receiver.recv() => {
+                            match result {
+                                Ok(event) => {
+                                    match strategy.process_event(event).await {
+                                        Ok(mut action_stream) => {
+                                            loop {
+                                                tokio::select! {
+                                                    _ = child.cancelled() => {
+                                                        info!("strategy shutting down while draining action stream");
+                                                        return;
+                                                    }
+                                                    action = action_stream.next() => {
+                                                        match action {
+                                                            Some(action) => {
+                                                                if let Err(e) = action_sender.send(action) {
+                                                                    error!("error sending action: {}", e);
+                                                                }
+                                                            }
+                                                            None => break,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => error!("error processing event: {}", e),
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!("strategy receiver lagged, skipped {n} messages");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    info!("event channel closed, strategy shutting down");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             });
