@@ -1,9 +1,6 @@
 //! A [`Store`] backed by SQLite via `sqlx`.
 
-use std::any::TypeId;
-use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::RwLock;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,7 +13,6 @@ use super::store::Store;
 /// A SQLite-backed [`Store`].
 pub struct SqliteStore {
     pool: SqlitePool,
-    overrides: RwLock<HashMap<TypeId, TableSchema>>,
 }
 
 impl SqliteStore {
@@ -31,19 +27,7 @@ impl SqliteStore {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        Ok(Self {
-            pool,
-            overrides: RwLock::new(HashMap::new()),
-        })
-    }
-
-    /// Override the best-guess schema for event type `E` with `schema`. Events
-    /// of type `E` are then persisted under `schema`'s table name and columns.
-    pub fn override_schema<E: 'static>(&self, schema: TableSchema) {
-        self.overrides
-            .write()
-            .expect("schema override lock poisoned")
-            .insert(TypeId::of::<E>(), schema);
+        Ok(Self { pool })
     }
 }
 
@@ -196,13 +180,5 @@ impl Store for SqliteStore {
             out.push(Row(values));
         }
         Ok(out)
-    }
-
-    fn schema_override(&self, type_id: TypeId) -> Option<TableSchema> {
-        self.overrides
-            .read()
-            .expect("schema override lock poisoned")
-            .get(&type_id)
-            .cloned()
     }
 }

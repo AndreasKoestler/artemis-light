@@ -413,18 +413,17 @@ async fn persisted_backfills_gap_between_last_stored_and_tip() {
     );
 }
 
-/// Slice 5: a schema override registered on the store changes the table name
-/// and column types; events persist under the overridden table.
+/// Slice 5: a schema override declared on the Persisted Collector changes the
+/// table name and column types; events persist under the overridden table.
 #[tokio::test]
 async fn override_schema_redirects_table_and_types() {
     let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
-    store.override_schema::<ValueSet>(
-        TableSchema::new("custom_values").col("value", SqlType::Numeric),
-    );
 
     // Block 1 complete, block 2 open.
     let collector = FakeCollector::default().live(vec![(1, 7), (2, 8)]);
-    let persisted = collector.with_persistence(store.clone());
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_schema(TableSchema::new("custom_values").col("value", SqlType::Numeric));
     let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 
     // Progress and rows live under the overridden table, not the derived one.

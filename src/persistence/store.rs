@@ -1,6 +1,5 @@
 //! The [`Store`] trait: a SQL backend for indexed events.
 
-use std::any::TypeId;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,13 +25,6 @@ pub trait Store: Send + Sync {
     /// Replay stored rows for `schema`'s table with `block_number <= to`, in
     /// ascending block order. Returns an empty vec if the table does not exist.
     async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>>;
-
-    /// The registered schema override for the event type identified by
-    /// `type_id`, if any. Defaults to `None` (use the best-guess schema).
-    fn schema_override(&self, type_id: TypeId) -> Option<TableSchema> {
-        let _ = type_id;
-        None
-    }
 }
 
 /// Blanket impl so a shared [`Arc<S>`] can be used wherever a [`Store`] is
@@ -49,9 +41,5 @@ impl<T: Store + ?Sized> Store for Arc<T> {
 
     async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>> {
         (**self).replay(schema, to).await
-    }
-
-    fn schema_override(&self, type_id: TypeId) -> Option<TableSchema> {
-        (**self).schema_override(type_id)
     }
 }
