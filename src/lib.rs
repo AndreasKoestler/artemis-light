@@ -35,6 +35,11 @@ pub mod executors;
 /// This module contains the core type definitions for Artemis.
 pub mod types;
 
+/// This module contains persistence: a SQL [`Store`](persistence::Store) and a
+/// [`Persisted`](persistence::Persisted) collector wrapper that records events
+/// and replays them on subscribe.
+pub mod persistence;
+
 /// This module contains syntax extensions for the `Collector` trait.
 pub mod collector_ext;
 // pub use collector_ext::*;

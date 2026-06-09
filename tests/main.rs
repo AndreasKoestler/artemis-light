@@ -306,7 +306,7 @@ async fn test_complete_flow() {
     impl Executor<NumberAction> for NumberExecutor {
         async fn execute(&mut self, action: NumberAction) -> Result<()> {
             // Send response: true if number is even, false if odd
-            let success = action.number % 2 == 0;
+            let success = action.number.is_multiple_of(2);
             action.response_tx.send(success).unwrap();
             Ok(())
         }
@@ -583,7 +583,7 @@ mod engine_tests {
 
         #[async_trait]
         impl Collector<u32> for EndingCollector {
-            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
                 Ok(Box::pin(futures::stream::empty::<u32>()))
             }
         }
@@ -631,7 +631,7 @@ mod engine_tests {
 
         #[async_trait]
         impl Collector<u32> for EndingCollector {
-            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
                 Ok(Box::pin(futures::stream::empty::<u32>()))
             }
         }

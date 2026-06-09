@@ -20,7 +20,11 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          # Pin a concrete version: foundryup only queries the (anonymous,
+          # rate-limited) GitHub API to resolve the "stable"/"nightly"
+          # channels. A pinned tag is downloaded directly from release
+          # assets, avoiding the HTTP 403 rate-limit failures seen in CI.
+          version: v1.7.1
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
