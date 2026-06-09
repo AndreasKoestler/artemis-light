@@ -28,7 +28,7 @@ impl TickCollector {
 
 #[async_trait]
 impl Collector<u64> for TickCollector {
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, u64>> {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, u64>> {
         let interval = self.interval;
         let count = self.count;
         let stream = futures::stream::unfold(0u64, move |n| async move {

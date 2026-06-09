@@ -54,7 +54,7 @@ impl<M> Collector<Transaction> for MempoolCollector<M>
 where
     M: Provider,
 {
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, Transaction>> {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, Transaction>> {
         let stream = self
             .provider
             .subscribe_pending_transactions()

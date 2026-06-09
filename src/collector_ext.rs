@@ -1,30 +1,39 @@
-use crate::types::{Collector, CollectorMap, CollectorMerge, FilterCollectorMap};
+use crate::types::Collector;
+
+mod filter_map;
+mod map;
+mod merge;
+
+pub use filter_map::*;
+pub use map::*;
+pub use merge::*;
+
 /// Extension trait that provides additional functionality for types implementing [`Collector`].
 ///
 /// This trait adds methods for transforming and combining collector streams:
 pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     /// Map events from type `E` to type `E2` using a function `f`.
-    fn map<F, E2>(self, f: F) -> CollectorMap<E, F>
+    fn map<F, E2>(self, f: F) -> Map<E, F>
     where
         F: Fn(E) -> E2 + Send + Sync + Clone + 'static,
     {
-        CollectorMap::new(Box::new(self), f)
+        Map::new(Box::new(self), f)
     }
 
     /// Filter and transform events from type `E` to type `E2` using a function `f`.
-    fn filter_map<F, E2>(self, f: F) -> FilterCollectorMap<E, F>
+    fn filter_map<F, E2>(self, f: F) -> FilterMap<E, F>
     where
         F: Fn(E) -> Option<E2> + Send + Sync + Clone + 'static,
     {
-        FilterCollectorMap::new(Box::new(self), f)
+        FilterMap::new(Box::new(self), f)
     }
 
     /// Merge two collectors into a single collector that emits events from both.
-    fn merge<C>(self, other: C) -> CollectorMerge<Self, C>
+    fn merge<C>(self, other: C) -> Merge<Self, C>
     where
         C: Collector<E> + Send + Sync + 'static,
     {
-        CollectorMerge::new(self, other)
+        Merge::new(self, other)
     }
 }
 
@@ -53,7 +62,7 @@ mod test {
     /// Implementation of the [Collector](Collector) trait for the [BlockCollector](BlockCollector).
     #[async_trait]
     impl Collector<u8> for TestCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u8>> {
+        async fn subscribe(&self) -> Result<CollectorStream<'_, u8>> {
             Ok(Box::pin(stream::iter(self.data.clone())))
         }
     }
@@ -64,7 +73,7 @@ mod test {
             data: vec![1, 2, 3],
         };
         let collector = collector.map(|n| n + 1);
-        let stream = collector.get_event_stream().await.unwrap();
+        let stream = collector.subscribe().await.unwrap();
         let event = stream.collect::<Vec<_>>().await;
         assert_eq!(event, vec![2, 3, 4]);
     }
@@ -75,7 +84,7 @@ mod test {
             data: vec![1, 2, 3, 4],
         };
         let collector = collector.filter_map(|n| if n % 2 == 0 { Some(n) } else { None });
-        let stream = collector.get_event_stream().await.unwrap();
+        let stream = collector.subscribe().await.unwrap();
         let event = stream.collect::<Vec<_>>().await;
         assert_eq!(event, vec![2, 4]);
     }
@@ -93,7 +102,7 @@ mod test {
         ];
 
         let mut res = collectors
-            .get_event_stream()
+            .subscribe()
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -107,7 +116,7 @@ mod test {
         let block_collector = TestCollector::new(vec![1, 3, 5]);
         let block_collector_2 = TestCollector::new(vec![2, 4, 6]);
         let merged = block_collector.merge(block_collector_2);
-        let stream = merged.get_event_stream().await.unwrap();
+        let stream = merged.subscribe().await.unwrap();
         let mut res = stream.collect::<Vec<_>>().await;
         res.sort();
         assert_eq!(res, vec![1, 2, 3, 4, 5, 6]);
@@ -120,7 +129,7 @@ mod test {
             .map(|n| n + 1)
             .filter_map(|n| if n % 2 == 0 { Some(n) } else { None })
             .merge(TestCollector::new(vec![11, 12, 13, 14, 15]));
-        let stream = collector.get_event_stream().await.unwrap();
+        let stream = collector.subscribe().await.unwrap();
         let mut res = stream.collect::<Vec<_>>().await;
         res.sort();
         assert_eq!(res, vec![2, 4, 6, 8, 10, 11, 12, 13, 14, 15]);

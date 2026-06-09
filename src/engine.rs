@@ -193,7 +193,7 @@ where
                 info!("starting collector...");
                 let mut policy = ReconnectPolicy::new(reconnect_config);
                 loop {
-                    let mut event_stream = match collector.get_event_stream().await {
+                    let mut event_stream = match collector.subscribe().await {
                         Ok(s) => s,
                         Err(e) => {
                             error!("collector stream creation failed: {e}");

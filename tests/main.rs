@@ -62,7 +62,7 @@ async fn test_block_collector_sends_blocks() {
     let provider = Arc::new(provider);
     let block_collector = BlockCollector::new(provider.clone());
 
-    let block_stream = block_collector.get_event_stream().await.unwrap();
+    let block_stream = block_collector.subscribe().await.unwrap();
     let block_a = block_stream.into_future().await.0.unwrap();
     let block_b = provider
         .get_block(BlockId::Number(BlockNumberOrTag::Latest))
@@ -79,7 +79,7 @@ async fn test_mempool_collector_sends_txs() {
     let provider = Arc::new(provider);
     let mempool_collector = MempoolCollector::new(provider.clone());
     let mempool_stream = mempool_collector
-        .get_event_stream()
+        .subscribe()
         .await
         .expect("Failed to get mempool stream");
 
@@ -142,7 +142,7 @@ async fn test_log_collector_receives_logs() {
     // Create a log collector filtered to this contract's address
     let filter = Filter::new().address(contract_addr);
     let log_collector = LogCollector::new(provider.clone(), filter);
-    let log_stream = log_collector.get_event_stream().await.unwrap();
+    let log_stream = log_collector.subscribe().await.unwrap();
 
     // Call setValue to emit the ValueSet event
     contract
@@ -171,7 +171,7 @@ async fn test_event_collector_receives_events() {
     // Create an event collector for ValueSet events
     let event_filter = contract.ValueSet_filter();
     let event_collector = EventCollector::new(event_filter);
-    let event_stream = event_collector.get_event_stream().await.unwrap();
+    let event_stream = event_collector.subscribe().await.unwrap();
 
     // Call setValue to emit the ValueSet event
     contract
@@ -219,7 +219,7 @@ async fn test_complete_flow() {
 
     #[async_trait]
     impl Collector<NumberEvent> for SimpleNumberCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, NumberEvent>> {
+        async fn subscribe(&self) -> Result<CollectorStream<'_, NumberEvent>> {
             let stream = tokio_stream::StreamExt::map(tokio_stream::iter(1..=10), NumberEvent);
             Ok(Box::pin(stream))
         }
@@ -326,7 +326,7 @@ async fn test_complete_flow() {
     let mut executor = NumberExecutor::new();
 
     // Create collector stream and execute flow
-    let mut event_stream = collector.get_event_stream().await.unwrap();
+    let mut event_stream = collector.subscribe().await.unwrap();
 
     while let Some(event) = event_stream.next().await {
         let mut actions = strategy.process_event(event).await.unwrap();
@@ -373,7 +373,7 @@ mod engine_tests {
 
     #[async_trait]
     impl Collector<u32> for FixedCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+        async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
             Ok(Box::pin(futures::stream::iter(self.items.clone())))
         }
     }
@@ -383,7 +383,7 @@ mod engine_tests {
 
     #[async_trait]
     impl Collector<u32> for InfiniteCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+        async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
             let stream = futures::stream::unfold(0u32, |n| async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 Some((n, n + 1))
@@ -392,12 +392,12 @@ mod engine_tests {
         }
     }
 
-    /// A collector whose `get_event_stream` always fails.
+    /// A collector whose `subscribe` always fails.
     struct FailingCollector;
 
     #[async_trait]
     impl Collector<u32> for FailingCollector {
-        async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+        async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
             Err(anyhow::anyhow!("collector failure"))
         }
     }
@@ -498,7 +498,7 @@ mod engine_tests {
 
         #[async_trait]
         impl Collector<u32> for BurstCollector {
-            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
                 Ok(Box::pin(futures::stream::iter(0..self.count)))
             }
         }

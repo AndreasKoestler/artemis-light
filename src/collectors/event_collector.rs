@@ -23,7 +23,7 @@ where
     P: Provider,
     E: SolEvent + Send + Sync,
 {
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
         let stream = self.event.subscribe().await?.into_stream();
         let stream = stream.filter_map(|el| match el {
             Ok((e, _)) => Some(e),

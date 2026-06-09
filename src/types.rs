@@ -1,8 +1,7 @@
 use alloy::rpc::types::Transaction;
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, stream::select};
-use jsonrpsee::core::DeserializeOwned;
+use futures::Stream;
 use std::pin::Pin;
 
 use crate::collectors::NewBlock;
@@ -18,7 +17,13 @@ pub type ActionStream<'a, A> = Pin<Box<dyn Stream<Item = A> + Send + 'a>>;
 #[async_trait]
 pub trait Collector<E>: Send + Sync {
     /// Returns the core event stream for the collector.
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>>;
+    async fn subscribe(&self) -> Result<CollectorStream<'_, E>>;
+
+    /// Deprecated alias for [`subscribe`](Collector::subscribe).
+    #[deprecated(since = "0.1.0", note = "Use `subscribe` instead")]
+    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
+        self.subscribe().await
+    }
 }
 
 /// Strategy trait, which defines the core logic for each opportunity.
@@ -39,102 +44,6 @@ pub trait Executor<A>: Send + Sync {
     async fn execute(&mut self, action: A) -> Result<()>;
 }
 
-/// CollectorMap is a wrapper around a [Collector] that maps outgoing
-/// events to a different type.
-pub struct CollectorMap<E, F> {
-    collector: Box<dyn Collector<E>>,
-    f: F,
-}
-impl<E, F> CollectorMap<E, F> {
-    /// Creates a new `CollectorMap` wrapping `collector` with the mapping function `f`.
-    pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
-        Self { collector, f }
-    }
-}
-
-#[async_trait]
-impl<E1, E2, F> Collector<E2> for CollectorMap<E1, F>
-where
-    E1: Send + Sync + 'static,
-    E2: Send + Sync + 'static,
-    F: Fn(E1) -> E2 + Send + Sync + Clone + 'static,
-{
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
-        let stream = self.collector.get_event_stream().await?;
-        let f = self.f.clone();
-        let stream = stream.map(f);
-        Ok(Box::pin(stream))
-    }
-}
-/// FilterCollectorMap is a wrapper around a [Collector] that filter-maps
-/// outgoing events, discarding `None` results and unwrapping `Some`.
-pub struct FilterCollectorMap<E, F> {
-    collector: Box<dyn Collector<E>>,
-    f: F,
-}
-impl<E, F> FilterCollectorMap<E, F> {
-    /// Creates a new `FilterCollectorMap` wrapping `collector` with the filter-map function `f`.
-    pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
-        Self { collector, f }
-    }
-}
-
-#[async_trait]
-impl<E1, E2, F> Collector<E2> for FilterCollectorMap<E1, F>
-where
-    E1: Send + Sync + 'static,
-    E2: Send + Sync + 'static,
-    F: Fn(E1) -> Option<E2> + Send + Sync + Clone + 'static,
-{
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E2>> {
-        let stream = self.collector.get_event_stream().await?;
-        let f = self.f.clone();
-        let stream = stream.filter_map(move |event| {
-            let f = f.clone();
-            async move { f(event) }
-        });
-        Ok(Box::pin(stream))
-    }
-}
-
-/// Merges two [Collector]s into a single stream that interleaves events from both.
-pub struct CollectorMerge<C1, C2> {
-    this: C1,
-    other: C2,
-}
-
-impl<C1, C2> CollectorMerge<C1, C2> {
-    /// Creates a new `CollectorMerge` that interleaves events from `this` and `other`.
-    pub fn new(this: C1, other: C2) -> Self {
-        Self { this, other }
-    }
-}
-
-#[async_trait]
-impl<C1, C2, E> Collector<E> for CollectorMerge<C1, C2>
-where
-    C1: Collector<E> + Send + Sync + 'static,
-    C2: Collector<E> + Send + Sync + 'static,
-    E: Send + Sync + DeserializeOwned + 'static,
-{
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
-        let this_stream = self.this.get_event_stream().await?;
-        let other_stream = self.other.get_event_stream().await?;
-        let merged = Box::pin(select(this_stream, other_stream)) as CollectorStream<'_, E>;
-        Ok(Box::pin(merged))
-    }
-}
-
-#[async_trait]
-impl<E: 'static, C: Collector<E>> Collector<E> for Vec<Box<C>> {
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
-        let stream = futures::stream::iter(self.iter())
-            .then(|collector| collector.get_event_stream())
-            .filter_map(|result| async { result.ok() })
-            .flatten();
-        Ok(Box::pin(stream))
-    }
-}
 /// A wrapper around an [Executor] that filter-maps incoming actions,
 /// silently dropping actions that map to `None`.
 pub struct ExecutorFilterMap<E, F> {

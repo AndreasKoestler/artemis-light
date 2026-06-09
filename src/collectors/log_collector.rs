@@ -26,7 +26,7 @@ impl<M> Collector<Log> for LogCollector<M>
 where
     M: Provider,
 {
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, Log>> {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, Log>> {
         let stream = self.provider.subscribe_logs(&self.filter).await?;
         let stream = stream.into_stream();
         Ok(Box::pin(stream))
