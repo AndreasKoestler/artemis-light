@@ -442,13 +442,13 @@ mod engine_tests {
             count: count.clone(),
         }));
 
-        let (token, mut set) = engine.run().await.unwrap();
+        let mut handle = engine.run().await.unwrap();
 
         // The finite collector will complete; give it a moment to drain.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        token.cancel();
+        handle.token.cancel();
 
-        while set.join_next().await.is_some() {}
+        while handle.tasks.join_next().await.is_some() {}
 
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
@@ -465,7 +465,7 @@ mod engine_tests {
             count: count.clone(),
         }));
 
-        let (token, mut set) = engine.run().await.unwrap();
+        let mut handle = engine.run().await.unwrap();
 
         // Let it run briefly so some events flow.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -474,10 +474,10 @@ mod engine_tests {
             "expected some events to flow"
         );
 
-        token.cancel();
+        handle.token.cancel();
 
         let deadline = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while set.join_next().await.is_some() {}
+            while handle.tasks.join_next().await.is_some() {}
         })
         .await;
 
@@ -528,13 +528,13 @@ mod engine_tests {
             count: count.clone(),
         }));
 
-        let (token, mut set) = engine.run().await.unwrap();
+        let mut handle = engine.run().await.unwrap();
 
         // Give enough time for events to drain through the slow strategy.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        token.cancel();
+        handle.token.cancel();
 
-        while set.join_next().await.is_some() {}
+        while handle.tasks.join_next().await.is_some() {}
 
         let executed = count.load(Ordering::SeqCst);
         assert!(
@@ -556,17 +556,121 @@ mod engine_tests {
             count: count.clone(),
         }));
 
-        let (token, mut set) = engine.run().await.unwrap();
+        let mut handle = engine.run().await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        token.cancel();
+        handle.token.cancel();
 
-        while set.join_next().await.is_some() {}
+        while handle.tasks.join_next().await.is_some() {}
 
         assert_eq!(
             count.load(Ordering::SeqCst),
             2,
             "good collector's events should still flow"
         );
+    }
+
+    /// A collector whose stream always ends immediately + a low failure
+    /// threshold; verify the engine surfaces a fatal cause and cancels its own
+    /// token — exercising the C1 escalation *without the test process dying*.
+    #[tokio::test]
+    async fn test_engine_collector_fatal_escalation() {
+        use artemis_light::engine::reconnect::ReconnectConfig;
+        use std::time::Duration;
+
+        /// Always yields an empty stream — i.e. the subscription ends at once.
+        struct EndingCollector;
+
+        #[async_trait]
+        impl Collector<u32> for EndingCollector {
+            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+                Ok(Box::pin(futures::stream::empty::<u32>()))
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default().with_reconnect_config(ReconnectConfig {
+            max_failures: 2,
+            base_delay: Duration::from_millis(10),
+        });
+        engine.add_collector(Box::new(EndingCollector));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let mut handle = engine.run().await.unwrap();
+
+        // The fatal token fires after the threshold of consecutive stream-ends.
+        tokio::time::timeout(Duration::from_secs(1), handle.fatal.cancelled())
+            .await
+            .expect("fatal signal did not fire within 1 s");
+
+        // The engine also cancelled its root token; the process is still alive.
+        assert!(
+            handle.token.is_cancelled(),
+            "root token should be cancelled on fatal escalation"
+        );
+
+        while handle.tasks.join_next().await.is_some() {}
+    }
+
+    /// A collector that escalates to `Fatal` *while* a strategy is still
+    /// syncing. The root-token cancellation must not be reported as a generic
+    /// `Err` — `run` must hand back an `EngineHandle` with `fatal` set so the
+    /// caller still observes the fatal cause and follows the documented exit
+    /// path. Regression test for the fatal-during-sync handle loss.
+    #[tokio::test]
+    async fn test_engine_fatal_during_sync_returns_handle() {
+        use artemis_light::engine::reconnect::ReconnectConfig;
+        use std::time::Duration;
+
+        /// Always yields an empty stream — the subscription ends at once.
+        struct EndingCollector;
+
+        #[async_trait]
+        impl Collector<u32> for EndingCollector {
+            async fn get_event_stream(&self) -> Result<CollectorStream<'_, u32>> {
+                Ok(Box::pin(futures::stream::empty::<u32>()))
+            }
+        }
+
+        /// Strategy whose sync outlives the collector's escalation window.
+        struct SlowSyncStrategy;
+
+        #[async_trait]
+        impl Strategy<u32, u32> for SlowSyncStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                Ok(Box::pin(futures::stream::iter(vec![event])))
+            }
+        }
+
+        let mut engine = Engine::<u32, u32>::default().with_reconnect_config(ReconnectConfig {
+            max_failures: 2,
+            base_delay: Duration::from_millis(10),
+        });
+        engine.add_collector(Box::new(EndingCollector));
+        engine.add_strategy(Box::new(SlowSyncStrategy));
+
+        let mut handle = tokio::time::timeout(Duration::from_secs(1), engine.run())
+            .await
+            .expect("run did not return within 1 s")
+            .expect("fatal during sync should return Ok(handle), not Err");
+
+        assert!(
+            handle.fatal.is_cancelled(),
+            "fatal cause should be observable on the returned handle"
+        );
+        assert!(
+            handle.token.is_cancelled(),
+            "root token should be cancelled on fatal escalation"
+        );
+
+        while handle.tasks.join_next().await.is_some() {}
     }
 }

@@ -82,13 +82,13 @@ async fn main() -> Result<()> {
     engine.add_executor(Box::new(PrintExecutor));
 
     println!("Starting engine — will process 5 ticks then exit...\n");
-    let (token, mut set) = engine.run().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut handle = engine.run().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Wait for all tasks to finish (the finite collector will complete).
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    token.cancel();
+    handle.token.cancel();
 
-    while set.join_next().await.is_some() {}
+    while handle.tasks.join_next().await.is_some() {}
 
     println!("\nDone!");
     Ok(())

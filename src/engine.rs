@@ -1,5 +1,6 @@
+pub mod reconnect;
+
 use std::marker::PhantomData;
-use std::time::Duration;
 
 use tokio::sync::broadcast::{self, Sender};
 use tokio::task::JoinSet;
@@ -8,6 +9,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::types::{Collector, Executor, Strategy};
+use reconnect::{Decision, ReconnectConfig, ReconnectPolicy};
+
+/// Handle returned by [`Engine::run`]. Bundles the cooperative-shutdown token,
+/// the set of running tasks, and an observe-only token that fires if a
+/// collector becomes unrecoverable.
+pub struct EngineHandle {
+    /// Cancel this to shut the engine down cooperatively.
+    pub token: CancellationToken,
+    /// The spawned collector/strategy/executor tasks.
+    pub tasks: JoinSet<()>,
+    /// Observe-only. The engine cancels this — and then `token` — if a collector
+    /// exhausts its [`ReconnectPolicy`], so the binary can tell a fatal shutdown
+    /// apart from a caller-initiated one. The library never calls
+    /// `process::exit`; the binary observes this and decides whether to restart.
+    /// Do not cancel it yourself.
+    pub fatal: CancellationToken,
+}
 
 /// The main engine of Artemis. This struct is responsible for orchestrating the
 /// data flow between collectors, strategies, and executors.
@@ -27,6 +45,9 @@ pub struct Engine<E, A> {
     /// The capacity of the action channel.
     action_channel_capacity: usize,
 
+    /// How collectors reconnect after a lost or failed stream.
+    reconnect_config: ReconnectConfig,
+
     _a: PhantomData<A>,
 }
 
@@ -38,6 +59,7 @@ impl<E, A> Default for Engine<E, A> {
             executors: vec![],
             event_channel_capacity: 512,
             action_channel_capacity: 512,
+            reconnect_config: ReconnectConfig::default(),
             _a: PhantomData,
         }
     }
@@ -57,6 +79,7 @@ impl<E, A> Engine<E, A> {
             executors,
             event_channel_capacity,
             action_channel_capacity,
+            reconnect_config: ReconnectConfig::default(),
             _a: PhantomData,
         }
     }
@@ -68,6 +91,12 @@ impl<E, A> Engine<E, A> {
 
     pub fn with_action_channel_capacity(mut self, capacity: usize) -> Self {
         self.action_channel_capacity = capacity;
+        self
+    }
+
+    /// Sets the [`ReconnectConfig`] applied to every collector.
+    pub fn with_reconnect_config(mut self, config: ReconnectConfig) -> Self {
+        self.reconnect_config = config;
         self
     }
 }
@@ -100,14 +129,20 @@ where
     /// buffer in the broadcast channel while historical sync runs. This
     /// eliminates the gap between HTTP replay and WS subscription.
     ///
-    /// Returns a [`CancellationToken`] that can be used to shut down the engine,
-    /// and a [`JoinSet`] that can be used to await task completion.
-    pub async fn run(self) -> Result<(CancellationToken, JoinSet<()>), Box<dyn std::error::Error>> {
+    /// Returns an [`EngineHandle`] carrying the shutdown token, the running
+    /// tasks, and a one-shot that fires if a collector becomes unrecoverable.
+    pub async fn run(self) -> Result<EngineHandle, Box<dyn std::error::Error>> {
         let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
         let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);
 
         let token = CancellationToken::new();
         let mut set = JoinSet::new();
+
+        let reconnect_config = self.reconnect_config;
+        // Independent of `token` so a caller-initiated shutdown isn't mistaken
+        // for a fatal one. Clone + idempotent, so every collector shares it
+        // directly — first to escalate wins, the rest are no-ops.
+        let fatal = CancellationToken::new();
 
         // Spawn executors first (they subscribe before any events flow).
         for mut executor in self.executors {
@@ -143,30 +178,44 @@ where
         }
 
         // Spawn collectors so WS subscriptions are active during strategy sync.
+        //
+        // Each collector drives a per-collector `ReconnectPolicy`: it pumps
+        // events while the stream lives, and on a lost or failed stream asks the
+        // policy whether to retry-after-backoff or escalate. A `Fatal` verdict
+        // cancels the `fatal` token (the reason) and the *root* token (tearing
+        // down every task) — the library never calls `process::exit`.
         for collector in self.collectors {
             let event_sender = event_sender.clone();
             let child = token.child_token();
+            let root = token.clone();
+            let fatal = fatal.clone();
             set.spawn(async move {
                 info!("starting collector...");
-                let mut retries = 0u32;
+                let mut policy = ReconnectPolicy::new(reconnect_config);
                 loop {
                     let mut event_stream = match collector.get_event_stream().await {
                         Ok(s) => s,
                         Err(e) => {
-                            retries += 1;
-                            error!("collector stream creation failed (attempt {retries}): {e}");
-                            if retries >= 3 {
-                                error!("collector failed {retries} times, giving up");
-                                return;
+                            error!("collector stream creation failed: {e}");
+                            match policy.on_creation_failed() {
+                                Decision::Retry { after } => {
+                                    warn!("retrying stream creation in {after:?}");
+                                    tokio::select! {
+                                        _ = child.cancelled() => return,
+                                        _ = tokio::time::sleep(after) => continue,
+                                    }
+                                }
+                                Decision::Fatal => {
+                                    error!(
+                                        "collector unrecoverable (creation), shutting down engine"
+                                    );
+                                    fatal.cancel();
+                                    root.cancel();
+                                    return;
+                                }
                             }
-                            tokio::select! {
-                                _ = child.cancelled() => return,
-                                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(retries))) => {}
-                            }
-                            continue;
                         }
                     };
-                    let mut received_events = false;
                     loop {
                         tokio::select! {
                             _ = child.cancelled() => {
@@ -176,7 +225,7 @@ where
                             event = event_stream.next() => {
                                 match event {
                                     Some(event) => {
-                                        received_events = true;
+                                        policy.on_events_received();
                                         if let Err(e) = event_sender.send(event) {
                                             error!("error sending event: {e}");
                                         }
@@ -186,19 +235,21 @@ where
                             }
                         }
                     }
-                    // Stream ended (WS disconnected)
-                    if received_events {
-                        retries = 0;
-                    }
-                    retries += 1;
-                    warn!("collector stream ended (attempt {retries}), retrying...");
-                    if retries >= 3 {
-                        error!("collector stream ended {retries} times, exiting process");
-                        std::process::exit(1);
-                    }
-                    tokio::select! {
-                        _ = child.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_secs(2u64.pow(retries))) => {}
+                    // Stream ended (e.g. the WebSocket dropped).
+                    match policy.on_stream_ended() {
+                        Decision::Retry { after } => {
+                            warn!("collector stream ended, retrying in {after:?}");
+                            tokio::select! {
+                                _ = child.cancelled() => return,
+                                _ = tokio::time::sleep(after) => {}
+                            }
+                        }
+                        Decision::Fatal => {
+                            error!("collector unrecoverable (stream ended), shutting down engine");
+                            fatal.cancel();
+                            root.cancel();
+                            return;
+                        }
                     }
                 }
             });
@@ -215,6 +266,18 @@ where
             info!("syncing strategy state...");
             tokio::select! {
                 _ = token.cancelled() => {
+                    // A collector may have escalated to `Fatal` during sync,
+                    // cancelling the root token. Hand back the handle so the
+                    // caller still observes `fatal` (already cancelled) and
+                    // follows the documented exit path. Only a caller-initiated
+                    // cancellation (fatal unset) is a plain error.
+                    if fatal.is_cancelled() {
+                        return Ok(EngineHandle {
+                            token,
+                            tasks: set,
+                            fatal,
+                        });
+                    }
                     return Err("engine cancelled during strategy sync".into());
                 }
                 result = strategy.sync_state() => {
@@ -271,6 +334,10 @@ where
             });
         }
 
-        Ok((token, set))
+        Ok(EngineHandle {
+            token,
+            tasks: set,
+            fatal,
+        })
     }
 }
