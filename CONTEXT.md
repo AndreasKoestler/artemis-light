@@ -18,8 +18,12 @@ The sink that carries out actions in an external domain (submitting a tx, postin
 The orchestrator that spawns every Collector, Strategy, and Executor as a task and fans events/actions between them over broadcast channels.
 
 **Reconnect Policy**:
-The per-Collector state machine that decides, after a stream is lost or never established, whether to **Retry** (after a backoff delay) or declare the Collector **Fatal** (unrecoverable). It owns the consecutive-failure counter and the backoff curve; it performs no I/O and keeps no clock — the driver supplies timing and cancellation.
+The per-Collector state machine that decides, after a stream is lost or never established, whether to **Retry** (after a backoff delay) or declare the Collector **Fatal** (unrecoverable). It owns the consecutive-failure counter and the backoff curve; it performs no I/O and keeps no clock — the **Collector Driver** supplies timing and cancellation.
 _Avoid_: retry handler, supervisor, backoff helper
+
+**Collector Driver**:
+The loop that runs one Collector's full lifecycle: subscribe to the event stream, pump its events into the event channel, and on a lost or failed stream consult the Collector's **Reconnect Policy** — sleeping for a **Retry** or, on a **Fatal** verdict, cancelling the fatal token and then the root token. It supplies the I/O the policy refuses to: the actual `sleep`, the actual stream subscription, the actual send. The Engine spawns one Driver per Collector and otherwise stays out of reconnection.
+_Avoid_: supervisor, collector task, reconnect loop
 
 **Fatal**:
 The Reconnect Policy's verdict that a Collector cannot recover. The Engine responds by cancelling a dedicated, observe-only **fatal token** (the reason) and then the root token (tearing down every task), so the binary can tell a fatal shutdown apart from a caller-initiated one and restart the process with a fresh sync — never by killing the host process itself.
@@ -27,8 +31,8 @@ _Avoid_: crash, panic, die
 
 ## Relationships
 
-- An **Engine** drives many **Collectors**; each **Collector** task owns one **Reconnect Policy** instance.
-- A **Reconnect Policy** counts consecutive stream failures and resets that count only when its Collector delivers a real event.
+- An **Engine** spawns one **Collector Driver** per **Collector**; each Driver owns one **Reconnect Policy** instance.
+- A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 
 ## Example dialogue

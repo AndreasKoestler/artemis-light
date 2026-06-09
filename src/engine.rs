@@ -1,15 +1,17 @@
+mod channel;
+mod driver;
 pub mod reconnect;
 
 use std::marker::PhantomData;
 
+use futures::StreamExt;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::task::JoinSet;
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::types::{Collector, Executor, Strategy};
-use reconnect::{Decision, ReconnectConfig, ReconnectPolicy};
+use reconnect::ReconnectConfig;
 
 /// Handle returned by [`Engine::run`]. Bundles the cooperative-shutdown token,
 /// the set of running tasks, and an observe-only token that fires if a
@@ -144,34 +146,20 @@ where
         // directly — first to escalate wins, the rest are no-ops.
         let fatal = CancellationToken::new();
 
-        // Spawn executors first (they subscribe before any events flow).
+        // Spawn executors first (they subscribe before any events flow). The
+        // action channel — with lag logged, closure and cancellation folded in —
+        // is presented as a plain stream, so the loop is just the per-action work.
         for mut executor in self.executors {
-            let mut receiver = action_sender.subscribe();
-            let child = token.child_token();
+            let mut actions = Box::pin(channel::into_stream(
+                action_sender.subscribe(),
+                token.child_token(),
+                "executor",
+            ));
             set.spawn(async move {
                 info!("starting executor... ");
-                loop {
-                    tokio::select! {
-                        _ = child.cancelled() => {
-                            info!("executor shutting down");
-                            break;
-                        }
-                        result = receiver.recv() => {
-                            match result {
-                                Ok(action) => {
-                                    if let Err(e) = executor.execute(action).await {
-                                        error!("error executing action: {}", e);
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!("executor receiver lagged, skipped {n} messages");
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    info!("action channel closed, executor shutting down");
-                                    break;
-                                }
-                            }
-                        }
+                while let Some(action) = actions.next().await {
+                    if let Err(e) = executor.execute(action).await {
+                        error!("error executing action: {e}");
                     }
                 }
             });
@@ -179,87 +167,31 @@ where
 
         // Spawn collectors so WS subscriptions are active during strategy sync.
         //
-        // Each collector drives a per-collector `ReconnectPolicy`: it pumps
-        // events while the stream lives, and on a lost or failed stream asks the
-        // policy whether to retry-after-backoff or escalate. A `Fatal` verdict
-        // cancels the `fatal` token (the reason) and the *root* token (tearing
-        // down every task) — the library never calls `process::exit`.
+        // Each collector is handed to a [`Collector Driver`](driver), which owns
+        // its full lifecycle — subscribe, pump events, and on a lost or failed
+        // stream consult the per-collector `ReconnectPolicy` to retry-after-
+        // backoff or escalate. A `Fatal` verdict cancels the `fatal` token (the
+        // reason) and the *root* token (tearing down every task); the library
+        // never calls `process::exit`.
         for collector in self.collectors {
-            let event_sender = event_sender.clone();
-            let child = token.child_token();
-            let root = token.clone();
-            let fatal = fatal.clone();
-            set.spawn(async move {
-                info!("starting collector...");
-                let mut policy = ReconnectPolicy::new(reconnect_config);
-                loop {
-                    let mut event_stream = match collector.subscribe().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("collector stream creation failed: {e}");
-                            match policy.on_creation_failed() {
-                                Decision::Retry { after } => {
-                                    warn!("retrying stream creation in {after:?}");
-                                    tokio::select! {
-                                        _ = child.cancelled() => return,
-                                        _ = tokio::time::sleep(after) => continue,
-                                    }
-                                }
-                                Decision::Fatal => {
-                                    error!(
-                                        "collector unrecoverable (creation), shutting down engine"
-                                    );
-                                    fatal.cancel();
-                                    root.cancel();
-                                    return;
-                                }
-                            }
-                        }
-                    };
-                    loop {
-                        tokio::select! {
-                            _ = child.cancelled() => {
-                                info!("collector shutting down");
-                                return;
-                            }
-                            event = event_stream.next() => {
-                                match event {
-                                    Some(event) => {
-                                        policy.on_events_received();
-                                        if let Err(e) = event_sender.send(event) {
-                                            error!("error sending event: {e}");
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                    }
-                    // Stream ended (e.g. the WebSocket dropped).
-                    match policy.on_stream_ended() {
-                        Decision::Retry { after } => {
-                            warn!("collector stream ended, retrying in {after:?}");
-                            tokio::select! {
-                                _ = child.cancelled() => return,
-                                _ = tokio::time::sleep(after) => {}
-                            }
-                        }
-                        Decision::Fatal => {
-                            error!("collector unrecoverable (stream ended), shutting down engine");
-                            fatal.cancel();
-                            root.cancel();
-                            return;
-                        }
-                    }
-                }
-            });
+            let tokens = driver::CollectorTokens {
+                child: token.child_token(),
+                fatal: fatal.clone(),
+                root: token.clone(),
+            };
+            set.spawn(driver::run(
+                collector,
+                reconnect_config,
+                event_sender.clone(),
+                tokens,
+            ));
         }
 
         // Subscribe each strategy to the event channel before syncing so that
         // events produced by collectors during sync are buffered in the receiver.
         // Cancellation is respected during sync via the token.
         for mut strategy in self.strategies {
-            let mut event_receiver = event_sender.subscribe();
+            let event_receiver = event_sender.subscribe();
             let action_sender = action_sender.clone();
             let child = token.child_token();
 
@@ -287,48 +219,27 @@ where
 
             set.spawn(async move {
                 info!("starting strategy... ");
-                loop {
-                    tokio::select! {
-                        _ = child.cancelled() => {
-                            info!("strategy shutting down");
-                            break;
-                        }
-                        result = event_receiver.recv() => {
-                            match result {
-                                Ok(event) => {
-                                    match strategy.process_event(event).await {
-                                        Ok(mut action_stream) => {
-                                            loop {
-                                                tokio::select! {
-                                                    _ = child.cancelled() => {
-                                                        info!("strategy shutting down while draining action stream");
-                                                        return;
-                                                    }
-                                                    action = action_stream.next() => {
-                                                        match action {
-                                                            Some(action) => {
-                                                                if let Err(e) = action_sender.send(action) {
-                                                                    error!("error sending action: {}", e);
-                                                                }
-                                                            }
-                                                            None => break,
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => error!("error processing event: {}", e),
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    warn!("strategy receiver lagged, skipped {n} messages");
-                                }
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    info!("event channel closed, strategy shutting down");
-                                    break;
+                let mut events = Box::pin(channel::into_stream(
+                    event_receiver,
+                    child.clone(),
+                    "strategy",
+                ));
+                while let Some(event) = events.next().await {
+                    match strategy.process_event(event).await {
+                        Ok(action_stream) => {
+                            // Drain the actions, but stop mid-stream on shutdown
+                            // rather than finishing a long stream first. Pinned on
+                            // the stack so the per-event drain costs no allocation.
+                            let mut actions = std::pin::pin!(
+                                action_stream.take_until(child.clone().cancelled_owned())
+                            );
+                            while let Some(action) = actions.next().await {
+                                if let Err(e) = action_sender.send(action) {
+                                    error!("error sending action: {e}");
                                 }
                             }
                         }
+                        Err(e) => error!("error processing event: {e}"),
                     }
                 }
             });
