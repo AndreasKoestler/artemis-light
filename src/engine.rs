@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::types::{Collector, Executor, Strategy};
+use crate::types::{Collector, Executor, Observer, Strategy};
 use reconnect::ReconnectConfig;
 
 /// Handle returned by [`Engine::run`]. Bundles the cooperative-shutdown token,
@@ -41,6 +41,9 @@ pub struct Engine<E, A> {
     /// The set of executors that the engine will use to execute actions.
     executors: Vec<Box<dyn Executor<A>>>,
 
+    /// Passive observers of every event and action crossing the channels.
+    observers: Vec<Box<dyn Observer<E, A>>>,
+
     /// The capacity of the event channel.
     event_channel_capacity: usize,
 
@@ -59,6 +62,7 @@ impl<E, A> Default for Engine<E, A> {
             collectors: vec![],
             strategies: vec![],
             executors: vec![],
+            observers: vec![],
             event_channel_capacity: 512,
             action_channel_capacity: 512,
             reconnect_config: ReconnectConfig::default(),
@@ -79,6 +83,7 @@ impl<E, A> Engine<E, A> {
             collectors,
             strategies,
             executors,
+            observers: vec![],
             event_channel_capacity,
             action_channel_capacity,
             reconnect_config: ReconnectConfig::default(),
@@ -123,6 +128,11 @@ where
         self.executors.push(executor);
     }
 
+    /// Adds a passive observer of every event and action.
+    pub fn add_observer(&mut self, observer: Box<dyn Observer<E, A>>) {
+        self.observers.push(observer);
+    }
+
     /// The core run loop of the engine. This function will spawn a task for
     /// each collector, strategy, and executor. It will then orchestrate the
     /// data flow between them.
@@ -160,6 +170,31 @@ where
                 while let Some(action) = actions.next().await {
                     if let Err(e) = executor.execute(action).await {
                         error!("error executing action: {e}");
+                    }
+                }
+            });
+        }
+
+        // Spawn observers next, before any events flow, so their subscriptions
+        // see everything. An observer is a passive consumer of both channels:
+        // same lag/shutdown semantics as strategies and executors, no feedback
+        // path into the pipeline.
+        for mut observer in self.observers {
+            let mut events = Box::pin(
+                channel::into_stream(event_sender.subscribe(), token.child_token(), "observer")
+                    .fuse(),
+            );
+            let mut actions = Box::pin(
+                channel::into_stream(action_sender.subscribe(), token.child_token(), "observer")
+                    .fuse(),
+            );
+            set.spawn(async move {
+                info!("starting observer... ");
+                loop {
+                    tokio::select! {
+                        Some(event) = events.next() => observer.observe_event(event).await,
+                        Some(action) = actions.next() => observer.observe_action(action).await,
+                        else => break,
                     }
                 }
             });

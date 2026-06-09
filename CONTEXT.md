@@ -17,6 +17,10 @@ The sink that carries out actions in an external domain (submitting a tx, postin
 **Engine**:
 The orchestrator that spawns every Collector, Strategy, and Executor as a task and fans events/actions between them over broadcast channels.
 
+**Observer**:
+A passive consumer of the pipeline: one more subscriber on the Engine's event and action channels, seeing everything Strategies and Executors see while producing and perturbing nothing. Observation is best-effort (a lagging Observer skips messages like any consumer) and infallible by design — there is no error channel through which observing could fail the pipeline. Events and actions each arrive in channel order; no ordering holds between the two.
+_Avoid_: metrics, instrument, monitor, telemetry hook
+
 **Reconnect Policy**:
 The per-Collector state machine that decides, after a stream is lost or never established, whether to **Retry** (after a backoff delay) or declare the Collector **Fatal** (unrecoverable). It owns the consecutive-failure counter and the backoff curve; it performs no I/O and keeps no clock — the **Collector Driver** supplies timing and cancellation.
 _Avoid_: retry handler, supervisor, backoff helper
@@ -63,6 +67,7 @@ _Avoid_: live stream, subscription
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
+- An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
 
 ## Example dialogue
 

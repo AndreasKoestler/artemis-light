@@ -87,10 +87,27 @@ pub enum Actions {
     SubmitTxToMempool(SubmitTxToMempool),
 }
 
-/// Trait for collecting runtime metrics from a stateful component.
-pub trait Metrics<S> {
-    fn collect_metrics(
-        &self,
-        state: &S,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+/// A passive consumer of the pipeline: sees every event fanned to
+/// [Strategies](Strategy) and every action fanned to [Executors](Executor),
+/// and can produce or perturb neither.
+///
+/// An Observer is just another subscriber on the Engine's broadcast channels,
+/// so observation is best-effort with the same semantics as any consumer: a
+/// lagging Observer skips messages (logged) rather than slowing the pipeline.
+/// Events and actions each arrive in channel order, but no ordering is
+/// guaranteed *between* the two. Both methods default to ignoring their input,
+/// so an adapter overrides only the side it cares about; neither returns a
+/// `Result` — there is deliberately no error channel through which observation
+/// could fail the pipeline.
+#[async_trait]
+pub trait Observer<E: Send + 'static, A: Send + 'static>: Send + Sync {
+    /// Called with every event fanned to Strategies. Default: ignore.
+    async fn observe_event(&mut self, event: E) {
+        let _ = event;
+    }
+
+    /// Called with every action fanned to Executors. Default: ignore.
+    async fn observe_action(&mut self, action: A) {
+        let _ = action;
+    }
 }

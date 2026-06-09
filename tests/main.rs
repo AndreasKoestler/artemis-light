@@ -353,7 +353,9 @@ async fn test_complete_flow() {
 mod engine_tests {
     use anyhow::Result;
     use artemis_light::engine::Engine;
-    use artemis_light::types::{ActionStream, Collector, CollectorStream, Executor, Strategy};
+    use artemis_light::types::{
+        ActionStream, Collector, CollectorStream, Executor, Observer, Strategy,
+    };
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -428,7 +430,58 @@ mod engine_tests {
         }
     }
 
+    /// Observer that records every event and action it sees.
+    struct RecordingObserver {
+        events: Arc<std::sync::Mutex<Vec<u32>>>,
+        actions: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    #[async_trait]
+    impl Observer<u32, u32> for RecordingObserver {
+        async fn observe_event(&mut self, event: u32) {
+            self.events.lock().unwrap().push(event);
+        }
+        async fn observe_action(&mut self, action: u32) {
+            self.actions.lock().unwrap().push(action);
+        }
+    }
+
     // -- Tests --------------------------------------------------------------
+
+    /// An Observer sees every event fanned to strategies and every action
+    /// fanned to executors, without perturbing either: the executor still
+    /// receives all actions.
+    #[tokio::test]
+    async fn test_engine_observer_sees_events_and_actions() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1, 2, 3])));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+        engine.add_observer(Box::new(RecordingObserver {
+            events: events.clone(),
+            actions: actions.clone(),
+        }));
+
+        let mut handle = engine.run().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.token.cancel();
+        while handle.tasks.join_next().await.is_some() {}
+
+        assert_eq!(*events.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(*actions.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "observation must not perturb the pipeline"
+        );
+    }
 
     /// 3 events flow through collector -> strategy -> executor; verify count.
     #[tokio::test]
