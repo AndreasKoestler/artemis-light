@@ -125,7 +125,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artemis-light = { git = "https://github.com/hypurrfi/artemis-light" }
+artemis-light = { git = "https://github.com/AndreasKoestler/artemis-light" }
 ```
 
 ### Minimal example
@@ -200,3 +200,15 @@ Lint checks:
 cargo fmt --all -- --check
 RUSTFLAGS="-Dwarnings" cargo clippy --all-features
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, please follow
+[SECURITY.md](SECURITY.md) instead of opening a public issue.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+This project is a derivative of [Artemis](https://github.com/paradigmxyz/artemis)
+by Paradigm, also licensed under Apache-2.0; see [NOTICE](NOTICE).
