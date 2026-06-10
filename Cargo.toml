@@ -41,5 +41,21 @@ name = "basic_example"
 path = "examples/basic_example.rs"
 
 [[example]]
+name = "combinators_example"
+path = "examples/combinators_example.rs"
+
+[[example]]
+name = "observer_example"
+path = "examples/observer_example.rs"
+
+[[example]]
+name = "reconnect_example"
+path = "examples/reconnect_example.rs"
+
+[[example]]
 name = "persistence_example"
 path = "examples/persistence_example.rs"
+
+[[example]]
+name = "onchain_example"
+path = "examples/onchain_example.rs"

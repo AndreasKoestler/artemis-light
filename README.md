@@ -1,8 +1,12 @@
 # artemis-light
 
+[![crates.io](https://img.shields.io/crates/v/artemis-light.svg)](https://crates.io/crates/artemis-light)
+[![docs.rs](https://docs.rs/artemis-light/badge.svg)](https://docs.rs/artemis-light)
+[![CI](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml/badge.svg)](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml)
+
 A stripped-down, modernised fork of the [Artemis](https://github.com/paradigmxyz/artemis) MEV framework, built on [Alloy](https://github.com/alloy-rs/alloy) and Tokio.
 
-**[API documentation](https://andreaskoestler.github.io/artemis-light/)**
+**[API documentation](https://andreaskoestler.github.io/artemis-light/)** (also on [docs.rs](https://docs.rs/artemis-light))
 
 ## Architecture
 
@@ -127,7 +131,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artemis-light = { git = "https://github.com/AndreasKoestler/artemis-light" }
+artemis-light = "0.1"
 ```
 
 ### Minimal example
@@ -181,6 +185,20 @@ configurable threshold (`Engine::with_reconnect_config`). Once exhausted, the
 engine cancels every task and fires `handle.fatal` — an observe-only token that
 lets the binary tell a fatal shutdown apart from a Ctrl-C one and restart,
 rather than the library killing the process.
+
+## Examples
+
+Runnable, narrated demos of every facility — the core pipeline, collector
+combinators, observers, the reconnect/fatal lifecycle, persistence, and an
+end-to-end on-chain run against a local Anvil chain — live in
+[`examples/`](examples/). Start with:
+
+```sh
+cargo run --example basic_example
+```
+
+and see [`examples/README.md`](examples/README.md) for the full list and a
+suggested reading order.
 
 ## Testing
 
