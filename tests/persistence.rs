@@ -68,6 +68,12 @@ struct FakeCollector {
     /// Number of leading `query_range` calls that should error before the rest
     /// succeed — used to simulate a transient RPC backfill failure.
     query_range_fails: AtomicUsize,
+    /// 1-based index of a single `query_range` call to fail (0 = none) — used
+    /// to simulate one bad chunk in the middle of a sliced backfill.
+    query_range_fails_on_call: AtomicUsize,
+    /// Every `(from, to)` range passed to `query_range`, for asserting how the
+    /// wrapper slices the backfill.
+    queried: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
 }
 
 impl FakeCollector {
@@ -86,6 +92,15 @@ impl FakeCollector {
     fn fail_query_range_times(self, n: usize) -> Self {
         self.query_range_fails.store(n, Ordering::SeqCst);
         self
+    }
+    fn fail_query_range_on_call(self, n: usize) -> Self {
+        self.query_range_fails_on_call.store(n, Ordering::SeqCst);
+        self
+    }
+    /// Handle onto the recorded `query_range` calls; stays usable after the
+    /// collector has been consumed by `with_persistence`.
+    fn queried(&self) -> Arc<std::sync::Mutex<Vec<(u64, u64)>>> {
+        self.queried.clone()
     }
 }
 
@@ -111,6 +126,19 @@ impl PersistableCollector<ValueSet> for FakeCollector {
         from: u64,
         to: u64,
     ) -> Result<CollectorStream<'_, (u64, ValueSet)>> {
+        let call_number = {
+            let mut queried = self.queried.lock().unwrap();
+            queried.push((from, to));
+            queried.len()
+        };
+        // Real RPC providers reject inverted `eth_getLogs` ranges; tolerating
+        // them here would hide a wrapper that issues impossible queries.
+        if from > to {
+            anyhow::bail!("inverted range: from {from} > to {to}");
+        }
+        if self.query_range_fails_on_call.load(Ordering::SeqCst) == call_number {
+            anyhow::bail!("simulated query_range failure on call {call_number}");
+        }
         let remaining = self.query_range_fails.load(Ordering::SeqCst);
         if remaining > 0 {
             self.query_range_fails
@@ -413,6 +441,152 @@ async fn persisted_backfills_gap_between_last_stored_and_tip() {
     );
 }
 
+/// Restarting while the stored height already equals (or exceeds) the chain
+/// tip must not issue an inverted backfill query (`from > to`). Real providers
+/// reject inverted `eth_getLogs` ranges, and that error would fail every
+/// resubscribe until the Reconnect Policy escalates to Fatal — a restart brick
+/// whose occurrence depends on restart timing. There is no gap, so no query
+/// should be issued at all.
+#[tokio::test]
+async fn backfill_is_skipped_when_store_is_at_the_tip() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 6, 1).await; // last stored block = 6
+
+    // The chain tip is *also* 6 — a restart within one block interval.
+    let collector = FakeCollector::default().live(vec![(7, 2)]).tip(6);
+    let queried = collector.queried();
+    let persisted = collector.with_persistence(store.clone());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Replay delivers the archive, live carries on; nothing was backfilled.
+    assert_eq!(events, vec![value_event(1), value_event(2)]);
+    assert_eq!(
+        *queried.lock().unwrap(),
+        Vec::<(u64, u64)>::new(),
+        "no backfill query should be issued when there is no gap"
+    );
+}
+
+/// The backfill must be sliced into bounded windows rather than issued as one
+/// `query_range` over the whole gap. With an empty store the gap is the entire
+/// chain (`[0 ..= tip]`); a single `eth_getLogs` over that is rejected by most
+/// providers (range/result caps) or returns an unboundedly large payload.
+#[tokio::test]
+async fn backfill_is_sliced_into_bounded_chunks() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    let collector = FakeCollector::default()
+        .tip(25)
+        .backfill(vec![(5, 1), (15, 2), (25, 3)])
+        .live(vec![(26, 4)]);
+    let queried = collector.queried();
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_backfill_chunk_size(10);
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Every backfilled event arrives, in block order, then the live tail.
+    assert_eq!(
+        events,
+        vec![
+            value_event(1),
+            value_event(2),
+            value_event(3),
+            value_event(4)
+        ]
+    );
+    // The gap was queried in inclusive, block-aligned windows of 10.
+    assert_eq!(*queried.lock().unwrap(), vec![(0, 9), (10, 19), (20, 25)]);
+    // Backfilled blocks are complete, so the trailing one is flushed too.
+    assert_eq!(store.last_block("value_set").await.unwrap(), Some(25));
+}
+
+/// With an empty store, the Backfill segment must begin at the configured
+/// start block instead of genesis — a strategy that only cares about recent
+/// history shouldn't have to sync (or be able to fetch) the whole chain.
+#[tokio::test]
+async fn backfill_starts_at_the_configured_start_block() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    // An event below the start block must never be queried for.
+    let collector = FakeCollector::default()
+        .tip(125)
+        .backfill(vec![(99, 1), (110, 2)]);
+    let queried = collector.queried();
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_start_block(100);
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    assert_eq!(events, vec![value_event(2)]);
+    assert_eq!(*queried.lock().unwrap(), vec![(100, 125)]);
+}
+
+/// Stored history that already reaches beyond the start block wins: the
+/// Backfill segment resumes from the last stored block, not from the start
+/// block, so no stored range is ever re-fetched.
+#[tokio::test]
+async fn stored_history_beyond_the_start_block_wins() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 110, 1).await; // last stored block = 110
+
+    let collector = FakeCollector::default()
+        .tip(125)
+        .backfill(vec![(105, 9), (115, 2)]);
+    let queried = collector.queried();
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_start_block(100);
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Replay delivers the archive; backfill covers only `[111 ..= 125]`.
+    assert_eq!(events, vec![value_event(1), value_event(2)]);
+    assert_eq!(*queried.lock().unwrap(), vec![(111, 125)]);
+}
+
+/// A chunk failure in the middle of the Backfill segment must end the whole
+/// subscription stream — including the live tail — not just the backfill. If
+/// the live tail kept going, blocks above the tip would be persisted while the
+/// failed chunk's blocks are missing, advancing the stored height over a
+/// permanent gap. Ending the stream instead hands the failure to the Reconnect
+/// Policy: the resubscribe backfills again from the last stored block.
+#[tokio::test]
+async fn mid_backfill_chunk_failure_ends_the_stream_without_corrupting_progress() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    let collector = FakeCollector::default()
+        .tip(25)
+        .backfill(vec![(5, 1), (15, 2), (25, 3)])
+        .live(vec![(26, 4)])
+        .fail_query_range_on_call(2); // the second chunk
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_backfill_chunk_size(10);
+
+    // The first chunk is queried eagerly and is fine, so subscribe succeeds.
+    let stream = persisted.subscribe().await.unwrap();
+
+    // The stream must terminate (bounded by the timeout) after delivering only
+    // the first chunk — no later chunks, and crucially no live events.
+    let events: Vec<ValueSet> =
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+            .await
+            .expect("stream must end after a failed backfill chunk");
+    assert_eq!(
+        events,
+        vec![value_event(1)],
+        "no event past the failed chunk may be delivered"
+    );
+
+    // The complete first chunk was flushed; nothing later advanced progress.
+    assert_eq!(store.last_block("value_set").await.unwrap(), Some(5));
+    assert_eq!(stored_values(&store).await, vec!["0x1".to_string()]);
+}
+
 /// Slice 5: a schema override declared on the Persisted Collector changes the
 /// table name and column types; events persist under the overridden table.
 #[tokio::test]
@@ -546,10 +720,12 @@ async fn failed_subscribe_does_not_consume_replay() {
     seed(&store, 5, 1).await;
     seed(&store, 6, 2).await;
 
-    // The first backfill query errors; subsequent ones succeed.
+    // Tip 7 leaves a one-block gap, so a backfill query is issued; the first
+    // one errors, subsequent ones succeed.
     let collector = FakeCollector::default()
-        .live(vec![(7, 3)])
-        .tip(6)
+        .backfill(vec![(7, 3)])
+        .live(vec![(8, 4)])
+        .tip(7)
         .fail_query_range_times(1);
     let persisted = collector.with_persistence(store.clone());
 
@@ -562,7 +738,15 @@ async fn failed_subscribe_does_not_consume_replay() {
     // Retry: the stored history (1, 2) must still be replayed — the failed
     // attempt must not have flipped the replay-once flag.
     let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
-    assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
+    assert_eq!(
+        events,
+        vec![
+            value_event(1),
+            value_event(2),
+            value_event(3),
+            value_event(4)
+        ]
+    );
 }
 
 /// A sibling collector that fails its first `subscribe` and succeeds after.

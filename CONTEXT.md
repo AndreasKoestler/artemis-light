@@ -53,7 +53,7 @@ The Segment that reconstructs stored history from the Store. Runs only on the **
 _Avoid_: re-emit, history dump
 
 **Backfill**:
-The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`) from the source. These are complete blocks, so all of them — including the trailing one — are persisted.
+The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`, never below the configured start block) from the source, sliced into bounded block-aligned chunks queried one at a time. These are complete blocks, so all of them — including the trailing one — are persisted. When there is no gap (stored height at or past the tip) no query is issued. A chunk that fails mid-backfill ends the whole subscription — live tail included — so the stored height cannot advance over the hole; the Reconnect Policy drives the resubscribe, which backfills again from the last stored block.
 _Avoid_: catch-up, gap fill
 
 **Live Tail**:
