@@ -1,8 +1,12 @@
 # artemis-light
 
+[![crates.io](https://img.shields.io/crates/v/artemis-light.svg)](https://crates.io/crates/artemis-light)
+[![docs.rs](https://docs.rs/artemis-light/badge.svg)](https://docs.rs/artemis-light)
+[![CI](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml/badge.svg)](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml)
+
 A stripped-down, modernised fork of the [Artemis](https://github.com/paradigmxyz/artemis) MEV framework, built on [Alloy](https://github.com/alloy-rs/alloy) and Tokio.
 
-**[API documentation](https://andreaskoestler.github.io/artemis-light/)**
+**[API documentation](https://andreaskoestler.github.io/artemis-light/)** (also on [docs.rs](https://docs.rs/artemis-light))
 
 ## Architecture
 
@@ -127,7 +131,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artemis-light = { git = "https://github.com/AndreasKoestler/artemis-light" }
+artemis-light = "0.1"
 ```
 
 ### Minimal example
