@@ -565,6 +565,62 @@ async fn failed_subscribe_does_not_consume_replay() {
     assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
 }
 
+/// A sibling collector that fails its first `subscribe` and succeeds after.
+struct FailOnceCollector {
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Collector<ValueSet> for FailOnceCollector {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, ValueSet>> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("sibling subscribe fails the first time");
+        }
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// Composing a `Persisted` collector under a combinator (here `chain`) must not
+/// strand the stored history. If a *sibling* source fails the composite
+/// `subscribe` **after** the `Persisted` source already subscribed
+/// successfully, the engine retries the whole composite — and that retry must
+/// still replay the archive. The replay-once flag must therefore be consumed by
+/// actually delivering the archive, not merely by a `subscribe` whose stream is
+/// then dropped undrained. Regression test for the replay-strand-under-
+/// composition bug.
+#[tokio::test]
+async fn composite_subscribe_failure_does_not_strand_replay() {
+    use artemis_light::collector_ext::CollectorExt;
+
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 5, 1).await;
+    seed(&store, 6, 2).await;
+
+    // Tip equals the last stored block, so there is no gap to backfill; live
+    // carries the next event.
+    let persisted = FakeCollector::default()
+        .live(vec![(7, 3)])
+        .tip(6)
+        .with_persistence(store.clone());
+    let sibling = FailOnceCollector {
+        failed: std::sync::atomic::AtomicBool::new(false),
+    };
+    let chained = persisted.chain(sibling);
+
+    // First subscribe fails: the `Persisted` source subscribes fine, then the
+    // sibling errors and fails the whole composite. The returned `Persisted`
+    // stream is dropped without ever being polled.
+    assert!(
+        chained.subscribe().await.is_err(),
+        "a failing sibling must fail the composite subscribe"
+    );
+
+    // Retry: the stored history (1, 2) must still be replayed — the first
+    // attempt's unpolled stream must not have consumed the replay-once flag.
+    let events: Vec<ValueSet> = chained.subscribe().await.unwrap().collect().await;
+    assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
+}
+
 /// A store that fails `write_block` for one specific block, delegating
 /// everything else to an inner [`SqliteStore`].
 struct FlakyStore {

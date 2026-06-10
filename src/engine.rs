@@ -200,6 +200,20 @@ where
             });
         }
 
+        // Subscribe every strategy's broadcast receiver *before* spawning any
+        // collector. A tokio broadcast channel only retains messages for
+        // receivers that already exist; a receiver created lazily in the sync
+        // loop below would miss every event broadcast before its turn came up —
+        // a deterministic loss for all but the first strategy, since each
+        // strategy syncs (and collectors emit) before the next strategy's
+        // receiver exists. Creating them all up front means events broadcast
+        // during any strategy's sync are buffered for every strategy.
+        let strategies: Vec<_> = self
+            .strategies
+            .into_iter()
+            .map(|strategy| (strategy, event_sender.subscribe()))
+            .collect();
+
         // Spawn collectors so WS subscriptions are active during strategy sync.
         //
         // Each collector is handed to a [`Collector Driver`](driver), which owns
@@ -222,11 +236,11 @@ where
             ));
         }
 
-        // Subscribe each strategy to the event channel before syncing so that
-        // events produced by collectors during sync are buffered in the receiver.
-        // Cancellation is respected during sync via the token.
-        for mut strategy in self.strategies {
-            let event_receiver = event_sender.subscribe();
+        // Sync each strategy and spawn its task. The receiver was subscribed
+        // above, before any collector could emit, so events produced during
+        // sync are buffered for it. Cancellation is respected during sync via
+        // the token.
+        for (mut strategy, event_receiver) in strategies {
             let action_sender = action_sender.clone();
             let child = token.child_token();
 

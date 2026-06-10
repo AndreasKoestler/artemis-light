@@ -669,6 +669,135 @@ mod engine_tests {
         while handle.tasks.join_next().await.is_some() {}
     }
 
+    /// Every strategy must see every event, including ones a collector emits
+    /// while *another* strategy is still syncing. A strategy's broadcast
+    /// receiver must therefore exist before any collector can emit — not be
+    /// created lazily as each strategy's turn comes up in the sync loop, which
+    /// would deterministically lose to the second strategy every event
+    /// broadcast during the first strategy's sync. Regression test for the
+    /// subscribe-after-send startup race.
+    #[tokio::test]
+    async fn test_engine_strategies_dont_miss_events_emitted_during_sync() {
+        use std::time::Duration;
+        use tokio::sync::{Notify, mpsc};
+
+        /// Emits `[1, 2, 3]` only after `gate` fires, then signals `emitted`.
+        /// Gating emission on a signal removes any race between collector start
+        /// and receiver creation, isolating the ordering bug under test.
+        struct GatedCollector {
+            gate: Arc<Notify>,
+            emitted: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Collector<u32> for GatedCollector {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
+                let gate = self.gate.clone();
+                let emitted = self.emitted.clone();
+                let stream = async_stream::stream! {
+                    gate.notified().await;
+                    for i in [1u32, 2, 3] {
+                        yield i;
+                    }
+                    // All three events have now been broadcast; release the
+                    // strategy whose sync opened the gate.
+                    emitted.notify_one();
+                };
+                Ok(Box::pin(stream))
+            }
+        }
+
+        /// Opens the gate during sync, then waits until the collector reports it
+        /// has broadcast every event — so all three are on the channel before
+        /// this strategy's sync returns and the *next* strategy is registered.
+        struct GateOpeningStrategy {
+            gate: Arc<Notify>,
+            emitted: Arc<Notify>,
+            seen: mpsc::UnboundedSender<u32>,
+        }
+
+        #[async_trait]
+        impl Strategy<u32, u32> for GateOpeningStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                self.gate.notify_one();
+                self.emitted.notified().await;
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                let _ = self.seen.send(event);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        /// Syncs instantly. Under the buggy ordering its receiver is created
+        /// only after the gate-opening strategy's sync completes — by which time
+        /// every event has already been broadcast and dropped.
+        struct RecordingStrategy {
+            seen: mpsc::UnboundedSender<u32>,
+        }
+
+        #[async_trait]
+        impl Strategy<u32, u32> for RecordingStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                let _ = self.seen.send(event);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let gate = Arc::new(Notify::new());
+        let emitted = Arc::new(Notify::new());
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(GatedCollector {
+            gate: gate.clone(),
+            emitted: emitted.clone(),
+        }));
+        engine.add_strategy(Box::new(GateOpeningStrategy {
+            gate,
+            emitted,
+            seen: tx_a,
+        }));
+        engine.add_strategy(Box::new(RecordingStrategy { seen: tx_b }));
+
+        let mut handle = engine.run().await.unwrap();
+
+        // Collect what each strategy received, bounded so the buggy case (which
+        // delivers nothing to the second strategy) fails fast instead of hanging.
+        async fn collect_three(rx: &mut mpsc::UnboundedReceiver<u32>) -> Vec<u32> {
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                    Ok(Some(v)) => got.push(v),
+                    _ => break,
+                }
+            }
+            got
+        }
+
+        let a = collect_three(&mut rx_a).await;
+        let b = collect_three(&mut rx_b).await;
+
+        handle.token.cancel();
+        while handle.tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            a,
+            vec![1, 2, 3],
+            "gate-opening strategy must see all events"
+        );
+        assert_eq!(
+            b,
+            vec![1, 2, 3],
+            "a strategy registered after another's sync must not miss events \
+             broadcast during that sync"
+        );
+    }
+
     /// A collector that escalates to `Fatal` *while* a strategy is still
     /// syncing. The root-token cancellation must not be reported as a generic
     /// `Err` — `run` must hand back an `EngineHandle` with `fatal` set so the

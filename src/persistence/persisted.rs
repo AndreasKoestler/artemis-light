@@ -136,7 +136,25 @@ where
         //    the backfill segment cover only the gap since the last stored block.
         let first_subscribe = !self.replayed.load(Ordering::SeqCst);
         let replay: CollectorStream<'_, E> = if first_subscribe {
-            replay_stored::<E, S>(&self.store, table, last).await?
+            let inner = replay_stored::<E, S>(&self.store, table, last).await?;
+            // Flip the replay-once flag when the archive is first *consumed*,
+            // not merely when `subscribe` succeeds. The engine retries
+            // `subscribe` on error, but it also discards the returned stream
+            // when a *sibling* fails the composite subscribe — e.g. this
+            // `Persisted` chained or merged with another collector, where the
+            // other source's subscribe errors after this one already succeeded.
+            // In that case the stream is dropped without ever being polled, so
+            // flipping the flag eagerly here would make the retry skip the DB
+            // replay while backfill covers only blocks after `last` — stranding
+            // the stored history. A zero-item stream that sets the flag on its
+            // first poll, chained ahead of the real replay, ties the flip to
+            // actual consumption.
+            let replayed = &self.replayed;
+            let mark = futures::stream::poll_fn(move |_| {
+                replayed.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(None::<E>)
+            });
+            Box::pin(mark.chain(inner)) as CollectorStream<'_, E>
         } else {
             Box::pin(futures::stream::empty()) as CollectorStream<'_, E>
         };
@@ -146,15 +164,6 @@ where
         let backfill_from = last.map(|l| l + 1).unwrap_or(0);
         let backfill_source = self.collector.query_range(backfill_from, tip).await?;
         let backfill = persist_and_emit(backfill_source, &self.store, self.schema.as_ref(), true);
-
-        // Only now — after every fallible setup step has succeeded — mark the
-        // replay segment as consumed. The engine retries `subscribe` when it
-        // returns an error, so flipping this flag earlier (e.g. right after
-        // `replay_stored`) would make a retry skip the DB replay while backfill
-        // covers only blocks after `last`, stranding the stored history.
-        if first_subscribe {
-            self.replayed.store(true, Ordering::SeqCst);
-        }
 
         // 3. Live tail, strictly above the backfill cut so the two segments are
         //    disjoint. A live subscription streams from "now", whose lower edge
