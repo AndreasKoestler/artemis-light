@@ -11,8 +11,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use super::record::{PAYLOAD_COLUMN, derive_record_with, from_payload, table_name};
-use super::schema::{Row, SqlType, SqlValue, TableSchema};
+use super::record::{derive_record_with, from_payload, table_name};
+use super::schema::{PAYLOAD_COLUMN, Row, SqlType, SqlValue, TableSchema};
 use super::store::Store;
 use crate::types::{Collector, CollectorStream};
 
@@ -89,7 +89,16 @@ impl<C, S> Persisted<C, S> {
     /// from the event signature: rows go to `schema`'s table with its listed
     /// columns (event fields it does not list are dropped; the lossless
     /// payload column is always appended).
+    ///
+    /// # Panics
+    /// Panics when the schema names a column the persistence layer adds
+    /// implicitly (`block_number`, `_payload`) or the store's internal
+    /// progress table — misconfigurations that would otherwise halt
+    /// persistence with an opaque SQL error on the first write.
     pub fn with_schema(mut self, schema: TableSchema) -> Self {
+        if let Err(reason) = schema.ensure_no_reserved_names() {
+            panic!("invalid schema override: {reason}");
+        }
         self.schema = Some(schema);
         self
     }
@@ -431,26 +440,52 @@ impl<'a, S: Store> BlockWriter<'a, S> {
         }
         match derive_record_with(event, self.override_) {
             Ok((row_schema, row)) => {
-                // The block advanced: the previous block is complete.
-                if let (Some(cur), Some(sch)) = (self.current, &self.schema)
-                    && block != cur
-                {
-                    self.healthy =
-                        flush(self.store, sch, cur, std::mem::take(&mut self.buffer)).await;
-                    if !self.healthy {
-                        // This event's block can never be written without
-                        // leaving a gap, so don't buffer its row either.
+                if let (Some(cur), Some(sch)) = (self.current, &self.schema) {
+                    // A backwards block means the open block's completeness
+                    // can no longer be trusted: flushing it would advance the
+                    // stored height past the late block's rows, leaving a
+                    // permanent hole behind the gap-free watermark.
+                    if block < cur {
+                        self.halt(format_args!(
+                            "block {block} arrived after block {cur} (reorg or \
+                             unordered source)"
+                        ));
                         return;
+                    }
+                    // The block advanced: the previous block is complete.
+                    if block > cur {
+                        self.healthy =
+                            flush(self.store, sch, cur, std::mem::take(&mut self.buffer)).await;
+                        if !self.healthy {
+                            // This event's block can never be written without
+                            // leaving a gap, so don't buffer its row either.
+                            return;
+                        }
                     }
                 }
                 self.current = Some(block);
                 self.schema = Some(row_schema);
                 self.buffer.push(row);
             }
-            // A derive failure must not break the event stream the rest of
-            // the pipeline depends on; log and keep forwarding.
-            Err(e) => tracing::error!("failed to derive row for persistence: {e}"),
+            // An event that can't be derived into a row can never be written,
+            // so its block — and everything after it — must not be either:
+            // progress advancing past it would hand the next restart exactly
+            // the quietly truncated history `replay_stored` refuses to emit.
+            // The event stream itself keeps flowing.
+            Err(e) => self.halt(format_args!("failed to derive row: {e}")),
         }
+    }
+
+    /// Stop persisting for the rest of the stream and discard the open block's
+    /// buffer (its completeness is no longer trustworthy). The stored height
+    /// stays at the last fully written block; a restart re-fetches from there.
+    fn halt(&mut self, reason: std::fmt::Arguments<'_>) {
+        self.healthy = false;
+        self.buffer.clear();
+        tracing::error!(
+            "halting persistence ({reason}); events keep flowing, and a \
+             restart will re-sync from the last stored block"
+        );
     }
 
     /// Flush the trailing block. Only correct when the source delivered the
@@ -499,6 +534,18 @@ mod tests {
         }
     }
 
+    alloy::sol! {
+        // No serde derive: `Serialize` is implemented by hand below to produce
+        // a non-object JSON value, which `derive_record_with` rejects.
+        event BadPing(uint256 value);
+    }
+
+    impl serde::Serialize for BadPing {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str("not a JSON object")
+        }
+    }
+
     /// A store whose every write fails.
     struct FailingStore;
 
@@ -511,6 +558,37 @@ mod tests {
             _rows: Vec<Row>,
         ) -> Result<()> {
             anyhow::bail!("simulated write failure at block {block}")
+        }
+        async fn last_block(&self, _table: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+        async fn replay(&self, _schema: &TableSchema, _to: u64) -> Result<Vec<Row>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A store that records which blocks were written and always succeeds.
+    #[derive(Default)]
+    struct RecordingStore {
+        written: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl RecordingStore {
+        fn written(&self) -> Vec<u64> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Store for RecordingStore {
+        async fn write_block(
+            &self,
+            _schema: &TableSchema,
+            block: u64,
+            _rows: Vec<Row>,
+        ) -> Result<()> {
+            self.written.lock().unwrap().push(block);
+            Ok(())
         }
         async fn last_block(&self, _table: &str) -> Result<Option<u64>> {
             Ok(None)
@@ -549,5 +627,60 @@ mod tests {
             0,
             "an unhealthy writer must not accumulate rows"
         );
+    }
+
+    /// A live stream can deliver a lower block after a higher one (a reorg
+    /// re-emission, or a misbehaving source). Flushing on *any* block change
+    /// would write the higher block — advancing `_artemis_progress` past the
+    /// lower block whose rows were never written, so a crash between the two
+    /// transactions leaves a permanent hole behind a "gap-free" watermark. A
+    /// backwards block must instead halt the writer before anything is
+    /// written: the open block's completeness can no longer be trusted.
+    #[tokio::test]
+    async fn writer_halts_on_non_monotone_blocks_without_writing() {
+        let store = RecordingStore::default();
+        let mut writer = BlockWriter::new(&store, None);
+
+        writer.record(5, &ping(1)).await;
+        writer.record(4, &ping(2)).await; // block went backwards
+        writer.record(5, &ping(3)).await; // the reorg's second half
+        writer.finish().await;
+
+        assert_eq!(
+            store.written(),
+            Vec::<u64>::new(),
+            "no block may be written once ordering is violated"
+        );
+        assert_eq!(writer.buffered(), 0);
+    }
+
+    /// An event that cannot be derived into a row must halt persistence, not
+    /// be skipped: progress would otherwise advance past its block, and replay
+    /// would hand strategies exactly the "quietly truncated history" the read
+    /// side refuses to produce (see `replay_stored`). Strategies that ran live
+    /// saw the event; strategies after a restart must not silently lose it.
+    #[tokio::test]
+    async fn writer_halts_on_underivable_event_instead_of_leaving_a_hole() {
+        let store = RecordingStore::default();
+        let mut writer = BlockWriter::new(&store, None);
+
+        writer.record(1, &ping(1)).await;
+        writer
+            .record(
+                2,
+                &BadPing {
+                    value: alloy::primitives::U256::ZERO,
+                },
+            )
+            .await;
+        writer.record(3, &ping(3)).await; // would previously flush past block 2
+        writer.finish().await;
+
+        assert_eq!(
+            store.written(),
+            Vec::<u64>::new(),
+            "nothing may be written once an event cannot be persisted"
+        );
+        assert_eq!(writer.buffered(), 0);
     }
 }

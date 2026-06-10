@@ -12,11 +12,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::schema::{Column, Row, SqlType, SqlValue, TableSchema};
-
-/// Name of the implicit column holding each event's full JSON, used to
-/// losslessly reconstruct the event when replaying from the database.
-pub const PAYLOAD_COLUMN: &str = "_payload";
+use super::schema::{
+    BLOCK_NUMBER_COLUMN, Column, PAYLOAD_COLUMN, Row, SqlType, SqlValue, TableSchema,
+};
 
 /// The best-guess table name for an event type, derived from its Solidity
 /// signature: `ValueSet(uint256)` -> `value_set`.
@@ -91,6 +89,12 @@ where
 
     let (table, columns, mut values) = match override_ {
         Some(schema) => {
+            // An override colliding with an implicit column would produce a
+            // `CREATE TABLE` with duplicate columns; surfacing it here makes
+            // the failure a clear derive error rather than an opaque SQL one.
+            if let Err(reason) = schema.ensure_no_reserved_names() {
+                anyhow::bail!("invalid schema override: {reason}");
+            }
             let values = schema
                 .columns
                 .iter()
@@ -107,6 +111,16 @@ where
             let mut columns = Vec::with_capacity(fields.len());
             let mut values = Vec::with_capacity(fields.len());
             for (name, (ty, value)) in &fields {
+                // The store adds BLOCK_NUMBER_COLUMN and this fn appends
+                // PAYLOAD_COLUMN; an event field by either name would shadow
+                // them in `CREATE TABLE` and break every write.
+                if name == BLOCK_NUMBER_COLUMN || name == PAYLOAD_COLUMN {
+                    anyhow::bail!(
+                        "event field {name:?} is reserved for an implicit column \
+                         the persistence layer adds to every table; rename it \
+                         with a schema override"
+                    );
+                }
                 columns.push(Column::new(name.clone(), *ty));
                 values.push(value.clone());
             }
@@ -140,7 +154,13 @@ pub fn from_payload<E: DeserializeOwned>(payload: &str) -> Result<E> {
 fn infer_type(value: &Value) -> SqlType {
     match value {
         Value::Bool(_) => SqlType::Integer,
-        Value::Number(n) if n.is_i64() || n.is_u64() => SqlType::Integer,
+        Value::Number(n) if n.is_i64() => SqlType::Integer,
+        // A u64 beyond i64::MAX exceeds SQLite's signed 64-bit integers; it is
+        // stored as decimal text (see `json_to_sql`), so type it as text.
+        Value::Number(n) if n.is_u64() => match n.as_u64() {
+            Some(u) if u > i64::MAX as u64 => SqlType::Text,
+            _ => SqlType::Integer,
+        },
         Value::Number(_) => SqlType::Real,
         Value::String(_) => SqlType::Text,
         // Arrays, objects and null are stored as JSON text.
@@ -157,7 +177,11 @@ fn json_to_sql(value: &Value) -> SqlValue {
             if let Some(i) = n.as_i64() {
                 SqlValue::Integer(i)
             } else if let Some(u) = n.as_u64() {
-                SqlValue::Integer(u as i64)
+                // Beyond SQLite's signed 64-bit integers: reinterpreting via
+                // `as i64` would store u64::MAX as -1, handing SQL queries
+                // silently wrong numbers. Spill to decimal text instead; the
+                // `_payload` column already preserves the exact value.
+                SqlValue::Text(u.to_string())
             } else {
                 SqlValue::Real(n.as_f64().unwrap_or(0.0))
             }
@@ -206,7 +230,8 @@ mod tests {
     fn infer_type_is_a_best_guess_from_json() {
         assert_eq!(infer_type(&json!(true)), SqlType::Integer);
         assert_eq!(infer_type(&json!(7)), SqlType::Integer);
-        assert_eq!(infer_type(&json!(u64::MAX)), SqlType::Integer);
+        // Too large for SQLite's signed 64-bit integers: stored as text.
+        assert_eq!(infer_type(&json!(u64::MAX)), SqlType::Text);
         assert_eq!(infer_type(&json!(1.5)), SqlType::Real);
         assert_eq!(infer_type(&json!("0x2a")), SqlType::Text);
         // Arrays, objects and null fall back to JSON text.
@@ -229,13 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn json_to_sql_keeps_a_u64_above_i64_max_as_integer() {
-        // u64::MAX does not fit in i64; it is reinterpreted via `as i64` rather
-        // than spilling to Real, matching SQLite's 64-bit integer storage.
+    fn json_to_sql_spills_a_u64_above_i64_max_to_decimal_text() {
+        // SQLite integers are signed 64-bit; reinterpreting via `as i64` would
+        // store u64::MAX as -1, handing SQL queries silently wrong numbers
+        // (the `_payload` column preserves the true value, so replay was never
+        // affected — but queryable columns must not lie). Spill to a decimal
+        // string instead.
         let big = u64::MAX;
+        assert_eq!(json_to_sql(&json!(big)), SqlValue::Text(big.to_string()));
+        // The i64 boundary itself still fits and stays an integer.
         assert_eq!(
-            json_to_sql(&json!(big)),
-            SqlValue::Integer(big as i64) // == -1
+            json_to_sql(&json!(i64::MAX as u64)),
+            SqlValue::Integer(i64::MAX)
         );
     }
 

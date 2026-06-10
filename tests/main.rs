@@ -9,7 +9,7 @@ use alloy::{
 };
 use artemis_light::{
     collectors::{BlockCollector, EventCollector, LogCollector, MempoolCollector},
-    executors::{MempoolExecutor, SubmitTxToMempool},
+    executors::{GasBidInfo, MempoolExecutor, SubmitTxToMempool},
     types::{ActionStream, Collector, Executor},
 };
 
@@ -127,6 +127,98 @@ async fn test_mempool_executor_sends_tx_simple() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let tx = provider.get_transaction_count(account).await.unwrap();
     assert_eq!(tx, 1);
+}
+
+/// A bid percentage above 100 would spend more than the opportunity's total
+/// profit on gas — the transaction itself becomes the loss. The executor must
+/// refuse the action rather than overbid.
+#[tokio::test]
+async fn test_mempool_executor_rejects_bid_percentage_above_100() {
+    let (provider, _anvil) = spawn_anvil().await.unwrap();
+    let provider = Arc::new(provider);
+    let mut mempool_executor = MempoolExecutor::new(provider.clone());
+
+    let account = provider.get_accounts().await.unwrap()[0];
+    let tx = TransactionRequest::default()
+        .with_to(account)
+        .with_from(account)
+        .with_value(U256::from(42));
+
+    let action = SubmitTxToMempool {
+        tx,
+        gas_bid_info: Some(GasBidInfo {
+            total_profit: 1_000_000_000_000,
+            bid_percentage: 101,
+        }),
+    };
+    let err = mempool_executor.execute(action).await.unwrap_err();
+    assert!(
+        err.to_string().contains("bid_percentage"),
+        "error should name the invalid field, got: {err}"
+    );
+
+    // Nothing was sent.
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), 0);
+}
+
+/// With a gas bid, the executor prices the tx at
+/// `total_profit / gas_usage * bid_percentage / 100` and sets the gas limit
+/// from its own estimate (so the provider's filler doesn't re-estimate).
+#[tokio::test]
+async fn test_mempool_executor_prices_tx_from_gas_bid() {
+    use alloy::consensus::Transaction as _;
+
+    let (provider, _anvil) = spawn_anvil().await.unwrap();
+    let provider = Arc::new(provider);
+    let mut mempool_executor = MempoolExecutor::new(provider.clone());
+
+    let account = provider.get_accounts().await.unwrap()[0];
+    let tx = TransactionRequest::default()
+        .with_to(account)
+        .with_from(account)
+        .with_value(U256::from(42));
+
+    // A plain transfer estimates at 21_000 gas; a profit of 21_000 * 4 gwei
+    // makes the breakeven price 4 gwei, so a 50% bid prices at 2 gwei —
+    // comfortably above anvil's default 1 gwei base fee.
+    const GWEI: u128 = 1_000_000_000;
+    let action = SubmitTxToMempool {
+        tx,
+        gas_bid_info: Some(GasBidInfo {
+            total_profit: 21_000 * 4 * GWEI,
+            bid_percentage: 50,
+        }),
+    };
+    mempool_executor.execute(action).await.unwrap();
+
+    // Wait for the 1s-block chain to mine it, then find the (only) tx by
+    // scanning blocks from the tip down.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let tip = provider.get_block_number().await.unwrap();
+    let mut sent = None;
+    for n in (0..=tip).rev() {
+        let block = provider
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(n)))
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(hash) = block.transactions.into_hashes().hashes().next() {
+            sent = provider.get_transaction_by_hash(hash).await.unwrap();
+            break;
+        }
+    }
+    let sent = sent.expect("the bid-priced transaction should have been mined");
+
+    assert_eq!(
+        sent.gas_price(),
+        Some(2 * GWEI),
+        "tx must be priced at breakeven * bid_percentage"
+    );
+    assert_eq!(
+        sent.gas_limit(),
+        21_000,
+        "the executor's estimate must be set as the gas limit"
+    );
 }
 
 /// Test that LogCollector receives logs emitted by a contract.

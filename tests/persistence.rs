@@ -182,6 +182,43 @@ fn value_set_schema() -> TableSchema {
     }
 }
 
+/// A file-backed store must run in WAL journal mode. The default rollback
+/// journal takes an exclusive lock per write and answers concurrent access
+/// with an immediate SQLITE_BUSY — and a single failed write permanently
+/// halts persistence (by design, to keep the gap-free prefix). WAL plus a
+/// busy timeout makes a concurrent reader a non-event instead.
+#[tokio::test]
+async fn sqlite_store_uses_wal_for_file_databases() {
+    let path = std::env::temp_dir().join(format!("artemis_wal_test_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("sqlite:{}", path.display());
+
+    // Connect and write through the store so the mode demonstrably holds on a
+    // live database, not just at open time.
+    let store = SqliteStore::connect(&url).await.unwrap();
+    store
+        .write_block(
+            &value_set_schema(),
+            1,
+            vec![Row(vec![SqlValue::Text("a".into())])],
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    // WAL is a persistent property of the database file; verify it with an
+    // independent plain connection.
+    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    let (mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(mode.to_lowercase(), "wal");
+}
+
 /// Slice 1: a written block can be read back via `replay`.
 #[tokio::test]
 async fn write_block_then_replay_reads_rows_back() {
@@ -339,6 +376,67 @@ fn derive_record_with_override_aligns_values_by_column_name() {
         panic!("payload column should be text");
     };
     assert_eq!(from_payload::<Transfer>(payload).unwrap(), event);
+}
+
+/// A store that accepts nothing and returns nothing — for tests that must
+/// fail before the store is ever touched.
+struct NullStore;
+
+#[async_trait]
+impl Store for NullStore {
+    async fn write_block(&self, _schema: &TableSchema, _block: u64, _rows: Vec<Row>) -> Result<()> {
+        unreachable!("the store must not be reached")
+    }
+    async fn last_block(&self, _table: &str) -> Result<Option<u64>> {
+        unreachable!("the store must not be reached")
+    }
+    async fn replay(&self, _schema: &TableSchema, _to: u64) -> Result<Vec<Row>> {
+        unreachable!("the store must not be reached")
+    }
+}
+
+/// A schema override naming a column the persistence layer adds implicitly
+/// (`block_number`, `_payload`) would produce a `CREATE TABLE` with duplicate
+/// columns — a SQL error that silently halts persistence on the first write.
+/// Misconfiguration must fail at construction instead.
+#[test]
+#[should_panic(expected = "reserved")]
+fn with_schema_rejects_reserved_column_names() {
+    let _ = FakeCollector::default()
+        .with_persistence(NullStore)
+        .with_schema(TableSchema::new("t").col("block_number", SqlType::Integer));
+}
+
+/// A schema override redirecting rows into the store's internal bookkeeping
+/// table would corrupt the progress watermarks of every other table.
+#[test]
+#[should_panic(expected = "reserved")]
+fn with_schema_rejects_the_progress_table() {
+    let _ = FakeCollector::default()
+        .with_persistence(NullStore)
+        .with_schema(TableSchema::new("_artemis_progress").col("value", SqlType::Text));
+}
+
+sol! {
+    // An event whose field collides with the implicit per-row block column.
+    #[derive(serde::Serialize, serde::Deserialize, Debug)]
+    event Sneaky(uint256 block_number);
+}
+
+/// An event field named after an implicit column cannot be stored — the
+/// derived `CREATE TABLE` would have duplicate columns and persistence would
+/// halt on the first write with an opaque SQL error. Deriving must fail with
+/// a clear message instead (which halts persistence loudly at the source).
+#[test]
+fn derive_rejects_event_fields_shadowing_implicit_columns() {
+    let event = Sneaky {
+        block_number: U256::from(1),
+    };
+    let err = derive_record(&event).unwrap_err().to_string();
+    assert!(
+        err.contains("reserved"),
+        "error should name the reserved column, got: {err}"
+    );
 }
 
 /// `payload_schema` describes the read-back shape — table name plus the single

@@ -17,6 +17,29 @@ impl<P, E> EventCollector<P, E> {
     }
 }
 
+/// The `(block, event)` to deliver for one decoded log, or `None` to skip it.
+///
+/// A log re-sent with `removed: true` is a reorg *retraction*: the node is
+/// telling us the event no longer happened. Delivering it as a fresh event
+/// would hand strategies a second occurrence — and persist a duplicate row
+/// that replays forever after. A log with no block number cannot be indexed.
+fn indexed_event<E>(event: E, log: &alloy::rpc::types::Log) -> Option<(u64, E)> {
+    if log.removed {
+        tracing::warn!(
+            block = log.block_number,
+            "skipping reorged (removed) event log"
+        );
+        return None;
+    }
+    match log.block_number {
+        Some(block) => Some((block, event)),
+        None => {
+            tracing::warn!("Event log missing block number; skipping");
+            None
+        }
+    }
+}
+
 /// Implementation of the [Collector](Collector) trait for the [EventCollector](EventCollector).
 #[async_trait]
 impl<P, E> Collector<E> for EventCollector<P, E>
@@ -27,7 +50,7 @@ where
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
         let stream = self.event.subscribe().await?.into_stream();
         let stream = stream.filter_map(|el| match el {
-            Ok((e, _)) => Some(e),
+            Ok((e, log)) => indexed_event(e, &log).map(|(_, e)| e),
             Err(e) => {
                 tracing::warn!("Failed to decode event log: {}", e);
                 None
@@ -49,13 +72,7 @@ where
     async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, E)>> {
         let stream = self.event.subscribe().await?.into_stream();
         let stream = stream.filter_map(|el| match el {
-            Ok((event, log)) => match log.block_number {
-                Some(block) => Some((block, event)),
-                None => {
-                    tracing::warn!("Event log missing block number; skipping");
-                    None
-                }
-            },
+            Ok((event, log)) => indexed_event(event, &log),
             Err(e) => {
                 tracing::warn!("Failed to decode event log: {}", e);
                 None
@@ -74,12 +91,43 @@ where
             .query()
             .await?
             .into_iter()
-            .filter_map(|(event, log)| log.block_number.map(|block| (block, event)))
+            .filter_map(|(event, log)| indexed_event(event, &log))
             .collect();
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
     async fn tip(&self) -> Result<u64> {
         Ok(self.event.provider.get_block_number().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::rpc::types::Log;
+
+    fn log_at(block: Option<u64>, removed: bool) -> Log {
+        Log {
+            block_number: block,
+            removed,
+            ..Default::default()
+        }
+    }
+
+    /// On a reorg, nodes re-send previously delivered logs with
+    /// `removed: true` to signal *retraction*. Treating one as a fresh event
+    /// would hand strategies a second occurrence of something that no longer
+    /// happened — and persist a duplicate row that replays forever after.
+    #[test]
+    fn removed_logs_are_retractions_not_events() {
+        assert_eq!(indexed_event((), &log_at(Some(5), true)), None);
+    }
+
+    /// A live log carries its block number through; one with no block number
+    /// cannot be indexed and is skipped.
+    #[test]
+    fn live_logs_carry_their_block_number() {
+        assert_eq!(indexed_event((), &log_at(Some(5), false)), Some((5, ())));
+        assert_eq!(indexed_event((), &log_at(None, false)), None);
     }
 }

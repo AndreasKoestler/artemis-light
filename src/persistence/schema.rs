@@ -1,5 +1,17 @@
 //! Table schema and row value types shared by every [`Store`](super::Store).
 
+/// Name of the implicit per-row block column every [`Store`](super::Store)
+/// adds when writing.
+pub(crate) const BLOCK_NUMBER_COLUMN: &str = "block_number";
+
+/// Name of the implicit column holding each event's full JSON, used to
+/// losslessly reconstruct the event when replaying from the database.
+pub const PAYLOAD_COLUMN: &str = "_payload";
+
+/// Name of the bookkeeping table [`SqliteStore`](super::SqliteStore) records
+/// per-table progress in.
+pub(crate) const PROGRESS_TABLE: &str = "_artemis_progress";
+
 /// A SQL column type. SQLite is dynamically typed, so these act as type
 /// affinities / a best-guess mapping from event field types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +74,29 @@ impl TableSchema {
     pub fn col(mut self, name: impl Into<String>, ty: SqlType) -> Self {
         self.columns.push(Column::new(name, ty));
         self
+    }
+
+    /// Err when the schema collides with identifiers the persistence layer
+    /// itself uses: the implicit [`BLOCK_NUMBER_COLUMN`] and [`PAYLOAD_COLUMN`]
+    /// columns (a collision produces a `CREATE TABLE` with duplicate columns),
+    /// or the internal [`PROGRESS_TABLE`] (a collision corrupts every table's
+    /// progress watermark).
+    pub(crate) fn ensure_no_reserved_names(&self) -> Result<(), String> {
+        if self.table == PROGRESS_TABLE {
+            return Err(format!(
+                "table name {PROGRESS_TABLE:?} is reserved for the store's internal bookkeeping"
+            ));
+        }
+        for column in &self.columns {
+            if column.name == BLOCK_NUMBER_COLUMN || column.name == PAYLOAD_COLUMN {
+                return Err(format!(
+                    "column name {:?} is reserved for an implicit column the \
+                     persistence layer adds to every table",
+                    column.name
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

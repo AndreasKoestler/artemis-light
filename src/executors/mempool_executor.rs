@@ -41,7 +41,9 @@ pub struct GasBidInfo {
     /// Total profit expected from opportunity
     pub total_profit: u128,
 
-    /// Percentage of bid profit to use for gas
+    /// Percentage of bid profit to use for gas, at most 100: bidding the whole
+    /// profit (100) breaks even; anything above it makes the transaction
+    /// itself the loss, so the executor refuses such actions.
     pub bid_percentage: u64,
 }
 
@@ -58,6 +60,19 @@ where
 {
     /// Send a transaction to the mempool.
     async fn execute(&mut self, mut action: SubmitTxToMempool) -> Result<()> {
+        // Refuse an over-100% bid before spending any RPC on it: it would
+        // price gas above the opportunity's total profit, making the
+        // transaction itself the loss.
+        if let Some(gas_bid_info) = &action.gas_bid_info
+            && gas_bid_info.bid_percentage > 100
+        {
+            return Err(anyhow::anyhow!(
+                "bid_percentage {} exceeds 100: the gas bid would cost more \
+                 than the opportunity's total profit",
+                gas_bid_info.bid_percentage
+            ));
+        }
+
         let gas_usage = tokio::time::timeout(
             self.rpc_timeout,
             self.client.estimate_gas(action.tx.clone()),
@@ -85,6 +100,10 @@ where
                 .context("Timeout getting gas price")?
                 .context("Error getting gas price")?;
         }
+        // The estimate priced the bid; set it as the limit too, so the
+        // provider's filler doesn't estimate a second time (an extra RPC per
+        // action, and a limit that could diverge from the one priced).
+        action.tx.set_gas_limit(gas_usage);
         action.tx.set_gas_price(bid_gas_price);
         let _pending_tx =
             tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))

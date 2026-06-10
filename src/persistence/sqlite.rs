@@ -1,13 +1,17 @@
 //! A [`Store`] backed by SQLite via `sqlx`.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
+    SqliteSynchronous,
+};
 use sqlx::{Arguments, Row as _, sqlite::SqliteArguments};
 
-use super::schema::{Row, SqlType, SqlValue, TableSchema};
+use super::schema::{BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema};
 use super::store::Store;
 
 /// A SQLite-backed [`Store`].
@@ -21,8 +25,19 @@ impl SqliteStore {
     /// Use `"sqlite::memory:"` for an ephemeral in-memory database. A single
     /// connection is used so an in-memory database is shared across calls and
     /// every write sees a consistent view.
+    ///
+    /// File databases run in WAL journal mode with `synchronous = NORMAL` and
+    /// a 5s busy timeout: the default rollback journal answers any concurrent
+    /// access with an immediate `SQLITE_BUSY`, and a single failed write
+    /// permanently halts persistence (by design, to keep the stored height a
+    /// gap-free prefix) — so a stray reader must wait, not kill the archive.
+    /// In-memory databases ignore the journal mode.
     pub async fn connect(url: &str) -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+        let opts = SqliteConnectOptions::from_str(url)?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -65,16 +80,16 @@ impl Store for SqliteStore {
         let mut tx = self.pool.begin().await?;
 
         // Progress table tracking the last processed block per event table.
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS _artemis_progress \
-             (table_name TEXT PRIMARY KEY, last_block INTEGER NOT NULL)",
-        )
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} \
+             (table_name TEXT PRIMARY KEY, last_block INTEGER NOT NULL)"
+        ))
         .execute(&mut *tx)
         .await?;
 
         // Create the table on demand: an implicit block_number column plus one
         // column per event field.
-        let mut defs = vec!["block_number INTEGER NOT NULL".to_string()];
+        let mut defs = vec![format!("{BLOCK_NUMBER_COLUMN} INTEGER NOT NULL")];
         for c in &schema.columns {
             defs.push(format!("{} {}", quote_ident(&c.name), c.ty.sql()));
         }
@@ -86,7 +101,7 @@ impl Store for SqliteStore {
         sqlx::query(&create).execute(&mut *tx).await?;
 
         // Insert every row in the block.
-        let mut col_names = vec!["block_number".to_string()];
+        let mut col_names = vec![BLOCK_NUMBER_COLUMN.to_string()];
         col_names.extend(schema.columns.iter().map(|c| quote_ident(&c.name)));
         let placeholders = vec!["?"; col_names.len()].join(", ");
         let insert = format!(
@@ -118,10 +133,10 @@ impl Store for SqliteStore {
         }
 
         // Advance the last processed block in the same transaction.
-        sqlx::query(
-            "INSERT INTO _artemis_progress (table_name, last_block) VALUES (?, ?) \
-             ON CONFLICT(table_name) DO UPDATE SET last_block = MAX(last_block, excluded.last_block)",
-        )
+        sqlx::query(&format!(
+            "INSERT INTO {PROGRESS_TABLE} (table_name, last_block) VALUES (?, ?) \
+             ON CONFLICT(table_name) DO UPDATE SET last_block = MAX(last_block, excluded.last_block)"
+        ))
         .bind(&schema.table)
         .bind(block as i64)
         .execute(&mut *tx)
@@ -132,7 +147,8 @@ impl Store for SqliteStore {
     }
 
     async fn last_block(&self, table: &str) -> Result<Option<u64>> {
-        let row = match sqlx::query("SELECT last_block FROM _artemis_progress WHERE table_name = ?")
+        let query = format!("SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = ?");
+        let row = match sqlx::query(&query)
             .bind(table)
             .fetch_optional(&self.pool)
             .await
@@ -153,7 +169,8 @@ impl Store for SqliteStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT {} FROM {} WHERE block_number <= ? ORDER BY block_number ASC, rowid ASC",
+            "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= ? \
+             ORDER BY {BLOCK_NUMBER_COLUMN} ASC, rowid ASC",
             select_cols,
             quote_ident(&schema.table)
         );
