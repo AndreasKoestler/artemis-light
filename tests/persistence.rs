@@ -11,9 +11,8 @@ use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
 use artemis_light::persistence::{
-    Column, PersistExt, PersistableCollector, Row, SqlType, SqlValue, SqliteStore, Store,
-    TableSchema, derive, derive_record, derive_record_with, from_payload, payload_schema,
-    table_name,
+    Column, PersistExt, PersistableCollector, Record, Row, SqlType, SqlValue, SqliteStore, Store,
+    TableSchema,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -305,61 +304,56 @@ async fn write_block_is_atomic_on_failure() {
     assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
 }
 
-/// Slice 4: schema is derived from a Serialize+SolEvent type — table name from
-/// the Solidity signature, columns from the event's field names.
-#[tokio::test]
-async fn derive_schema_uses_event_name_and_field_names() {
-    let event = ValueSet {
-        value: U256::from(42),
-    };
-
-    assert_eq!(table_name::<ValueSet>(), "value_set");
-
-    let (schema, _row) = derive(&event).unwrap();
-    assert_eq!(schema.table, "value_set");
-    assert_eq!(schema.columns, vec![Column::new("value", SqlType::Text)]);
-}
-
-/// A multi-field event derives one column per field, named after the field and
-/// ordered deterministically (by field name), with values aligned to columns.
+/// Slice 4: a Record without a declared schema is a best guess from the event
+/// type — table name from the Solidity signature, columns frozen from the
+/// first encoded event (named after its fields, ordered deterministically by
+/// field name), no schema reported before that.
 #[test]
-fn derive_maps_each_event_field_to_a_column() {
-    let (schema, Row(values)) = derive(&transfer_event()).unwrap();
+fn record_freezes_inferred_schema_from_first_encoded_event() {
+    let record = Record::<Transfer>::new(None).unwrap();
+    assert_eq!(record.table(), "transfer");
+    assert!(
+        record.schema().is_none(),
+        "no schema before the first encode freezes one"
+    );
 
+    let Row(values) = record.encode(&transfer_event()).unwrap();
+
+    let schema = record.schema().unwrap();
     assert_eq!(schema.table, "transfer");
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    // Sorted by field name: `amount` before `from`.
-    assert_eq!(names, vec!["amount", "from"]);
-    assert_eq!(values.len(), 2);
+    // Sorted by field name (`amount` before `from`), with `_payload` appended.
+    assert_eq!(names, vec!["amount", "from", "_payload"]);
+    assert_eq!(values.len(), 3);
 }
 
-/// `derive_record` appends an implicit `_payload` column holding the event's
-/// full JSON, and that payload round-trips back to an equal event.
+/// The implicit `_payload` column holds the event's full JSON, and that
+/// payload round-trips back to an equal event through `decode`.
 #[test]
-fn derive_record_appends_payload_column_that_round_trips() {
+fn record_payload_column_round_trips_through_decode() {
     let event = transfer_event();
-    let (schema, Row(values)) = derive_record(&event).unwrap();
-
-    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, vec!["amount", "from", "_payload"]);
+    let record = Record::<Transfer>::new(None).unwrap();
+    let Row(values) = record.encode(&event).unwrap();
 
     let SqlValue::Text(payload) = values.last().unwrap() else {
         panic!("payload column should be text");
     };
-    let restored: Transfer = from_payload(payload).unwrap();
-    assert_eq!(restored, event);
+    assert_eq!(record.decode(payload).unwrap(), event);
 }
 
 /// A schema override redirects the table, renames-away unlisted fields, fills
 /// columns with no matching field with `NULL`, and still appends `_payload`.
 #[test]
-fn derive_record_with_override_aligns_values_by_column_name() {
+fn record_with_override_aligns_values_by_column_name() {
     let event = transfer_event();
     let override_ = TableSchema::new("transfers_custom")
         .col("amount", SqlType::Numeric) // kept and retyped
         .col("missing", SqlType::Text); // no matching event field
 
-    let (schema, Row(values)) = derive_record_with(&event, Some(&override_)).unwrap();
+    let record = Record::<Transfer>::new(Some(override_)).unwrap();
+    // A declared schema is available before anything is encoded.
+    let schema = record.schema().unwrap();
+    let Row(values) = record.encode(&event).unwrap();
 
     // Table and column set follow the override, with `_payload` appended; the
     // `from` field is renamed-away because the override does not list it.
@@ -375,7 +369,7 @@ fn derive_record_with_override_aligns_values_by_column_name() {
     let SqlValue::Text(payload) = values.last().unwrap() else {
         panic!("payload column should be text");
     };
-    assert_eq!(from_payload::<Transfer>(payload).unwrap(), event);
+    assert_eq!(record.decode(payload).unwrap(), event);
 }
 
 /// A store that accepts nothing and returns nothing — for tests that must
@@ -424,15 +418,16 @@ sol! {
 }
 
 /// An event field named after an implicit column cannot be stored — the
-/// derived `CREATE TABLE` would have duplicate columns and persistence would
-/// halt on the first write with an opaque SQL error. Deriving must fail with
+/// inferred `CREATE TABLE` would have duplicate columns and persistence would
+/// halt on the first write with an opaque SQL error. Encoding must fail with
 /// a clear message instead (which halts persistence loudly at the source).
 #[test]
-fn derive_rejects_event_fields_shadowing_implicit_columns() {
+fn record_rejects_event_fields_shadowing_implicit_columns() {
     let event = Sneaky {
         block_number: U256::from(1),
     };
-    let err = derive_record(&event).unwrap_err().to_string();
+    let record = Record::<Sneaky>::new(None).unwrap();
+    let err = record.encode(&event).unwrap_err().to_string();
     assert!(
         err.contains("reserved"),
         "error should name the reserved column, got: {err}"
@@ -440,19 +435,25 @@ fn derive_rejects_event_fields_shadowing_implicit_columns() {
 }
 
 /// `payload_schema` describes the read-back shape — table name plus the single
-/// `_payload` column — without needing an event instance.
+/// `_payload` column — without needing an encoded event, and it follows the
+/// declared table when a schema override redirects it.
 #[test]
 fn payload_schema_is_table_plus_payload_column() {
-    let schema = payload_schema::<Transfer>();
+    let record = Record::<Transfer>::new(None).unwrap();
+    let schema = record.payload_schema();
     assert_eq!(schema.table, "transfer");
     assert_eq!(schema.columns, vec![Column::new("_payload", SqlType::Text)]);
+
+    let redirected = Record::<Transfer>::new(Some(TableSchema::new("transfers_custom"))).unwrap();
+    assert_eq!(redirected.payload_schema().table, "transfers_custom");
 }
 
 /// A stored payload that is not valid JSON for the event type is a hard error,
 /// never a silently dropped row.
 #[test]
-fn from_payload_errors_on_unreadable_text() {
-    assert!(from_payload::<Transfer>("not a valid payload").is_err());
+fn decode_errors_on_unreadable_text() {
+    let record = Record::<Transfer>::new(None).unwrap();
+    assert!(record.decode("not a valid payload").is_err());
 }
 
 /// Slice 7: a `Persisted` collector records live events one transaction per
@@ -482,7 +483,9 @@ async fn persisted_records_live_events_per_complete_block() {
 
 /// Persist one event at `block` as if a previous run had stored it.
 async fn seed(store: &SqliteStore, block: u64, value: u64) {
-    let (schema, row) = derive_record(&value_event(value)).unwrap();
+    let record = Record::<ValueSet>::new(None).unwrap();
+    let row = record.encode(&value_event(value)).unwrap();
+    let schema = record.schema().unwrap();
     store.write_block(&schema, block, vec![row]).await.unwrap();
 }
 

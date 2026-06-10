@@ -45,6 +45,10 @@ _Avoid_: concat, append
 A Collector wrapper that records every event it sees into a Store and, on subscribe, delivers three **Segments** in fixed order: **Replay**, then **Backfill**, then the **Live Tail**.
 _Avoid_: indexer, archiver, recorder
 
+**Record**:
+The mapping between one event type and its SQL rows. It owns the table name, the column schema — declared via an override (validated at construction, where a bad override panics) or frozen from the first encoded event — the encode-to-row and decode-from-payload directions, and the reserved-name invariant. The Store sees only the schemas and rows a Record produces.
+_Avoid_: codec, row mapper, serializer
+
 **Segment**:
 One of the three ordered parts of a Persisted Collector's subscription. The order — Replay → Backfill → Live Tail — is fixed; the Segments are disjoint, split at the chain tip observed during subscribe.
 
@@ -66,6 +70,7 @@ _Avoid_: live stream, subscription
 - A **Merge** or **Chain** composite is one **Collector** to the **Engine**: its sources share one **Collector Driver** and one **Reconnect Policy** (one lifecycle). Register sources as separate Collectors instead when each should reconnect — and go **Fatal** — independently.
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail.
+- A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
 

@@ -1,6 +1,7 @@
 //! [`Persisted`]: a [`Collector`] wrapper that records every event it sees and,
 //! on subscribe, replays stored history before following the chain tip.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::sol_types::SolEvent;
@@ -11,8 +12,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use super::record::{derive_record_with, from_payload, table_name};
-use super::schema::{PAYLOAD_COLUMN, Row, SqlType, SqlValue, TableSchema};
+use super::record::Record;
+use super::schema::{Row, SqlValue, TableSchema};
 use super::store::Store;
 use crate::types::{Collector, CollectorStream};
 
@@ -167,13 +168,13 @@ where
         let live_source = self.collector.subscribe_indexed().await?;
         let tip = self.collector.tip().await?;
 
-        // The table name follows the declared schema, if any.
-        let table = self
-            .schema
-            .as_ref()
-            .map(|schema| schema.table.clone())
-            .unwrap_or_else(table_name::<E>);
-        let last = self.store.last_block(&table).await?;
+        // The Record fixes the table name and owns the event <-> row mapping
+        // for the whole subscription; the override was already validated in
+        // `with_schema`, so this only fails on a library bug. Shared (Arc)
+        // between the backfill and live writers, so a schema frozen during
+        // backfill is reused by the live tail.
+        let record = Arc::new(Record::<E>::new(self.schema.clone())?);
+        let last = self.store.last_block(record.table()).await?;
 
         // 1. Replay stored history, reconstructed from the database — but only
         //    on the first subscribe. On a reconnect the engine subscribes again;
@@ -182,7 +183,7 @@ where
         //    the backfill segment cover only the gap since the last stored block.
         let first_subscribe = !self.replayed.load(Ordering::SeqCst);
         let replay: CollectorStream<'_, E> = if first_subscribe {
-            let inner = replay_stored::<E, S>(&self.store, table, last).await?;
+            let inner = replay_stored(&self.store, &record, last).await?;
             // Flip the replay-once flag when the archive is first *consumed*,
             // not merely when `subscribe` succeeds. The engine retries
             // `subscribe` on error, but it also discards the returned stream
@@ -231,7 +232,7 @@ where
             )
             .await?
         };
-        let backfill = persist_and_emit(backfill_source, &self.store, self.schema.as_ref(), true);
+        let backfill = persist_and_emit(backfill_source, &self.store, record.clone(), true);
 
         // 3. Live tail, strictly above the backfill cut so the two segments are
         //    disjoint. A live subscription streams from "now", whose lower edge
@@ -263,7 +264,7 @@ where
                 })
                 .take_until(poison.cancelled_owned()),
         ) as CollectorStream<'_, (u64, E)>;
-        let live = persist_and_emit(live_source, &self.store, self.schema.as_ref(), false);
+        let live = persist_and_emit(live_source, &self.store, record, false);
 
         Ok(Segments {
             replay,
@@ -278,19 +279,18 @@ where
 /// row's payload column. Returns an empty stream when nothing is stored.
 async fn replay_stored<'a, E, S>(
     store: &'a S,
-    table: String,
+    record: &Record<E>,
     last: Option<u64>,
 ) -> Result<CollectorStream<'a, E>>
 where
-    E: DeserializeOwned + SolEvent + Send + 'a,
+    E: DeserializeOwned + Send + 'a,
     S: Store + 'a,
 {
     let Some(to) = last else {
         return Ok(Box::pin(futures::stream::empty()));
     };
 
-    let payload_schema = TableSchema::new(table).col(PAYLOAD_COLUMN, SqlType::Text);
-    let rows = store.replay(&payload_schema, to).await?;
+    let rows = store.replay(&record.payload_schema(), to).await?;
     // A stored row that cannot be reconstructed is a hard error, not a row to
     // skip: replay feeds strategies the historical view they reason over, and
     // `_artemis_progress` already counts these blocks as processed. Silently
@@ -299,7 +299,7 @@ where
     let mut events = Vec::with_capacity(rows.len());
     for Row(cols) in rows {
         match cols.into_iter().next() {
-            Some(SqlValue::Text(payload)) => events.push(from_payload::<E>(&payload)?),
+            Some(SqlValue::Text(payload)) => events.push(record.decode(&payload)?),
             other => anyhow::bail!("unexpected payload column on replay: {other:?}"),
         }
     }
@@ -376,15 +376,15 @@ where
 fn persist_and_emit<'a, E, S>(
     mut source: CollectorStream<'a, (u64, E)>,
     store: &'a S,
-    override_: Option<&'a TableSchema>,
+    record: Arc<Record<E>>,
     flush_final: bool,
 ) -> CollectorStream<'a, E>
 where
-    E: Serialize + SolEvent + Send + Sync + 'static,
+    E: Serialize + Send + Sync + 'static,
     S: Store + 'a,
 {
     let stream = async_stream::stream! {
-        let mut writer = BlockWriter::new(store, override_);
+        let mut writer = BlockWriter::new(store, record);
 
         while let Some((block, event)) = source.next().await {
             writer.record(block, &event).await;
@@ -411,36 +411,34 @@ where
 /// restart re-fetches everything after the last good block.
 ///
 /// [`finish`]: BlockWriter::finish
-struct BlockWriter<'a, S> {
+struct BlockWriter<'a, S, E> {
     store: &'a S,
-    override_: Option<&'a TableSchema>,
+    record: Arc<Record<E>>,
     buffer: Vec<Row>,
     current: Option<u64>,
-    schema: Option<TableSchema>,
     healthy: bool,
 }
 
-impl<'a, S: Store> BlockWriter<'a, S> {
-    fn new(store: &'a S, override_: Option<&'a TableSchema>) -> Self {
+impl<'a, S: Store, E: Serialize> BlockWriter<'a, S, E> {
+    fn new(store: &'a S, record: Arc<Record<E>>) -> Self {
         Self {
             store,
-            override_,
+            record,
             buffer: Vec::new(),
             current: None,
-            schema: None,
             healthy: true,
         }
     }
 
     /// Buffer one event's row, first flushing the previous block if `block`
     /// has advanced past it. No-op once unhealthy.
-    async fn record<E: Serialize + SolEvent>(&mut self, block: u64, event: &E) {
+    async fn record(&mut self, block: u64, event: &E) {
         if !self.healthy {
             return;
         }
-        match derive_record_with(event, self.override_) {
-            Ok((row_schema, row)) => {
-                if let (Some(cur), Some(sch)) = (self.current, &self.schema) {
+        match self.record.encode(event) {
+            Ok(row) => {
+                if let Some(cur) = self.current {
                     // A backwards block means the open block's completeness
                     // can no longer be trusted: flushing it would advance the
                     // stored height past the late block's rows, leaving a
@@ -452,10 +450,13 @@ impl<'a, S: Store> BlockWriter<'a, S> {
                         ));
                         return;
                     }
-                    // The block advanced: the previous block is complete.
+                    // The block advanced: the previous block is complete. The
+                    // schema is always present here — `current` is only set
+                    // after a successful encode, which froze it.
                     if block > cur {
+                        let schema = self.record.schema().expect("frozen by first encode");
                         self.healthy =
-                            flush(self.store, sch, cur, std::mem::take(&mut self.buffer)).await;
+                            flush(self.store, &schema, cur, std::mem::take(&mut self.buffer)).await;
                         if !self.healthy {
                             // This event's block can never be written without
                             // leaving a gap, so don't buffer its row either.
@@ -464,15 +465,14 @@ impl<'a, S: Store> BlockWriter<'a, S> {
                     }
                 }
                 self.current = Some(block);
-                self.schema = Some(row_schema);
                 self.buffer.push(row);
             }
-            // An event that can't be derived into a row can never be written,
+            // An event that can't be encoded into a row can never be written,
             // so its block — and everything after it — must not be either:
             // progress advancing past it would hand the next restart exactly
             // the quietly truncated history `replay_stored` refuses to emit.
             // The event stream itself keeps flowing.
-            Err(e) => self.halt(format_args!("failed to derive row: {e}")),
+            Err(e) => self.halt(format_args!("failed to encode row: {e}")),
         }
     }
 
@@ -492,9 +492,10 @@ impl<'a, S: Store> BlockWriter<'a, S> {
     /// block completely (a finite backfill range, not a live tail).
     async fn finish(&mut self) {
         if self.healthy
-            && let (Some(cur), Some(sch)) = (self.current, &self.schema)
+            && let Some(cur) = self.current
         {
-            flush(self.store, sch, cur, std::mem::take(&mut self.buffer)).await;
+            let schema = self.record.schema().expect("frozen by first encode");
+            flush(self.store, &schema, cur, std::mem::take(&mut self.buffer)).await;
         }
     }
 
@@ -536,14 +537,38 @@ mod tests {
 
     alloy::sol! {
         // No serde derive: `Serialize` is implemented by hand below to produce
-        // a non-object JSON value, which `derive_record_with` rejects.
+        // a non-object JSON value — which `Record::encode` rejects — for the
+        // zero value only, so one writer can see good and bad events of the
+        // same type.
         event BadPing(uint256 value);
     }
 
     impl serde::Serialize for BadPing {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_str("not a JSON object")
+            if self.value.is_zero() {
+                serializer.serialize_str("not a JSON object")
+            } else {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("value", &self.value.to_string())?;
+                map.end()
+            }
         }
+    }
+
+    fn bad_ping(value: u64) -> BadPing {
+        BadPing {
+            value: alloy::primitives::U256::from(value),
+        }
+    }
+
+    /// A writer over a fresh inferred [`Record`] for `E`.
+    fn writer<S, E>(store: &S) -> BlockWriter<'_, S, E>
+    where
+        S: Store,
+        E: alloy::sol_types::SolEvent + Serialize,
+    {
+        BlockWriter::new(store, Arc::new(Record::new(None).unwrap()))
     }
 
     /// A store whose every write fails.
@@ -606,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn writer_stops_buffering_once_unhealthy() {
         let store = FailingStore;
-        let mut writer = BlockWriter::new(&store, None);
+        let mut writer = writer::<_, Ping>(&store);
 
         // Block 1 buffers normally.
         writer.record(1, &ping(1)).await;
@@ -639,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn writer_halts_on_non_monotone_blocks_without_writing() {
         let store = RecordingStore::default();
-        let mut writer = BlockWriter::new(&store, None);
+        let mut writer = writer::<_, Ping>(&store);
 
         writer.record(5, &ping(1)).await;
         writer.record(4, &ping(2)).await; // block went backwards
@@ -654,26 +679,19 @@ mod tests {
         assert_eq!(writer.buffered(), 0);
     }
 
-    /// An event that cannot be derived into a row must halt persistence, not
+    /// An event that cannot be encoded into a row must halt persistence, not
     /// be skipped: progress would otherwise advance past its block, and replay
     /// would hand strategies exactly the "quietly truncated history" the read
     /// side refuses to produce (see `replay_stored`). Strategies that ran live
     /// saw the event; strategies after a restart must not silently lose it.
     #[tokio::test]
-    async fn writer_halts_on_underivable_event_instead_of_leaving_a_hole() {
+    async fn writer_halts_on_unencodable_event_instead_of_leaving_a_hole() {
         let store = RecordingStore::default();
-        let mut writer = BlockWriter::new(&store, None);
+        let mut writer = writer::<_, BadPing>(&store);
 
-        writer.record(1, &ping(1)).await;
-        writer
-            .record(
-                2,
-                &BadPing {
-                    value: alloy::primitives::U256::ZERO,
-                },
-            )
-            .await;
-        writer.record(3, &ping(3)).await; // would previously flush past block 2
+        writer.record(1, &bad_ping(1)).await;
+        writer.record(2, &bad_ping(0)).await; // zero serialises unencodably
+        writer.record(3, &bad_ping(3)).await; // would previously flush past block 2
         writer.finish().await;
 
         assert_eq!(

@@ -1,10 +1,19 @@
-//! Best-guess mapping between events and SQL rows.
+//! The [`Record`]: the mapping between one event type and its SQL rows.
 //!
-//! The table name comes from the event's Solidity signature; column names come
-//! from the event's `serde` field names and column types are inferred from the
-//! serialised JSON. This requires events to implement [`serde::Serialize`].
+//! A `Record` owns the table name, the column schema — declared via an
+//! override or frozen from the first encoded event — and both directions of
+//! the mapping: encode an event to a [`Row`], decode a stored payload back to
+//! the event. It also owns the reserved-name invariant; the
+//! [`Store`](super::Store) sees only the schemas and rows a `Record` produces.
+//!
+//! Without a declared schema the mapping is a best guess: the table name comes
+//! from the event's Solidity signature, column names from the event's `serde`
+//! field names, and column types are inferred from the serialised JSON. This
+//! requires events to implement [`serde::Serialize`].
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
@@ -16,9 +25,163 @@ use super::schema::{
     BLOCK_NUMBER_COLUMN, Column, PAYLOAD_COLUMN, Row, SqlType, SqlValue, TableSchema,
 };
 
+/// The mapping between the event type `E` and its SQL rows. See the
+/// [module docs](self).
+pub struct Record<E> {
+    table: String,
+    columns: ColumnsSource,
+    _event: PhantomData<fn() -> E>,
+}
+
+/// Where a [`Record`]'s event-field columns come from.
+enum ColumnsSource {
+    /// Declared via a schema override, validated at construction.
+    Declared(Vec<Column>),
+    /// Inferred from the first successfully encoded event, then frozen for
+    /// the lifetime of the `Record`. The store's `CREATE TABLE IF NOT EXISTS`
+    /// freezes the table on the first write anyway, so later events that
+    /// would infer differently (e.g. a `u64` crossing `i64::MAX`) only vary
+    /// in value affinity, which SQLite absorbs.
+    Inferred(OnceLock<Vec<Column>>),
+}
+
+impl<E: SolEvent> Record<E> {
+    /// A `Record` for `E`, honouring an optional schema override.
+    ///
+    /// With an override, its table name and columns are used: each column's
+    /// value is looked up by name from the event's fields when encoding (a
+    /// missing field becomes `NULL`), so columns may be renamed-away,
+    /// reordered, or retyped without disturbing value alignment. Errs when
+    /// the override names a reserved identifier (the implicit columns or the
+    /// store's progress table).
+    ///
+    /// Without an override, the table name is derived from `E`'s Solidity
+    /// signature and the columns are frozen from the first encoded event.
+    pub fn new(override_: Option<TableSchema>) -> Result<Self> {
+        let (table, columns) = match override_ {
+            Some(schema) => {
+                // An override colliding with an implicit column would produce
+                // a `CREATE TABLE` with duplicate columns; surfacing it here
+                // makes the failure a clear construction error rather than an
+                // opaque SQL one.
+                if let Err(reason) = schema.ensure_no_reserved_names() {
+                    anyhow::bail!("invalid schema override: {reason}");
+                }
+                (schema.table, ColumnsSource::Declared(schema.columns))
+            }
+            None => (table_name::<E>(), ColumnsSource::Inferred(OnceLock::new())),
+        };
+        Ok(Self {
+            table,
+            columns,
+            _event: PhantomData,
+        })
+    }
+}
+
+impl<E> Record<E> {
+    /// The table this event type's rows are written to and replayed from.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The write schema: the event-field columns plus the implicit
+    /// [`PAYLOAD_COLUMN`]. Available immediately for a declared schema;
+    /// `None` for an inferred one until the first successful [`encode`]
+    /// freezes it.
+    ///
+    /// [`encode`]: Record::encode
+    pub fn schema(&self) -> Option<TableSchema> {
+        let columns = match &self.columns {
+            ColumnsSource::Declared(columns) => columns.as_slice(),
+            ColumnsSource::Inferred(lock) => lock.get()?.as_slice(),
+        };
+        let mut columns = columns.to_vec();
+        columns.push(Column::new(PAYLOAD_COLUMN, SqlType::Text));
+        Some(TableSchema {
+            table: self.table.clone(),
+            columns,
+        })
+    }
+
+    /// The schema used to read back stored events for replay: the table name
+    /// plus the single [`PAYLOAD_COLUMN`]. Needs no encoded event, so replay
+    /// can run before any live event is seen.
+    pub fn payload_schema(&self) -> TableSchema {
+        TableSchema::new(self.table.clone()).col(PAYLOAD_COLUMN, SqlType::Text)
+    }
+
+    /// Encode one event as a [`Row`] aligned to the frozen columns (a column
+    /// with no matching field becomes `NULL`), with the event's full JSON
+    /// appended as the [`PAYLOAD_COLUMN`] for lossless replay.
+    pub fn encode(&self, event: &E) -> Result<Row>
+    where
+        E: Serialize,
+    {
+        // One serialisation pass feeds both the field map and the payload
+        // column; this runs once per event on the persistence hot path.
+        let json = event_json(event)?;
+        let fields = field_map(&json)?;
+        let columns = self.freeze_columns(&fields)?;
+        let mut values: Vec<SqlValue> = columns
+            .iter()
+            .map(|col| {
+                fields
+                    .get(&col.name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(SqlValue::Null)
+            })
+            .collect();
+        values.push(SqlValue::Text(json.to_string()));
+        Ok(Row(values))
+    }
+
+    /// Reconstruct an event from a stored [`PAYLOAD_COLUMN`] value.
+    pub fn decode(&self, payload: &str) -> Result<E>
+    where
+        E: DeserializeOwned,
+    {
+        serde_json::from_str(payload).context("stored payload is not valid for this event type")
+    }
+
+    /// The frozen event-field columns, inferring them from `fields` on the
+    /// first call when no schema was declared.
+    fn freeze_columns(&self, fields: &BTreeMap<String, (SqlType, SqlValue)>) -> Result<&[Column]> {
+        match &self.columns {
+            ColumnsSource::Declared(columns) => Ok(columns),
+            ColumnsSource::Inferred(lock) => {
+                if let Some(columns) = lock.get() {
+                    return Ok(columns);
+                }
+                for name in fields.keys() {
+                    // The store adds BLOCK_NUMBER_COLUMN and `encode` appends
+                    // PAYLOAD_COLUMN; an event field by either name would
+                    // shadow them in `CREATE TABLE` and break every write.
+                    if name == BLOCK_NUMBER_COLUMN || name == PAYLOAD_COLUMN {
+                        anyhow::bail!(
+                            "event field {name:?} is reserved for an implicit column \
+                             the persistence layer adds to every table; rename it \
+                             with a schema override"
+                        );
+                    }
+                }
+                let columns = fields
+                    .iter()
+                    .map(|(name, (ty, _))| Column::new(name.clone(), *ty))
+                    .collect();
+                // A concurrent encode may have frozen first; either winner
+                // derived from the same event type, so the loser's set is a
+                // no-op and `get` is now always populated.
+                let _ = lock.set(columns);
+                Ok(lock.get().expect("frozen above").as_slice())
+            }
+        }
+    }
+}
+
 /// The best-guess table name for an event type, derived from its Solidity
 /// signature: `ValueSet(uint256)` -> `value_set`.
-pub fn table_name<E: SolEvent>() -> String {
+fn table_name<E: SolEvent>() -> String {
     let signature = E::SIGNATURE;
     let name = signature.split('(').next().unwrap_or(signature);
     to_snake_case(name)
@@ -41,121 +204,6 @@ fn field_map(value: &Value) -> Result<BTreeMap<String, (SqlType, SqlValue)>> {
         .iter()
         .map(|(key, field)| (key.clone(), (infer_type(field), json_to_sql(field))))
         .collect())
-}
-
-/// The best-guess [`TableSchema`] and [`Row`] for a serialisable event:
-/// one column per top-level field, named and typed from the serialised JSON.
-pub fn derive<E>(event: &E) -> Result<(TableSchema, Row)>
-where
-    E: Serialize + SolEvent,
-{
-    let fields = field_map(&event_json(event)?)?;
-    let mut columns = Vec::with_capacity(fields.len());
-    let mut values = Vec::with_capacity(fields.len());
-    for (name, (ty, value)) in fields {
-        columns.push(Column::new(name, ty));
-        values.push(value);
-    }
-
-    Ok((
-        TableSchema {
-            table: table_name::<E>(),
-            columns,
-        },
-        Row(values),
-    ))
-}
-
-/// The schema and row for `event`, augmented with a [`PAYLOAD_COLUMN`] holding
-/// the event's full JSON. The per-field columns make the table queryable; the
-/// payload column makes replay lossless.
-pub fn derive_record<E>(event: &E) -> Result<(TableSchema, Row)>
-where
-    E: Serialize + SolEvent,
-{
-    derive_record_with(event, None)
-}
-
-/// Like [`derive_record`], but honouring an optional schema `override_`.
-///
-/// When an override is given, its table name and columns are used: each
-/// override column's value is looked up by name from the event's fields (a
-/// missing field becomes `NULL`), so columns may be renamed-away, reordered, or
-/// retyped without disturbing value alignment. The [`PAYLOAD_COLUMN`] is always
-/// appended for lossless replay.
-pub fn derive_record_with<E>(
-    event: &E,
-    override_: Option<&TableSchema>,
-) -> Result<(TableSchema, Row)>
-where
-    E: Serialize + SolEvent,
-{
-    // One serialisation pass feeds both the field map and the payload column;
-    // this runs once per event on the persistence hot path.
-    let json = event_json(event)?;
-    let fields = field_map(&json)?;
-
-    let (table, columns, mut values) = match override_ {
-        Some(schema) => {
-            // An override colliding with an implicit column would produce a
-            // `CREATE TABLE` with duplicate columns; surfacing it here makes
-            // the failure a clear derive error rather than an opaque SQL one.
-            if let Err(reason) = schema.ensure_no_reserved_names() {
-                anyhow::bail!("invalid schema override: {reason}");
-            }
-            let values = schema
-                .columns
-                .iter()
-                .map(|col| {
-                    fields
-                        .get(&col.name)
-                        .map(|(_, value)| value.clone())
-                        .unwrap_or(SqlValue::Null)
-                })
-                .collect();
-            (schema.table.clone(), schema.columns.clone(), values)
-        }
-        None => {
-            let mut columns = Vec::with_capacity(fields.len());
-            let mut values = Vec::with_capacity(fields.len());
-            for (name, (ty, value)) in &fields {
-                // The store adds BLOCK_NUMBER_COLUMN and this fn appends
-                // PAYLOAD_COLUMN; an event field by either name would shadow
-                // them in `CREATE TABLE` and break every write.
-                if name == BLOCK_NUMBER_COLUMN || name == PAYLOAD_COLUMN {
-                    anyhow::bail!(
-                        "event field {name:?} is reserved for an implicit column \
-                         the persistence layer adds to every table; rename it \
-                         with a schema override"
-                    );
-                }
-                columns.push(Column::new(name.clone(), *ty));
-                values.push(value.clone());
-            }
-            (table_name::<E>(), columns, values)
-        }
-    };
-
-    let mut schema = TableSchema { table, columns };
-    let payload = json.to_string();
-    schema
-        .columns
-        .push(Column::new(PAYLOAD_COLUMN, SqlType::Text));
-    values.push(SqlValue::Text(payload));
-
-    Ok((schema, Row(values)))
-}
-
-/// The schema used to read back stored events for replay: the table name plus
-/// the single [`PAYLOAD_COLUMN`]. Needs no event instance, so replay can run
-/// before any live event is seen.
-pub fn payload_schema<E: SolEvent>() -> TableSchema {
-    TableSchema::new(table_name::<E>()).col(PAYLOAD_COLUMN, SqlType::Text)
-}
-
-/// Reconstruct an event from a stored [`PAYLOAD_COLUMN`] value.
-pub fn from_payload<E: DeserializeOwned>(payload: &str) -> Result<E> {
-    serde_json::from_str(payload).context("stored payload is not valid for this event type")
 }
 
 /// Best-guess SQL type for a serialised field value.

@@ -1,10 +1,12 @@
 use crate::types::{Collector, CollectorStream};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::StreamExt;
+
+use super::filter_map::subscribe_filter_mapped;
 
 /// `Map` is a wrapper around a [Collector] that maps outgoing
-/// events to a different type.
+/// events to a different type: a [`FilterMap`](super::FilterMap)
+/// that never discards.
 pub struct Map<E, F> {
     collector: Box<dyn Collector<E>>,
     f: F,
@@ -25,9 +27,7 @@ where
     F: Fn(E1) -> E2 + Send + Sync + Clone + 'static,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E2>> {
-        let stream = self.collector.subscribe().await?;
         let f = self.f.clone();
-        let stream = stream.map(f);
-        Ok(Box::pin(stream))
+        subscribe_filter_mapped(&*self.collector, move |event| Some(f(event))).await
     }
 }
