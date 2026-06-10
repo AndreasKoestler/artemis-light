@@ -186,6 +186,20 @@ engine cancels every task and fires `handle.fatal` — an observe-only token tha
 lets the binary tell a fatal shutdown apart from a Ctrl-C one and restart,
 rather than the library killing the process.
 
+## Examples
+
+Runnable, narrated demos of every facility — the core pipeline, collector
+combinators, observers, the reconnect/fatal lifecycle, persistence, and an
+end-to-end on-chain run against a local Anvil chain — live in
+[`examples/`](examples/). Start with:
+
+```sh
+cargo run --example basic_example
+```
+
+and see [`examples/README.md`](examples/README.md) for the full list and a
+suggested reading order.
+
 ## Testing
 
 Run the full test suite (requires `anvil` on `$PATH` for integration tests):
