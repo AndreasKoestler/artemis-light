@@ -143,7 +143,11 @@ where
     ///
     /// Returns an [`EngineHandle`] carrying the shutdown token, the running
     /// tasks, and a one-shot that fires if a collector becomes unrecoverable.
-    pub async fn run(self) -> Result<EngineHandle, Box<dyn std::error::Error>> {
+    ///
+    /// Errors are [`anyhow::Error`], matching every other fallible API in the
+    /// crate, so `engine.run().await?` composes in an `anyhow` (or plain
+    /// `Box<dyn Error>`) `main` without a conversion shim.
+    pub async fn run(self) -> anyhow::Result<EngineHandle> {
         let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
         let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);
 
@@ -259,7 +263,7 @@ where
                             fatal,
                         });
                     }
-                    return Err("engine cancelled during strategy sync".into());
+                    return Err(anyhow::anyhow!("engine cancelled during strategy sync"));
                 }
                 result = strategy.sync_state() => {
                     result?;

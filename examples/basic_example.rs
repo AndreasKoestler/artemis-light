@@ -59,35 +59,54 @@ impl Strategy<u64, u64> for DoubleStrategy {
     }
 }
 
-/// An executor that prints each action it receives.
-struct PrintExecutor;
+/// An executor that prints each action it receives and signals `done` once it
+/// has handled the expected number of actions.
+struct PrintExecutor {
+    remaining: u64,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 #[async_trait]
 impl Executor<u64> for PrintExecutor {
     async fn execute(&mut self, action: u64) -> Result<()> {
         println!("[executor] action = {action}");
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0
+            && let Some(done) = self.done.take()
+        {
+            let _ = done.send(());
+        }
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    const TICKS: u64 = 5;
+
     // Build a collector and use `.map()` to add 100 to every tick.
     let collector =
-        TickCollector::new(std::time::Duration::from_millis(500), 5).map(|tick| tick + 100);
+        TickCollector::new(std::time::Duration::from_millis(500), TICKS).map(|tick| tick + 100);
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
     let mut engine = Engine::<u64, u64>::default();
     engine.add_collector(Box::new(collector));
     engine.add_strategy(Box::new(DoubleStrategy));
-    engine.add_executor(Box::new(PrintExecutor));
+    engine.add_executor(Box::new(PrintExecutor {
+        remaining: TICKS,
+        done: Some(done_tx),
+    }));
 
-    println!("Starting engine — will process 5 ticks then exit...\n");
-    let mut handle = engine.run().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Starting engine — will process {TICKS} ticks then exit...\n");
+    let mut handle = engine.run().await?;
 
-    // Wait for all tasks to finish (the finite collector will complete).
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    // Run until the executor reports the last action handled, then shut down
+    // cooperatively: cancel the token and wait for every task to exit. A real
+    // binary would select between this and Ctrl-C / `handle.fatal` (see the
+    // README's minimal example).
+    let _ = done_rx.await;
     handle.token.cancel();
-
     while handle.tasks.join_next().await.is_some() {}
 
     println!("\nDone!");

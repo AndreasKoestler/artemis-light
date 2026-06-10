@@ -72,6 +72,37 @@ async fn test_block_collector_sends_blocks() {
     assert_eq!(block_a.hash, block_b.header.hash);
 }
 
+/// Over plain HTTP there is no pubsub, so `subscribe_blocks` fails and the
+/// collector must fall back to polling — and still deliver new blocks.
+#[tokio::test]
+async fn test_block_collector_polls_when_subscriptions_are_unavailable() {
+    let anvil = Anvil::new()
+        .block_time(1)
+        .chain_id(1337)
+        .try_spawn()
+        .unwrap();
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+    let provider = Arc::new(provider);
+    let block_collector = BlockCollector::new(provider.clone());
+
+    let block_stream = block_collector.subscribe().await.unwrap();
+    let block = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        block_stream.into_future(),
+    )
+    .await
+    .expect("polling fallback should deliver a block within 15s")
+    .0
+    .unwrap();
+
+    let chain_block = provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(block.number)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(block.hash, chain_block.header.hash);
+}
+
 /// Test that mempool collector correctly emits blocks.
 #[tokio::test]
 async fn test_mempool_collector_sends_txs() {
@@ -887,6 +918,39 @@ mod engine_tests {
             vec![1, 2, 3],
             "a strategy registered after another's sync must not miss events \
              broadcast during that sync"
+        );
+    }
+
+    /// A strategy whose `sync_state` errors must surface that error from
+    /// `Engine::run` — it is the only fallible user hook in the run loop, and
+    /// a regression that swallowed it would start the pipeline on unsynced
+    /// state silently.
+    #[tokio::test]
+    async fn test_engine_run_surfaces_strategy_sync_error() {
+        struct FailingSyncStrategy;
+
+        #[async_trait]
+        impl Strategy<u32, u32> for FailingSyncStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                Err(anyhow::anyhow!("sync exploded"))
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                Ok(Box::pin(futures::stream::iter(vec![event])))
+            }
+        }
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1])));
+        engine.add_strategy(Box::new(FailingSyncStrategy));
+
+        let err = engine
+            .run()
+            .await
+            .err()
+            .expect("a failing sync_state must fail run");
+        assert!(
+            err.to_string().contains("sync exploded"),
+            "the strategy's own error must surface, got: {err}"
         );
     }
 

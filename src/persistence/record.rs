@@ -24,17 +24,22 @@ pub fn table_name<E: SolEvent>() -> String {
     to_snake_case(name)
 }
 
+/// Serialise an event to its JSON [`Value`] — the single serialisation pass
+/// both the field map and the payload column are derived from.
+fn event_json<E: Serialize>(event: &E) -> Result<Value> {
+    serde_json::to_value(event).context("event is not serialisable to JSON")
+}
+
 /// Map an event's top-level fields to `name -> (best-guess type, value)`,
 /// sorted by field name (deterministic across runs).
-fn field_map<E: Serialize>(event: &E) -> Result<BTreeMap<String, (SqlType, SqlValue)>> {
-    let value = serde_json::to_value(event).context("event is not serialisable to JSON")?;
+fn field_map(value: &Value) -> Result<BTreeMap<String, (SqlType, SqlValue)>> {
     let object = match value {
         Value::Object(map) => map,
         other => anyhow::bail!("event must serialise to a JSON object, got {other}"),
     };
     Ok(object
-        .into_iter()
-        .map(|(key, field)| (key, (infer_type(&field), json_to_sql(&field))))
+        .iter()
+        .map(|(key, field)| (key.clone(), (infer_type(field), json_to_sql(field))))
         .collect())
 }
 
@@ -44,7 +49,7 @@ pub fn derive<E>(event: &E) -> Result<(TableSchema, Row)>
 where
     E: Serialize + SolEvent,
 {
-    let fields = field_map(event)?;
+    let fields = field_map(&event_json(event)?)?;
     let mut columns = Vec::with_capacity(fields.len());
     let mut values = Vec::with_capacity(fields.len());
     for (name, (ty, value)) in fields {
@@ -85,7 +90,10 @@ pub fn derive_record_with<E>(
 where
     E: Serialize + SolEvent,
 {
-    let fields = field_map(event)?;
+    // One serialisation pass feeds both the field map and the payload column;
+    // this runs once per event on the persistence hot path.
+    let json = event_json(event)?;
+    let fields = field_map(&json)?;
 
     let (table, columns, mut values) = match override_ {
         Some(schema) => {
@@ -129,7 +137,7 @@ where
     };
 
     let mut schema = TableSchema { table, columns };
-    let payload = serde_json::to_string(event).context("event is not serialisable to JSON")?;
+    let payload = json.to_string();
     schema
         .columns
         .push(Column::new(PAYLOAD_COLUMN, SqlType::Text));

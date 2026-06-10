@@ -19,12 +19,13 @@ The **Engine** fans-out every event to every strategy via a `tokio::sync::broadc
 
 | Layer | Type | Description |
 |---|---|---|
-| **Collector** | `BlockCollector` | Subscribes to new blocks via WebSocket |
+| **Collector** | `BlockCollector` | Subscribes to new blocks via WebSocket (falls back to polling) |
 | | `MempoolCollector` | Subscribes to pending transactions in the mempool |
 | | `LogCollector` | Subscribes to on-chain event logs matching a filter |
 | | `EventCollector` | Subscribes to an arbitrary `alloy` subscription |
 | **Strategy** | `Strategy<E, A>` | User-defined: receives events, produces action streams |
 | **Executor** | `MempoolExecutor` | Submits transactions to the public mempool |
+| **Observer** | `Observer<E, A>` | Passive consumer of every event and action crossing the channels |
 | **Persistence** | `Persisted<C, S>` | Wraps a block-aware collector to record events to a SQL `Store` and replay them on restart |
 
 ## Combinators
@@ -46,12 +47,28 @@ let collector = mempool_collector.filter_map(|tx| {
 let collector = block_collector.merge(mempool_collector);
 ```
 
-**Executor combinators:**
+## Observers
 
-| Combinator | Description |
-|---|---|
-| `ExecutorFilterMap` | Filter-maps actions before forwarding to an inner executor |
-| `.instrument(metrics)` | Wraps an executor (or strategy) with a `Metrics` callback |
+An **Observer** is one more subscriber on the engine's event and action
+channels: it sees everything strategies and executors see while producing and
+perturbing nothing. Observation is best-effort (a lagging observer skips
+messages like any consumer) and infallible by design — there is no error
+channel through which observing could fail the pipeline. Use it for metrics,
+logging, or shadow analysis:
+
+```rust
+use artemis_light::types::Observer;
+
+struct Telemetry;
+
+#[async_trait::async_trait]
+impl Observer<MyEvent, MyAction> for Telemetry {
+    async fn observe_event(&mut self, event: MyEvent) { /* count it */ }
+    async fn observe_action(&mut self, action: MyAction) { /* count it */ }
+}
+
+engine.add_observer(Box::new(Telemetry));
+```
 
 ## Persistence
 

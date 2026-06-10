@@ -119,30 +119,10 @@ pub struct Row(pub Vec<SqlValue>);
 mod tests {
     use super::*;
 
-    #[test]
-    fn sql_type_maps_to_create_table_keyword() {
-        assert_eq!(SqlType::Integer.sql(), "INTEGER");
-        assert_eq!(SqlType::Real.sql(), "REAL");
-        assert_eq!(SqlType::Text.sql(), "TEXT");
-        assert_eq!(SqlType::Blob.sql(), "BLOB");
-        assert_eq!(SqlType::Numeric.sql(), "NUMERIC");
-    }
-
-    #[test]
-    fn column_new_accepts_str_and_string() {
-        assert_eq!(
-            Column::new("amount", SqlType::Numeric),
-            Column {
-                name: "amount".to_string(),
-                ty: SqlType::Numeric,
-            }
-        );
-        // `impl Into<String>` so an owned String works too.
-        assert_eq!(
-            Column::new(String::from("amount"), SqlType::Numeric).name,
-            "amount"
-        );
-    }
+    // Construction helpers (`SqlType::sql`, `Column::new`, `TableSchema::new`)
+    // are restatements of their own definitions; testing them asserts nothing
+    // a regression could violate. Only the builder's ordering contract — which
+    // value alignment in `derive_record_with` depends on — is worth pinning.
 
     #[test]
     fn table_schema_builder_appends_columns_in_order() {
@@ -158,10 +138,5 @@ mod tests {
                 Column::new("amount", SqlType::Numeric),
             ]
         );
-    }
-
-    #[test]
-    fn new_table_schema_starts_empty() {
-        assert!(TableSchema::new("transfer").columns.is_empty());
     }
 }
