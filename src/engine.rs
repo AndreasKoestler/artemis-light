@@ -22,7 +22,8 @@ pub struct EngineHandle {
     /// The spawned collector/strategy/executor tasks.
     pub tasks: JoinSet<()>,
     /// Observe-only. The engine cancels this — and then `token` — if a collector
-    /// exhausts its [`ReconnectPolicy`], so the binary can tell a fatal shutdown
+    /// exhausts its [`ReconnectPolicy`](reconnect::ReconnectPolicy), so the
+    /// binary can tell a fatal shutdown
     /// apart from a caller-initiated one. The library never calls
     /// `process::exit`; the binary observes this and decides whether to restart.
     /// Do not cancel it yourself.

@@ -2,6 +2,8 @@
 
 A stripped-down, modernised fork of the [Artemis](https://github.com/paradigmxyz/artemis) MEV framework, built on [Alloy](https://github.com/alloy-rs/alloy) and Tokio.
 
+**[API documentation](https://andreaskoestler.github.io/artemis-light/)**
+
 ## Architecture
 
 Artemis-light is an **event-processing pipeline** composed of three pluggable stages wired together by an engine:

@@ -115,7 +115,7 @@ impl<C, S> Persisted<C, S> {
     }
 
     /// Slice the backfill into `query_range` windows of at most `blocks`
-    /// blocks (default [`DEFAULT_BACKFILL_CHUNK_SIZE`]), queried one at a
+    /// blocks (default 10,000), queried one at a
     /// time, so no single RPC call exceeds provider range caps or buffers an
     /// unbounded result.
     ///

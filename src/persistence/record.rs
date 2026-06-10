@@ -26,7 +26,7 @@ use super::schema::{
 };
 
 /// The mapping between the event type `E` and its SQL rows. See the
-/// [module docs](self).
+/// [module docs](crate::persistence).
 pub struct Record<E> {
     table: String,
     columns: ColumnsSource,
