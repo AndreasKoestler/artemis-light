@@ -42,4 +42,3 @@ pub mod persistence;
 
 /// This module contains syntax extensions for the `Collector` trait.
 pub mod collector_ext;
-// pub use collector_ext::*;

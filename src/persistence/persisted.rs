@@ -108,33 +108,6 @@ impl<'a, E: Send + 'a> Segments<'a, E> {
     }
 }
 
-/// The three segments of a [`Persisted`] subscription, in delivery order.
-///
-/// Construction forces an editor to account for every segment; the order in
-/// which they reach the subscriber is fixed in exactly one place,
-/// [`Segments::into_stream`]. The boundary arithmetic that keeps the segments
-/// disjoint lives at the construction site in [`Persisted::subscribe`].
-struct Segments<'a, E> {
-    /// Stored history reconstructed from the database. Empty on every
-    /// subscribe after the first (see the replay-once flag on [`Persisted`]).
-    replay: CollectorStream<'a, E>,
-    /// The RPC gap `[last+1 ..= tip]`: complete blocks, so the trailing block
-    /// is flushed too.
-    backfill: CollectorStream<'a, E>,
-    /// The unbounded live tail, strictly above the backfill cut (`> tip`); its
-    /// final in-progress block is never flushed.
-    live: CollectorStream<'a, E>,
-}
-
-impl<'a, E: Send + 'a> Segments<'a, E> {
-    /// Deliver replay, then backfill, then live. Replay and backfill must
-    /// precede the live tail so strategies see history in block order, and the
-    /// live tail must come last because it never ends.
-    fn into_stream(self) -> CollectorStream<'a, E> {
-        Box::pin(self.replay.chain(self.backfill).chain(self.live))
-    }
-}
-
 #[async_trait]
 impl<C, S, E> Collector<E> for Persisted<C, S>
 where

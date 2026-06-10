@@ -1,12 +1,7 @@
-use alloy::rpc::types::Transaction;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
-
-use crate::collectors::NewBlock;
-
-use crate::executors::SubmitTxToMempool;
 
 /// A stream of events emitted by a [Collector].
 pub type CollectorStream<'a, E> = Pin<Box<dyn Stream<Item = E> + Send + 'a>>;
@@ -42,49 +37,6 @@ pub trait Strategy<E, A>: Send + Sync {
 pub trait Executor<A>: Send + Sync {
     /// Execute an action.
     async fn execute(&mut self, action: A) -> Result<()>;
-}
-
-/// A wrapper around an [Executor] that filter-maps incoming actions,
-/// silently dropping actions that map to `None`.
-pub struct ExecutorFilterMap<E, F> {
-    executor: E,
-    f: F,
-}
-
-impl<E, F> ExecutorFilterMap<E, F> {
-    /// Creates a new `ExecutorFilterMap` wrapping `executor` with the filter-map function `f`.
-    pub fn new(executor: E, f: F) -> Self {
-        Self { executor, f }
-    }
-}
-
-#[async_trait]
-impl<A1, A2, E, F> Executor<A1> for ExecutorFilterMap<E, F>
-where
-    E: Executor<A2> + Send + Sync + 'static,
-    F: Fn(A1) -> Option<A2> + Send + Sync + Clone + 'static,
-    A1: Send + Sync + 'static,
-    A2: Send + Sync + 'static,
-{
-    async fn execute(&mut self, action: A1) -> Result<()> {
-        let action = (self.f)(action);
-        match action {
-            Some(action) => self.executor.execute(action).await,
-            None => Ok(()),
-        }
-    }
-}
-
-/// Convenience enum containing all the events that can be emitted by collectors.
-pub enum Events {
-    NewBlock(NewBlock),
-    Transaction(Box<Transaction>),
-}
-
-/// Convenience enum containing all the actions that can be executed by executors.
-pub enum Actions {
-    //    FlashbotsBundle(FlashbotsBundle),
-    SubmitTxToMempool(SubmitTxToMempool),
 }
 
 /// A passive consumer of the pipeline: sees every event fanned to
