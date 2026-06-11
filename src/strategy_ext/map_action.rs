@@ -24,16 +24,17 @@ where
     E: Send + Sync + 'static,
     A: Send + Sync + 'static,
     A2: Send + Sync + 'static,
-    F: Fn(A) -> A2 + Send + Sync + Clone + 'static,
+    F: Fn(A) -> A2 + Send + Sync + 'static,
 {
     async fn sync_state(&mut self) -> Result<()> {
         self.strategy.sync_state().await
     }
 
     async fn process_event(&mut self, event: E) -> Result<ActionStream<'_, A2>> {
-        // Cloned, not borrowed: the returned stream already holds the mutable
-        // borrow of the inner strategy for its full lifetime.
-        let f = self.f.clone();
+        // `&mut self.strategy` and `&self.f` are disjoint field borrows, so
+        // the returned stream can hold both for the same lifetime — no need
+        // to clone the closure.
+        let f = &self.f;
         let stream = self.strategy.process_event(event).await?;
         Ok(Box::pin(stream.map(f)))
     }

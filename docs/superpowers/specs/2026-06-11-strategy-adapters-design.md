@@ -36,7 +36,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
     /// e.g. an umbrella-enum constructor: `.map_action(Action::Submit)`.
     fn map_action<F, A2>(self, f: F) -> MapAction<E, A, F>
     where
-        F: Fn(A) -> A2 + Send + Sync + Clone + 'static;
+        F: Fn(A) -> A2 + Send + Sync + 'static;
 }
 
 // src/executor_ext.rs
@@ -92,13 +92,14 @@ One file per combinator, holding `Box<dyn Strategy<E, A>>` /
 | Struct | File | Implements | Core of impl |
 |---|---|---|---|
 | `FilterMapEvent<E, A, F>` | `src/strategy_ext/filter_map_event.rs` | `Strategy<E2, A>` | `f(event)` → `Some(e)`: delegate; `None`: `Ok(empty stream)` |
-| `MapAction<E, A, F>` | `src/strategy_ext/map_action.rs` | `Strategy<E, A2>` | await inner stream, wrap in `StreamExt::map(f.clone())` |
+| `MapAction<E, A, F>` | `src/strategy_ext/map_action.rs` | `Strategy<E, A2>` | await inner stream, wrap in `StreamExt::map(&self.f)` |
 | `FilterMapAction<A, F>` | `src/executor_ext/filter_map_action.rs` | `Executor<A2>` | `f(action)` → `Some(a)`: delegate; `None`: `Ok(())` |
 
-`MapAction` is the only wrapper that captures its closure inside a returned
-stream (which mutably borrows the inner strategy for `'_`), so it alone needs
-`F: Clone` — the same reason `CollectorExt::map` requires it. The other two
-call their closure before delegating.
+No wrapper needs `F: Clone`: `MapAction`'s returned stream borrows
+`&mut self.strategy` and `&self.f` simultaneously, but those are disjoint
+field borrows through `&mut self`, so the closure is borrowed rather than
+cloned. (`FilterMapEvent` and `FilterMapAction` call their closure before
+delegating and never capture it at all.)
 
 In each `impl`, the outer type (`E2`/`A2`) appears only in the closure's
 signature, so inference resolves it at the `add_strategy`/`add_executor` call

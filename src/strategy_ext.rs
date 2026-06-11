@@ -30,7 +30,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
     /// an umbrella-enum constructor: `.map_action(Action::Submit)`.
     fn map_action<F, A2>(self, f: F) -> MapAction<E, A, F>
     where
-        F: Fn(A) -> A2 + Send + Sync + Clone + 'static,
+        F: Fn(A) -> A2 + Send + Sync + 'static,
     {
         MapAction::new(Box::new(self), f)
     }
@@ -52,9 +52,11 @@ mod test {
 
     /// The umbrella event type a multi-source engine would broadcast.
     #[derive(Clone, Debug)]
-    #[allow(dead_code)]
     enum Event {
         Num(u32),
+        /// Payload constructed but never read in tests — exists to prove
+        /// unmatched variants are skipped.
+        #[allow(dead_code)]
         Text(String),
     }
 
