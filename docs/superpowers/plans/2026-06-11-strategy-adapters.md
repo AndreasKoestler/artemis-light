@@ -374,6 +374,12 @@ Expected: compile error — no method named `map_action`.
 
 - [x] **Step 3: Implement `MapAction` and the trait method**
 
+> **Amended after review (commit `0328d1b`):** the `F: Clone` bound and the
+> "Cloned, not borrowed" comment below turned out to be unnecessary —
+> `&mut self.strategy` and `&self.f` are disjoint field borrows, so the
+> shipped code borrows the closure instead. The snippets below are the
+> pre-fix historical record; the spec carries the corrected rationale.
+
 Create `src/strategy_ext/map_action.rs`:
 
 ```rust
@@ -913,7 +919,7 @@ git commit -m "docs: add adapters_example demonstrating the umbrella-enum patter
 
 **Files:** none (verification only; fixes — if any — amend the relevant commit or land as a follow-up commit).
 
-- [ ] **Step 1: Run the full CI gate locally**
+- [x] **Step 1: Run the full CI gate locally**
 
 ```bash
 cargo fmt --all -- --check
@@ -924,6 +930,6 @@ cargo doc --no-deps
 
 Expected: all four succeed with no warnings. `cargo doc` matters here: the rustdoc cross-links (`CollectorExt::map`, `StrategyExt::filter_map_event`) must resolve — `docs.yml` CI builds docs and the crate denies rustdoc warnings.
 
-- [ ] **Step 2: Confirm the spec is fully covered**
+- [x] **Step 2: Confirm the spec is fully covered**
 
 Check each spec requirement (docs/superpowers/specs/2026-06-11-strategy-adapters-design.md) against the code: three combinators with the spec'd signatures and semantics, empty-stream/Ok(()) filtering, sync_state delegation, error passthrough, chaining, example, README registration, lib.rs exports, rustdoc cross-links.
