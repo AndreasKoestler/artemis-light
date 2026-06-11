@@ -1,8 +1,10 @@
 use crate::types::Strategy;
 
 mod filter_map_event;
+mod map_action;
 
 pub use filter_map_event::*;
+pub use map_action::*;
 
 /// Extension trait that provides adapter combinators for types implementing
 /// [`Strategy`].
@@ -22,6 +24,15 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
         F: Fn(E2) -> Option<E> + Send + Sync + 'static,
     {
         FilterMapEvent::new(Box::new(self), f)
+    }
+
+    /// Lift this strategy's actions into a wider action type `A2` — typically
+    /// an umbrella-enum constructor: `.map_action(Action::Submit)`.
+    fn map_action<F, A2>(self, f: F) -> MapAction<E, A, F>
+    where
+        F: Fn(A) -> A2 + Send + Sync + Clone + 'static,
+    {
+        MapAction::new(Box::new(self), f)
     }
 }
 
@@ -146,5 +157,78 @@ mod test {
         });
         assert!(strategy.sync_state().await.is_err());
         assert!(strategy.process_event(Event::Num(1)).await.is_err());
+    }
+
+    /// The umbrella action type a multi-strategy engine would broadcast.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Action {
+        Submit(u32),
+    }
+
+    /// A narrow strategy emitting two actions per event: `n` and `n + 1`.
+    struct PairStrategy;
+
+    #[async_trait]
+    impl Strategy<u32, u32> for PairStrategy {
+        async fn sync_state(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+            Ok(Box::pin(stream::iter(vec![event, event + 1])))
+        }
+    }
+
+    #[tokio::test]
+    async fn map_action_transforms_every_action_preserving_order() {
+        let mut strategy = PairStrategy.map_action(Action::Submit);
+        let actions = strategy
+            .process_event(7)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(actions, vec![Action::Submit(7), Action::Submit(8)]);
+    }
+
+    #[tokio::test]
+    async fn map_action_delegates_sync_state_and_propagates_errors() {
+        let synced = Arc::new(AtomicBool::new(false));
+        let mut probe = SyncProbe {
+            synced: Arc::clone(&synced),
+        }
+        .map_action(Action::Submit);
+        probe.sync_state().await.unwrap();
+        assert!(synced.load(Ordering::SeqCst));
+
+        let mut failing = FailingStrategy.map_action(Action::Submit);
+        assert!(failing.sync_state().await.is_err());
+        assert!(failing.process_event(1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn filter_map_event_and_map_action_compose_end_to_end() {
+        let mut strategy = PairStrategy
+            .filter_map_event(|e: Event| match e {
+                Event::Num(n) => Some(n),
+                _ => None,
+            })
+            .map_action(Action::Submit);
+
+        let actions = strategy
+            .process_event(Event::Num(1))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(actions, vec![Action::Submit(1), Action::Submit(2)]);
+
+        let skipped = strategy
+            .process_event(Event::Text("not for me".into()))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(skipped.is_empty());
     }
 }
