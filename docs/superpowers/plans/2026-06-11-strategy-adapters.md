@@ -649,7 +649,7 @@ git commit -m "feat: add ExecutorExt::filter_map_action adapter"
 - Modify: `Cargo.toml` (add `[[example]]` block after the `combinators_example` block)
 - Modify: `examples/README.md` (add table row after `combinators_example`)
 
-- [ ] **Step 1: Write the example**
+- [x] **Step 1: Write the example**
 
 Create `examples/adapters_example.rs`:
 
@@ -877,7 +877,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Register the example**
+- [x] **Step 2: Register the example**
 
 Add to `Cargo.toml` after the `combinators_example` block:
 
@@ -893,12 +893,12 @@ Add to the table in `examples/README.md`, after the `combinators_example` row:
 | [`adapters_example`](adapters_example.rs) | Mounting narrow strategies and executors into an umbrella-enum engine with `StrategyExt::filter_map_event`/`map_action` and `ExecutorExt::filter_map_action` | No |
 ```
 
-- [ ] **Step 3: Run the example to verify it works**
+- [x] **Step 3: Run the example to verify it works**
 
 Run: `cargo run --example adapters_example`
 Expected: interleaved `[submit] tick 0/2/4` and `[log] price 1.4 ...` / `[log] price 2.3 ...` lines (order varies), ending with `Done!` and a clean exit.
 
-- [ ] **Step 4: Format, lint, commit**
+- [x] **Step 4: Format, lint, commit**
 
 ```bash
 cargo fmt --all

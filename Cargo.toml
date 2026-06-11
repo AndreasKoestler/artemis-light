@@ -45,6 +45,10 @@ name = "combinators_example"
 path = "examples/combinators_example.rs"
 
 [[example]]
+name = "adapters_example"
+path = "examples/adapters_example.rs"
+
+[[example]]
 name = "observer_example"
 path = "examples/observer_example.rs"
 
