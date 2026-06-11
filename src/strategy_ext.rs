@@ -1,8 +1,12 @@
 use crate::types::Strategy;
 
+mod cooldown;
+mod filter_actions;
 mod filter_map_event;
 mod map_action;
 
+pub use cooldown::*;
+pub use filter_actions::*;
 pub use filter_map_event::*;
 pub use map_action::*;
 
@@ -33,6 +37,24 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
         F: Fn(A) -> A2 + Send + Sync + 'static,
     {
         MapAction::new(Box::new(self), f)
+    }
+
+    /// A risk gate on the output side: drop every action failing `predicate`
+    /// — minimum profit, maximum notional, allowlisted targets. As a
+    /// combinator the risk policy is visible at composition time rather than
+    /// buried inside strategy logic.
+    fn filter_actions<P>(self, predicate: P) -> FilterActions<E, A, P>
+    where
+        P: Fn(&A) -> bool + Send + Sync + 'static,
+    {
+        FilterActions::new(Box::new(self), predicate)
+    }
+
+    /// Suppress this strategy's actions for `duration` after it fires. A
+    /// cooling strategy still sees every event — only its actions are
+    /// dropped — and an actionless event does not start the cooldown.
+    fn cooldown(self, duration: std::time::Duration) -> Cooldown<E, A> {
+        Cooldown::new(Box::new(self), duration)
     }
 }
 
@@ -206,6 +228,33 @@ mod test {
         let mut failing = FailingStrategy.map_action(Action::Submit);
         assert!(failing.sync_state().await.is_err());
         assert!(failing.process_event(1).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_risk_gate_and_cooldown_compose_end_to_end() {
+        use std::time::Duration;
+
+        // PairStrategy emits `n` and `n + 1`; the risk gate keeps only even
+        // actions, and the cooldown counts a gated-through action as firing.
+        let mut strategy = PairStrategy
+            .filter_actions(|a: &u32| a.is_multiple_of(2))
+            .cooldown(Duration::from_secs(60));
+
+        let actions = strategy
+            .process_event(1)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(actions, vec![2], "the odd action fails the risk gate");
+
+        let suppressed = strategy
+            .process_event(3)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(suppressed.is_empty(), "the strategy fired and is cooling");
     }
 
     #[tokio::test]
