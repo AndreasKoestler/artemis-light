@@ -53,6 +53,10 @@ name = "observer_example"
 path = "examples/observer_example.rs"
 
 [[example]]
+name = "reliability_example"
+path = "examples/reliability_example.rs"
+
+[[example]]
 name = "reconnect_example"
 path = "examples/reconnect_example.rs"
 

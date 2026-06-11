@@ -41,6 +41,34 @@ _Avoid_: combine, join, fan-in (the Engine's channel-level fan-in is a different
 A combinator that delivers two or more Collectors' streams strictly in sequence — the next source's events are held back until the previous source's stream ends. Sources still subscribe eagerly at the composite's subscribe, so a later live source buffers at its source rather than missing events while earlier segments drain (the same head-buffering rationale as the Persisted Collector's subscribe). Any creation failure fails the whole subscribe.
 _Avoid_: concat, append
 
+**Retry**:
+An Executor wrapper that re-submits a failed action with exponential backoff, per its **Retry Policy** (max retries + base delay), returning the last error once retries are exhausted. The execution-side counterpart of the **Reconnect Policy** — distinct from that policy's *Retry* decision, which concerns Collector streams.
+_Avoid_: resubmit loop, retry handler
+
+**Fallback**:
+An Executor wrapper that tries a primary executor and re-submits the action to a secondary on error — primary RPC → backup RPC, or private relay → public mempool. The primary's error is logged; only the fallback's verdict is returned.
+_Avoid_: failover, backup executor
+
+**Rate Limit**:
+An Executor wrapper that caps submissions per sliding one-second window, to respect provider limits. An over-cap action waits (backpressure on the action channel) — it is never dropped. Every attempt counts against the window, including failed ones: a failed submission still spent provider quota.
+_Avoid_: throttle, debounce
+
+**Circuit Breaker**:
+An Executor wrapper that stops submitting after N consecutive failures: an open circuit fails fast without reaching the inner executor, until an operator resets it through its **Handle** (taken before the engine consumes the executor). For a bot that signs transactions, failing closed is a safety feature, not just resilience. A success closes the counter; only an explicit reset closes an open circuit.
+_Avoid_: fuse, trip switch
+
+**Gated**:
+An Executor wrapper guarded by a kill switch the caller keeps (an `AtomicBool`): flag on, actions execute; flag off, actions are logged and dropped with `Ok`. Flipping the flag at runtime is the emergency stop. **Dry Run** is a Gated whose flag is permanently off — paper-trading mode.
+_Avoid_: toggle, feature flag
+
+**Risk Gate**:
+A Strategy wrapper (`filter_actions`) that drops every action failing a predicate — minimum profit, maximum notional, allowlisted targets. As a combinator, the risk policy is visible at composition time rather than buried inside strategy logic.
+_Avoid_: action filter, sanity check
+
+**Cooldown**:
+A Strategy wrapper that suppresses a strategy's actions for a period after it fires. A cooling strategy still sees every event — only its actions are dropped — so its internal state stays current; an actionless event does not start the cooldown, and a multi-action batch passes whole before the cooldown engages.
+_Avoid_: debounce, rate limit (that is the Executor-side wrapper)
+
 **Persisted Collector**:
 A Collector wrapper that records every event it sees into a Store and, on subscribe, delivers three **Segments** in fixed order: **Replay**, then **Backfill**, then the **Live Tail**.
 _Avoid_: indexer, archiver, recorder
@@ -73,6 +101,8 @@ _Avoid_: live stream, subscription
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
+- The reliability wrappers (**Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them.
+- A **Risk Gate** and a **Cooldown** wrap one **Strategy**; the Cooldown counts only actions that survive the layers inside it as firing.
 
 ## Example dialogue
 
@@ -85,3 +115,4 @@ _Avoid_: live stream, subscription
 
 - "retry" was used for both a single backoff-and-reconnect step and the whole give-up-or-keep-trying policy — resolved: a single step is a **Retry** decision; the state machine that emits those decisions is the **Reconnect Policy**.
 - A persistent stream-*creation* failure and a persistent stream-*end* are the same concept to the Reconnect Policy: both feed one counter and both can reach **Fatal**. The earlier code treated creation-failure as a quiet task exit — that asymmetry was an accidental gap, not a decision.
+- "Retry" now names two things: the Reconnect Policy's per-step *decision* on the Collector side, and the Executor wrapper on the execution side. Context disambiguates — streams reconnect, submissions retry — and both share the same backoff curve idiom.
