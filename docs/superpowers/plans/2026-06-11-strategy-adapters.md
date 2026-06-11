@@ -44,7 +44,7 @@ Cargo.toml                           (modify: add [[example]] block)
 - Create: `src/strategy_ext/filter_map_event.rs`
 - Modify: `src/lib.rs` (add module declaration after the `collector_ext` block at the end)
 
-- [ ] **Step 1: Create the module skeleton and wire it into lib.rs**
+- [x] **Step 1: Create the module skeleton and wire it into lib.rs**
 
 Create `src/strategy_ext.rs`:
 
@@ -86,7 +86,7 @@ Add to the end of `src/lib.rs` (after the `pub mod collector_ext;` block):
 pub mod strategy_ext;
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Append to `src/strategy_ext.rs`:
 
@@ -213,12 +213,12 @@ mod test {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail to compile**
+- [x] **Step 3: Run the tests to verify they fail to compile**
 
 Run: `cargo test --all-features strategy_ext`
 Expected: compile error — `filter_map_event.rs` module file does not exist yet (`file not found for module 'filter_map_event'`).
 
-- [ ] **Step 4: Implement `FilterMapEvent`**
+- [x] **Step 4: Implement `FilterMapEvent`**
 
 Create `src/strategy_ext/filter_map_event.rs`:
 
@@ -264,12 +264,12 @@ where
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --all-features strategy_ext`
 Expected: 4 tests pass.
 
-- [ ] **Step 6: Format, lint, commit**
+- [x] **Step 6: Format, lint, commit**
 
 ```bash
 cargo fmt --all
@@ -286,7 +286,7 @@ git commit -m "feat: add StrategyExt::filter_map_event adapter"
 - Create: `src/strategy_ext/map_action.rs`
 - Modify: `src/strategy_ext.rs` (module decl, trait method, tests)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `test` module in `src/strategy_ext.rs`. The umbrella action enum and `PairStrategy` double also serve the chained end-to-end test:
 
@@ -367,12 +367,12 @@ Append to the `test` module in `src/strategy_ext.rs`. The umbrella action enum a
 
 Update the test module's import line to include the new wrapper re-exports (no change needed — `super::StrategyExt` already brings the methods in; the wrappers are used only through inference).
 
-- [ ] **Step 2: Run the tests to verify they fail to compile**
+- [x] **Step 2: Run the tests to verify they fail to compile**
 
 Run: `cargo test --all-features strategy_ext`
 Expected: compile error — no method named `map_action`.
 
-- [ ] **Step 3: Implement `MapAction` and the trait method**
+- [x] **Step 3: Implement `MapAction` and the trait method**
 
 Create `src/strategy_ext/map_action.rs`:
 
@@ -442,12 +442,12 @@ And add the method to the `StrategyExt` trait body:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --all-features strategy_ext`
 Expected: 7 tests pass.
 
-- [ ] **Step 5: Format, lint, commit**
+- [x] **Step 5: Format, lint, commit**
 
 ```bash
 cargo fmt --all
