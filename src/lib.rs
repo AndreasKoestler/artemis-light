@@ -45,3 +45,6 @@ pub mod collector_ext;
 
 /// This module contains syntax extensions for the `Strategy` trait.
 pub mod strategy_ext;
+
+/// This module contains syntax extensions for the `Executor` trait.
+pub mod executor_ext;

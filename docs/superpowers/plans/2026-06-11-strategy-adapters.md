@@ -465,7 +465,7 @@ git commit -m "feat: add StrategyExt::map_action adapter"
 - Create: `src/executor_ext/filter_map_action.rs`
 - Modify: `src/lib.rs` (add module declaration after `strategy_ext`)
 
-- [ ] **Step 1: Create the module skeleton, wire lib.rs, write the failing tests**
+- [x] **Step 1: Create the module skeleton, wire lib.rs, write the failing tests**
 
 Create `src/executor_ext.rs`:
 
@@ -580,12 +580,12 @@ Add to `src/lib.rs` after the `strategy_ext` declaration:
 pub mod executor_ext;
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail to compile**
+- [x] **Step 2: Run the tests to verify they fail to compile**
 
 Run: `cargo test --all-features executor_ext`
 Expected: compile error — `filter_map_action.rs` module file does not exist yet.
 
-- [ ] **Step 3: Implement `FilterMapAction`**
+- [x] **Step 3: Implement `FilterMapAction`**
 
 Create `src/executor_ext/filter_map_action.rs`:
 
@@ -626,12 +626,12 @@ where
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --all-features executor_ext`
 Expected: 2 tests pass.
 
-- [ ] **Step 5: Format, lint, commit**
+- [x] **Step 5: Format, lint, commit**
 
 ```bash
 cargo fmt --all
