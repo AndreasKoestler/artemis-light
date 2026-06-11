@@ -178,6 +178,8 @@ async fn main() -> Result<()> {
 
     // Consumer side: project the umbrella Event down to each narrow
     // strategy, and lift each strategy's actions into the umbrella Action.
+    // Events the closure maps to `None` are silently skipped — an unmatched
+    // event yields an empty action stream, not an error.
     engine.add_strategy(Box::new(
         EvenTickStrategy
             .filter_map_event(|e: Event| match e {
@@ -216,6 +218,7 @@ async fn main() -> Result<()> {
     println!("Starting engine — two narrow strategies in one umbrella engine...\n");
     let mut handle = engine.run().await?;
 
+    // Cooperative shutdown — see basic_example for the full idiom.
     let _ = done_rx.await;
     handle.token.cancel();
     while handle.tasks.join_next().await.is_some() {}
