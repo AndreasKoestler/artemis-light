@@ -55,6 +55,25 @@ pub async fn spawn_anvil_with_signer() -> Result<(impl Provider + Clone, AnvilIn
     Ok((provider, anvil))
 }
 
+/// Spawns Anvil and instantiates an HTTP-only provider (no pubsub), to
+/// exercise the collectors' polling fallback.
+pub async fn spawn_anvil_http() -> Result<(impl Provider + Clone, AnvilInstance)> {
+    let anvil = Anvil::new().block_time(1).chain_id(1337).try_spawn()?;
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse()?);
+    Ok((provider, anvil))
+}
+
+/// Spawns Anvil and instantiates an HTTP-only provider with a wallet signer,
+/// for fallback tests that deploy contracts.
+pub async fn spawn_anvil_http_with_signer() -> Result<(impl Provider + Clone, AnvilInstance)> {
+    let anvil = Anvil::new().block_time(1).chain_id(1337).try_spawn()?;
+    let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+    let provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect_http(anvil.endpoint().parse()?);
+    Ok((provider, anvil))
+}
+
 /// Test that block collector correctly emits blocks.
 #[tokio::test]
 async fn test_block_collector_sends_blocks() {
@@ -76,12 +95,7 @@ async fn test_block_collector_sends_blocks() {
 /// collector must fall back to polling — and still deliver new blocks.
 #[tokio::test]
 async fn test_block_collector_polls_when_subscriptions_are_unavailable() {
-    let anvil = Anvil::new()
-        .block_time(1)
-        .chain_id(1337)
-        .try_spawn()
-        .unwrap();
-    let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+    let (provider, _anvil) = spawn_anvil_http().await.unwrap();
     let provider = Arc::new(provider);
     let block_collector = BlockCollector::new(provider.clone());
 
@@ -131,6 +145,36 @@ async fn test_mempool_collector_sends_txs() {
 
     let tx = mempool_stream.into_future().await.0.unwrap();
     assert_eq!(&tx_receipt.transaction_hash, tx.inner.hash());
+}
+
+/// Over plain HTTP there is no pubsub, so `subscribe_pending_transactions`
+/// fails and the collector must fall back to polling the pending-tx filter —
+/// and still deliver the full transaction.
+#[tokio::test]
+async fn test_mempool_collector_polls_when_subscriptions_are_unavailable() {
+    let (provider, _anvil) = spawn_anvil_http().await.unwrap();
+    let provider = Arc::new(provider);
+    let mempool_collector = MempoolCollector::new(provider.clone());
+    let mempool_stream = mempool_collector.subscribe().await.unwrap();
+
+    let account = provider.get_accounts().await.unwrap()[0];
+    let tx = TransactionRequest::default()
+        .with_to(account)
+        .with_from(account)
+        .with_value(U256::from(42))
+        .with_gas_price(100_000_000_000_000_000u128);
+    let pending_tx = provider.send_transaction(tx).await.unwrap();
+    let tx_hash = *pending_tx.tx_hash();
+
+    let tx = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        mempool_stream.into_future(),
+    )
+    .await
+    .expect("polling fallback should deliver the pending tx within 15s")
+    .0
+    .unwrap();
+    assert_eq!(tx.inner.hash(), &tx_hash);
 }
 
 /// Test that the mempool executor correctly sends txs
@@ -282,6 +326,39 @@ async fn test_log_collector_receives_logs() {
     assert_eq!(log.address(), contract_addr);
 }
 
+/// Over plain HTTP there is no pubsub, so `subscribe_logs` fails and the
+/// collector must fall back to a polled log filter — and still deliver logs.
+#[tokio::test]
+async fn test_log_collector_polls_when_subscriptions_are_unavailable() {
+    let (provider, _anvil) = spawn_anvil_http_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+
+    let contract = Emitter::deploy(provider.clone()).await.unwrap();
+    let contract_addr = *contract.address();
+
+    // Subscribe before emitting: the polled filter only reports logs that
+    // arrive after its creation.
+    let filter = Filter::new().address(contract_addr);
+    let log_collector = LogCollector::new(provider.clone(), filter);
+    let log_stream = log_collector.subscribe().await.unwrap();
+
+    contract
+        .setValue(U256::from(42))
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+
+    let log = tokio::time::timeout(std::time::Duration::from_secs(15), log_stream.into_future())
+        .await
+        .expect("polling fallback should deliver the log within 15s")
+        .0
+        .unwrap();
+    assert_eq!(log.address(), contract_addr);
+}
+
 /// Test that EventCollector receives typed events from a contract.
 #[tokio::test]
 async fn test_event_collector_receives_events() {
@@ -308,6 +385,42 @@ async fn test_event_collector_receives_events() {
 
     // Verify the decoded event value
     let ev = event_stream.into_future().await.0.unwrap();
+    assert_eq!(ev.value, U256::from(42));
+}
+
+/// Over plain HTTP there is no pubsub, so the event subscription fails and
+/// the collector must fall back to a polled log filter — and still deliver
+/// decoded events.
+#[tokio::test]
+async fn test_event_collector_polls_when_subscriptions_are_unavailable() {
+    let (provider, _anvil) = spawn_anvil_http_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+
+    let contract = Emitter::deploy(provider.clone()).await.unwrap();
+
+    // Subscribe before emitting: the polled filter only reports logs that
+    // arrive after its creation.
+    let event_filter = contract.ValueSet_filter();
+    let event_collector = EventCollector::new(event_filter);
+    let event_stream = event_collector.subscribe().await.unwrap();
+
+    contract
+        .setValue(U256::from(42))
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+
+    let ev = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        event_stream.into_future(),
+    )
+    .await
+    .expect("polling fallback should deliver the event within 15s")
+    .0
+    .unwrap();
     assert_eq!(ev.value, U256::from(42));
 }
 

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::{providers::Provider, rpc::types::Transaction};
+use alloy::{primitives::TxHash, providers::Provider, rpc::types::Transaction};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use crate::collectors::fallback::subscribe_or_poll;
 use crate::types::{Collector, CollectorStream};
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,15 +56,18 @@ where
     M: Provider,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, Transaction>> {
-        let stream = self
-            .provider
-            .subscribe_pending_transactions()
-            .await?
-            .into_stream();
+        let hashes = subscribe_or_poll(
+            "pending transactions",
+            self.subscription_hashes(),
+            self.polling_hashes(),
+        )
+        .await?;
 
+        // Both sources yield bare hashes; the full-transaction lookup is
+        // shared and applied once, after the source is chosen.
         let provider = self.provider.clone();
         let rpc_timeout = self.rpc_timeout;
-        let stream = stream
+        let stream = hashes
             .map(move |tx_hash| {
                 let provider = provider.clone();
                 async move {
@@ -93,5 +97,29 @@ where
             .filter_map(|tx| async { tx });
 
         Ok(Box::pin(stream))
+    }
+}
+
+impl<M> MempoolCollector<M>
+where
+    M: Provider,
+{
+    /// Pending-tx hashes over pubsub. Fails on transports without pubsub.
+    async fn subscription_hashes(&self) -> Result<CollectorStream<'_, TxHash>> {
+        let stream = self
+            .provider
+            .subscribe_pending_transactions()
+            .await?
+            .into_stream();
+        Ok(Box::pin(stream))
+    }
+
+    /// Pending-tx hashes via a polled filter; the poller yields batches,
+    /// flattened here to match the subscription's shape.
+    async fn polling_hashes(&self) -> Result<CollectorStream<'_, TxHash>> {
+        let poller = self.provider.watch_pending_transactions().await?;
+        Ok(Box::pin(
+            poller.into_stream().flat_map(futures::stream::iter),
+        ))
     }
 }

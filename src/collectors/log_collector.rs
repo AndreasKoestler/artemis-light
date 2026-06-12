@@ -1,3 +1,4 @@
+use crate::collectors::fallback::subscribe_or_poll;
 use crate::types::{Collector, CollectorStream};
 use alloy::{
     providers::Provider,
@@ -5,6 +6,7 @@ use alloy::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::sync::Arc;
 
 /// A collector that listens for new blockchain event logs based on a [Filter],
@@ -27,8 +29,26 @@ where
     M: Provider,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, Log>> {
+        subscribe_or_poll("logs", self.subscription_stream(), self.polling_stream()).await
+    }
+}
+
+impl<M> LogCollector<M>
+where
+    M: Provider,
+{
+    /// Matching logs over pubsub. Fails on transports without pubsub.
+    async fn subscription_stream(&self) -> Result<CollectorStream<'_, Log>> {
         let stream = self.provider.subscribe_logs(&self.filter).await?;
-        let stream = stream.into_stream();
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream.into_stream()))
+    }
+
+    /// Matching logs via a polled filter; the poller yields batches,
+    /// flattened here to match the subscription's shape.
+    async fn polling_stream(&self) -> Result<CollectorStream<'_, Log>> {
+        let poller = self.provider.watch_logs(&self.filter).await?;
+        Ok(Box::pin(
+            poller.into_stream().flat_map(futures::stream::iter),
+        ))
     }
 }
