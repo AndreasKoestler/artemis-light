@@ -21,7 +21,8 @@ pub trait Collector<E>: Send + Sync {
     }
 }
 
-/// Strategy trait, which defines the core logic for each opportunity.
+/// Strategy trait, which defines an agent's decision logic: events in,
+/// actions out.
 #[async_trait]
 pub trait Strategy<E, A>: Send + Sync {
     /// Sync the initial state of the strategy if needed, usually by fetching

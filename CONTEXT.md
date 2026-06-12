@@ -1,6 +1,6 @@
 # artemis-light
 
-Domain language for the event-processing pipeline (Collectors → Strategies → Executors, wired by the Engine). Records the terms a maintainer must share to talk about the pipeline precisely.
+Domain language for a framework for reliable, long-running on-chain automation: event-driven agents that watch a chain, decide, and act through an event-processing pipeline (Collectors → Strategies → Executors, wired by the Engine). Records the terms a maintainer must share to talk about the pipeline precisely.
 
 ## Language
 
@@ -9,7 +9,7 @@ A source of events that turns an external stream (new blocks, pending txs, logs)
 _Avoid_: listener, watcher, source
 
 **Strategy**:
-The opportunity logic — consumes events, produces a stream of actions.
+The decision logic — consumes events, produces a stream of actions.
 
 **Executor**:
 The sink that carries out actions in an external domain (submitting a tx, posting an order).

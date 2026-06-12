@@ -2,11 +2,11 @@
 name = "artemis-light"
 version = "0.1.0"
 edition = "2024"
-description = "A stripped-down, modernised fork of the Artemis MEV framework, built on Alloy and Tokio"
+description = "A framework for reliable, long-running on-chain automation: event-driven agents built on Alloy and Tokio. A fork of Paradigm's Artemis."
 license = "Apache-2.0"
 repository = "https://github.com/AndreasKoestler/artemis-light"
 readme = "README.md"
-keywords = ["mev", "ethereum", "alloy", "tokio", "web3"]
+keywords = ["ethereum", "web3", "alloy", "bot", "indexer"]
 categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [dependencies]
