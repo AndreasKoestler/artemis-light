@@ -55,7 +55,7 @@
 - Create: `src/collectors/fallback.rs`
 - Modify: `src/collectors/mod.rs`
 
-- [ ] **Step 1: Write the helper module with failing tests and a `todo!()` body**
+- [x] **Step 1: Write the helper module with failing tests and a `todo!()` body**
 
 Create `src/collectors/fallback.rs`:
 
@@ -160,12 +160,12 @@ mod fallback;
 
 (No `pub use` — the helper is not public API.)
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --lib collectors::fallback`
 Expected: 3 tests FAIL (panic at `not yet implemented` from `todo!()`). If they fail to *compile* instead, fix the test code first — the red state must be the `todo!()` panic.
 
-- [ ] **Step 3: Implement the helper**
+- [x] **Step 3: Implement the helper**
 
 Replace the function body (`let _ = ...; todo!()`) with:
 
@@ -179,12 +179,12 @@ Replace the function body (`let _ = ...; todo!()`) with:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib collectors::fallback`
 Expected: `test result: ok. 3 passed`
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt
@@ -202,12 +202,12 @@ Behavior-preserving refactor — the inline fallback at `src/collectors/block_co
 - Modify: `src/collectors/block_collector.rs`
 - Test (existing): `tests/main.rs` — `test_block_collector_sends_blocks`, `test_block_collector_polls_when_subscriptions_are_unavailable`
 
-- [ ] **Step 1: Run the existing block tests to confirm green before refactoring**
+- [x] **Step 1: Run the existing block tests to confirm green before refactoring**
 
 Run: `cargo test --test main test_block_collector`
 Expected: `test result: ok. 2 passed` (slow — each spawns Anvil with 1s blocks)
 
-- [ ] **Step 2: Refactor**
+- [x] **Step 2: Refactor**
 
 Replace the whole `Collector` impl (everything from `/// Implementation of the [Collector]...` to the end of the file) with:
 
@@ -278,12 +278,12 @@ use crate::types::{Collector, CollectorStream};
 
 (The `tracing::warn` import stays — the polling arm still uses it; the per-subscribe-failure warning now lives in the helper.)
 
-- [ ] **Step 3: Run the block tests to verify still green**
+- [x] **Step 3: Run the block tests to verify still green**
 
 Run: `cargo test --test main test_block_collector`
 Expected: `test result: ok. 2 passed`
 
-- [ ] **Step 4: Format and commit**
+- [x] **Step 4: Format and commit**
 
 ```bash
 cargo fmt
@@ -299,7 +299,7 @@ git commit -m "refactor: move BlockCollector polling fallback onto subscribe_or_
 - Modify: `src/collectors/mempool_collector.rs`
 - Modify: `tests/main.rs` (add `spawn_anvil_http`, refactor existing block HTTP test onto it, add the mempool fallback test)
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 In `tests/main.rs`, add next to `spawn_anvil_with_signer` (around line 56):
 
@@ -356,12 +356,12 @@ async fn test_mempool_collector_polls_when_subscriptions_are_unavailable() {
 }
 ```
 
-- [ ] **Step 2: Run the new test to verify it fails**
+- [x] **Step 2: Run the new test to verify it fails**
 
 Run: `cargo test --test main test_mempool_collector_polls`
 Expected: FAIL — panics at `mempool_collector.subscribe().await.unwrap()` with a transport error (HTTP has no `eth_subscribe`).
 
-- [ ] **Step 3: Implement the fallback**
+- [x] **Step 3: Implement the fallback**
 
 In `src/collectors/mempool_collector.rs`, replace the `Collector` impl (the whole block from `/// Implementation of the [Collector]...` to end of file) with:
 
@@ -452,12 +452,12 @@ and add below the existing `use crate::types::...` line:
 use crate::collectors::fallback::subscribe_or_poll;
 ```
 
-- [ ] **Step 4: Run the mempool tests (both transports) to verify they pass**
+- [x] **Step 4: Run the mempool tests (both transports) to verify they pass**
 
 Run: `cargo test --test main test_mempool_collector`
 Expected: `test result: ok. 2 passed`
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt
@@ -473,7 +473,7 @@ git commit -m "feat: MempoolCollector falls back to filter polling without pubsu
 - Modify: `src/collectors/log_collector.rs`
 - Modify: `tests/main.rs` (add `spawn_anvil_http_with_signer`, add the log fallback test)
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 In `tests/main.rs`, add next to `spawn_anvil_http`:
 
@@ -530,12 +530,12 @@ async fn test_log_collector_polls_when_subscriptions_are_unavailable() {
 }
 ```
 
-- [ ] **Step 2: Run the new test to verify it fails**
+- [x] **Step 2: Run the new test to verify it fails**
 
 Run: `cargo test --test main test_log_collector_polls`
 Expected: FAIL — panics at `log_collector.subscribe().await.unwrap()` with a transport error.
 
-- [ ] **Step 3: Implement the fallback**
+- [x] **Step 3: Implement the fallback**
 
 In `src/collectors/log_collector.rs`, replace the `Collector` impl (from `/// Implementation of the [Collector]...` to end of file) with:
 
@@ -587,12 +587,12 @@ use std::sync::Arc;
 
 (`futures::StreamExt` is new — needed for `flat_map`.)
 
-- [ ] **Step 4: Run the log tests (both transports) to verify they pass**
+- [x] **Step 4: Run the log tests (both transports) to verify they pass**
 
 Run: `cargo test --test main test_log_collector`
 Expected: `test result: ok. 2 passed`
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt
@@ -610,7 +610,7 @@ Both `EventPoller::into_stream()` and `EventSubscription::into_stream()` yield `
 - Modify: `src/collectors/event_collector.rs`
 - Modify: `tests/main.rs` (add the event fallback test)
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 In `tests/main.rs`, add after `test_event_collector_receives_events`:
 
@@ -652,12 +652,12 @@ async fn test_event_collector_polls_when_subscriptions_are_unavailable() {
 }
 ```
 
-- [ ] **Step 2: Run the new test to verify it fails**
+- [x] **Step 2: Run the new test to verify it fails**
 
 Run: `cargo test --test main test_event_collector_polls`
 Expected: FAIL — panics at `event_collector.subscribe().await.unwrap()` with a transport error.
 
-- [ ] **Step 3: Implement the fallback**
+- [x] **Step 3: Implement the fallback**
 
 In `src/collectors/event_collector.rs`:
 
@@ -717,12 +717,12 @@ with
 
 In `PersistableCollector::subscribe_indexed`, make the same one-line replacement (`self.event.subscribe().await?.into_stream()` → `self.raw_stream().await?`). The `filter_map` bodies in both methods stay exactly as they are. `query_range` and `tip` are untouched.
 
-- [ ] **Step 4: Run the event collector tests to verify they pass**
+- [x] **Step 4: Run the event collector tests to verify they pass**
 
 Run: `cargo test --test main test_event_collector && cargo test --lib event_collector`
 Expected: integration `2 passed`; lib unit tests `2 passed`.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt
@@ -737,13 +737,13 @@ git commit -m "feat: EventCollector falls back to filter polling without pubsub"
 **Files:**
 - Modify: `CONTEXT.md`
 
-- [ ] **Step 1: Add the language entry**
+- [x] **Step 1: Add the language entry**
 
 In `CONTEXT.md`, directly after the **Fallback** entry (the paragraph ending `_Avoid_: failover, backup executor`), add:
 
 ```markdown
 **Polling Fallback**:
-The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. Distinct from **Fallback**, the executor-side wrapper.
+The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. While polling, event latency is the provider's poll interval rather than push-on-arrival. Distinct from **Fallback**, the executor-side wrapper.
 _Avoid_: failover, degraded mode
 ```
 
@@ -753,7 +753,7 @@ In the `## Relationships` section, add this bullet:
 - Every built-in **Collector**'s subscribe carries a **Polling Fallback**; a failed poll feeds the **Reconnect Policy**'s counter like any subscribe failure.
 ```
 
-- [ ] **Step 2: Run the full verification suite**
+- [x] **Step 2: Run the full verification suite**
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets && cargo test
@@ -761,7 +761,7 @@ cargo fmt --check && cargo clippy --all-targets && cargo test
 
 Expected: fmt clean; clippy introduces no new warnings; full test suite passes (lib unit tests + `tests/main.rs` + `tests/persistence.rs` — slow, spawns many Anvil instances).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add CONTEXT.md

@@ -87,8 +87,9 @@ Add a `CONTEXT.md` language entry:
 
 > **Polling Fallback**: The collector-side downgrade from a pubsub
 > subscription to filter polling when `subscribe()` fails, logged as a
-> warning and re-attempted fresh on every reconnect. Distinct from the
-> executor-side **Fallback** wrapper.
+> warning and re-attempted fresh on every reconnect. While polling, event
+> latency is the provider's poll interval rather than push-on-arrival.
+> Distinct from the executor-side **Fallback** wrapper.
 > _Avoid_: failover, degraded mode
 
 ## Testing
