@@ -1,6 +1,7 @@
+use crate::collectors::fallback::subscribe_or_poll;
 use crate::persistence::PersistableCollector;
 use crate::types::{Collector, CollectorStream};
-use alloy::{contract::Event, providers::Provider, sol_types::SolEvent};
+use alloy::{contract::Event, providers::Provider, rpc::types::Log, sol_types::SolEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio_stream::StreamExt;
@@ -40,6 +41,37 @@ fn indexed_event<E>(event: E, log: &alloy::rpc::types::Log) -> Option<(u64, E)> 
     }
 }
 
+/// The raw decoded `(event, log)` stream, before reorg/index filtering.
+/// Subscription and poller deliberately share this item type.
+type RawEventStream<'a, E> = CollectorStream<'a, alloy::sol_types::Result<(E, Log)>>;
+
+impl<P, E> EventCollector<P, E>
+where
+    P: Provider,
+    E: SolEvent + Send + Sync,
+{
+    /// The `(event, log)` source shared by `subscribe` and
+    /// `subscribe_indexed`: pubsub when available, filter polling otherwise.
+    async fn raw_stream(&self) -> Result<RawEventStream<'_, E>> {
+        subscribe_or_poll(
+            "contract events",
+            self.subscription_stream(),
+            self.polling_stream(),
+        )
+        .await
+    }
+
+    /// Decoded events over pubsub. Fails on transports without pubsub.
+    async fn subscription_stream(&self) -> Result<RawEventStream<'_, E>> {
+        Ok(Box::pin(self.event.subscribe().await?.into_stream()))
+    }
+
+    /// Decoded events via a polled log filter.
+    async fn polling_stream(&self) -> Result<RawEventStream<'_, E>> {
+        Ok(Box::pin(self.event.watch().await?.into_stream()))
+    }
+}
+
 /// Implementation of the [Collector](Collector) trait for the [EventCollector](EventCollector).
 #[async_trait]
 impl<P, E> Collector<E> for EventCollector<P, E>
@@ -48,7 +80,7 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
-        let stream = self.event.subscribe().await?.into_stream();
+        let stream = self.raw_stream().await?;
         let stream = stream.filter_map(|el| match el {
             Ok((e, log)) => indexed_event(e, &log).map(|(_, e)| e),
             Err(e) => {
@@ -70,7 +102,7 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, E)>> {
-        let stream = self.event.subscribe().await?.into_stream();
+        let stream = self.raw_stream().await?;
         let stream = stream.filter_map(|el| match el {
             Ok((event, log)) => indexed_event(event, &log),
             Err(e) => {

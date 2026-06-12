@@ -14,6 +14,9 @@ mod mempool_collector;
 /// This collector listens to a stream of new events.
 mod event_collector;
 
+/// Crate-private subscribe-or-poll downgrade shared by the collectors above.
+mod fallback;
+
 pub use block_collector::*;
 pub use event_collector::*;
 pub use log_collector::*;

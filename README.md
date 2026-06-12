@@ -4,9 +4,38 @@
 [![docs.rs](https://docs.rs/artemis-light/badge.svg)](https://docs.rs/artemis-light)
 [![CI](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml/badge.svg)](https://github.com/AndreasKoestler/artemis-light/actions/workflows/test.yml)
 
-A stripped-down, modernised fork of the [Artemis](https://github.com/paradigmxyz/artemis) MEV framework, built on [Alloy](https://github.com/alloy-rs/alloy) and Tokio.
+A Rust framework for reliable, long-running **on-chain automation**:
+event-driven agents that watch a chain, decide, and act. Built on
+[Alloy](https://github.com/alloy-rs/alloy) and Tokio, it began as a
+stripped-down, modernised fork of Paradigm's
+[Artemis](https://github.com/paradigmxyz/artemis) MEV framework.
+
+Use it for liquidation bots and keepers, indexers and event archivers,
+monitoring and alerting agents, trading automation — and MEV searchers.
 
 **[API documentation](https://andreaskoestler.github.io/artemis-light/)** (also on [docs.rs](https://docs.rs/artemis-light))
+
+## Purpose and scope
+
+artemis-light provides what an unattended on-chain agent needs to stay
+correct and alive over a long horizon:
+
+- **The pipeline** — Collectors → Strategies → Executors, orchestrated by an
+  Engine over broadcast channels.
+- **Composition** — combinators for every stage (`map`, `filter_map`, `merge`,
+  `chain`, risk gates, cooldowns) so cross-cutting policy is visible at
+  composition time.
+- **Operational safety** — per-collector reconnect with fatal escalation,
+  polling fallback for pubsub-less transports, and executor wrappers for
+  retry, fallback, rate limiting, circuit breaking, and a kill switch /
+  dry-run mode.
+- **Durable persistence** — events recorded to SQL, replayed on restart, and
+  backfilled across the gap, so a restarted agent resumes instead of
+  re-syncing from genesis.
+
+Out of scope: strategy logic itself, protocol-specific integrations, and
+MEV-specific infrastructure (bundles, private relays, latency optimisation) —
+the parts the fork deliberately dropped.
 
 ## Architecture
 

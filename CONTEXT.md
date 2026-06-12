@@ -1,6 +1,6 @@
 # artemis-light
 
-Domain language for the event-processing pipeline (Collectors → Strategies → Executors, wired by the Engine). Records the terms a maintainer must share to talk about the pipeline precisely.
+Domain language for a framework for reliable, long-running on-chain automation: event-driven agents that watch a chain, decide, and act through an event-processing pipeline (Collectors → Strategies → Executors, wired by the Engine). Records the terms a maintainer must share to talk about the pipeline precisely.
 
 ## Language
 
@@ -9,7 +9,7 @@ A source of events that turns an external stream (new blocks, pending txs, logs)
 _Avoid_: listener, watcher, source
 
 **Strategy**:
-The opportunity logic — consumes events, produces a stream of actions.
+The decision logic — consumes events, produces a stream of actions.
 
 **Executor**:
 The sink that carries out actions in an external domain (submitting a tx, posting an order).
@@ -48,6 +48,10 @@ _Avoid_: resubmit loop, retry handler
 **Fallback**:
 An Executor wrapper that tries a primary executor and re-submits the action to a secondary on error — primary RPC → backup RPC, or private relay → public mempool. The primary's error is logged; only the fallback's verdict is returned.
 _Avoid_: failover, backup executor
+
+**Polling Fallback**:
+The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. While polling, event latency is the provider's poll interval rather than push-on-arrival. Distinct from **Fallback**, the executor-side wrapper.
+_Avoid_: failover, degraded mode
 
 **Rate Limit**:
 An Executor wrapper that caps submissions per sliding one-second window, to respect provider limits. An over-cap action waits (backpressure on the action channel) — it is never dropped. Every attempt counts against the window, including failed ones: a failed submission still spent provider quota.
@@ -103,6 +107,7 @@ _Avoid_: live stream, subscription
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
 - The reliability wrappers (**Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them.
 - A **Risk Gate** and a **Cooldown** wrap one **Strategy**; the Cooldown counts only actions that survive the layers inside it as firing.
+- Every built-in **Collector**'s subscribe carries a **Polling Fallback**; a failed poll feeds the **Reconnect Policy**'s counter like any subscribe failure.
 
 ## Example dialogue
 
