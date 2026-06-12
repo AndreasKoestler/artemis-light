@@ -26,3 +26,5 @@ target/
 *.db-wal
 *.sqlite
 *.sqlite3
+# Git worktrees for isolated feature work
+.worktrees/
