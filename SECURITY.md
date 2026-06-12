@@ -5,11 +5,10 @@
 Please **do not** report security vulnerabilities through public GitHub
 issues, discussions, or pull requests.
 
-Instead, use one of these private channels:
+Instead, use GitHub private vulnerability reporting:
 
 - **GitHub private vulnerability reporting** (preferred):
   [Report a vulnerability](https://github.com/AndreasKoestler/artemis-light/security/advisories/new)
-- **Email:** andreas@last.net
 
 Include as much of the following as you can:
 
