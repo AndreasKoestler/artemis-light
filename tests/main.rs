@@ -177,7 +177,9 @@ async fn test_mempool_collector_polls_when_subscriptions_are_unavailable() {
     assert_eq!(tx.inner.hash(), &tx_hash);
 }
 
-/// Test that the mempool executor correctly sends txs
+/// Test that the mempool executor correctly sends a 1559-priced tx. The
+/// executor now prices `max_fee_per_gas`/`max_priority_fee_per_gas` itself from
+/// the provider's fee estimate, so the request carries no manual gas price.
 #[tokio::test]
 async fn test_mempool_executor_sends_tx_simple() {
     let (provider, _anvil) = spawn_anvil().await.unwrap();
@@ -186,12 +188,10 @@ async fn test_mempool_executor_sends_tx_simple() {
 
     let account = provider.get_accounts().await.unwrap()[0];
     let value: u64 = 42;
-    let gas_price = 100_000_000_000_000_000u128;
     let tx = TransactionRequest::default()
         .with_to(account)
         .with_from(account)
-        .with_value(U256::from(value))
-        .with_gas_price(gas_price);
+        .with_value(U256::from(value));
 
     let action = SubmitTxToMempool {
         tx,
@@ -236,7 +236,7 @@ async fn test_mempool_executor_rejects_bid_percentage_above_100() {
     assert_eq!(provider.get_transaction_count(account).await.unwrap(), 0);
 }
 
-/// With a gas bid, the executor prices the tx at
+/// With a gas bid, the executor caps `max_fee_per_gas` at
 /// `total_profit / gas_usage * bid_percentage / 100` and sets the gas limit
 /// from its own estimate (so the provider's filler doesn't re-estimate).
 #[tokio::test]
@@ -285,14 +285,76 @@ async fn test_mempool_executor_prices_tx_from_gas_bid() {
     let sent = sent.expect("the bid-priced transaction should have been mined");
 
     assert_eq!(
-        sent.gas_price(),
-        Some(2 * GWEI),
-        "tx must be priced at breakeven * bid_percentage"
+        sent.max_fee_per_gas(),
+        2 * GWEI,
+        "max_fee_per_gas must be capped at breakeven * bid_percentage"
+    );
+    assert!(
+        sent.max_priority_fee_per_gas().unwrap_or_default() <= sent.max_fee_per_gas(),
+        "the EIP-1559 invariant must hold: priority <= max_fee"
     );
     assert_eq!(
         sent.gas_limit(),
         21_000,
         "the executor's estimate must be set as the gas limit"
+    );
+}
+
+/// With auto-mining off, the first submission stays pending past the
+/// confirmation timeout; the executor escalates the fee and resends at the same
+/// nonce. Mining a block then confirms the replacement and `execute` returns
+/// `Ok`. We assert the strong, deterministic invariant the plan permits: the
+/// nonce advanced by exactly 1 (so exactly one tx mined at the pinned nonce),
+/// and the executor returned `Ok`.
+#[tokio::test]
+async fn replacement_speeds_up_a_stuck_transaction() {
+    use alloy::providers::ext::AnvilApi;
+    use artemis_light::executors::ReplacementPolicy;
+    use std::time::Duration;
+
+    let (provider, anvil) = spawn_anvil_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+    let from = anvil.addresses()[0];
+    let to = anvil.addresses()[1];
+
+    // Turn off auto-mining so the first send stays pending.
+    provider.anvil_set_auto_mine(false).await.unwrap();
+
+    let mut executor = MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
+        confirmation_timeout: Duration::from_millis(300),
+        max_replacements: 1,
+        escalation_percent: 125,
+    });
+
+    // Drive execute on a task: it will send, time out waiting for a mine,
+    // escalate, and resend at the same nonce.
+    let tx = TransactionRequest::default()
+        .with_from(from)
+        .with_to(to)
+        .with_value(U256::from(1u64));
+    let exec_handle = tokio::spawn(async move {
+        executor
+            .execute(SubmitTxToMempool {
+                tx,
+                gas_bid_info: None,
+            })
+            .await
+    });
+
+    // After the confirmation timeout has fired at least once (forcing the
+    // escalated replacement), mine a block; the replacement at the pinned nonce
+    // is what gets mined.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    provider.evm_mine(None).await.unwrap();
+
+    // execute resolves Ok once the replacement confirms.
+    exec_handle.await.unwrap().unwrap();
+
+    // Exactly one transaction from `from` mined at the pinned nonce.
+    assert_eq!(
+        provider.get_transaction_count(from).await.unwrap(),
+        1,
+        "exactly one tx (the replacement) should have mined at the pinned nonce"
     );
 }
 

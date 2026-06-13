@@ -1,4 +1,3 @@
-use std::ops::{Div, Mul};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +11,101 @@ use alloy::{
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// An EIP-1559 fee pair. Invariant: `max_priority_fee_per_gas <= max_fee_per_gas`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fees {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// A provider's EIP-1559 fee suggestion (the shape of
+/// `Provider::estimate_eip1559_fees`).
+#[derive(Debug, Clone, Copy)]
+pub struct FeeEstimate {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// Price a transaction's EIP-1559 fees. See the module/spec for the algorithm.
+fn price_1559(
+    est: FeeEstimate,
+    gas_usage: u64,
+    bump_percent: u64,
+    bid: Option<&GasBidInfo>,
+) -> anyhow::Result<Fees> {
+    let base_headroom = est
+        .max_fee_per_gas
+        .saturating_sub(est.max_priority_fee_per_gas);
+    let bumped_priority = est.max_priority_fee_per_gas * bump_percent as u128 / 100;
+
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match bid {
+        Some(bid) => {
+            if bid.bid_percentage > 100 {
+                return Err(anyhow::anyhow!(
+                    "bid_percentage {} exceeds 100: the gas bid would cost more \
+                     than the opportunity's total profit",
+                    bid.bid_percentage
+                ));
+            }
+            if gas_usage == 0 {
+                return Err(anyhow::anyhow!(
+                    "Gas estimation returned 0, cannot calculate bid price"
+                ));
+            }
+            let breakeven = bid.total_profit / gas_usage as u128;
+            let max_fee = breakeven * bid.bid_percentage as u128 / 100;
+            // Preserve the EIP-1559 invariant: priority can't exceed max_fee.
+            (max_fee, bumped_priority.min(max_fee))
+        }
+        None => (base_headroom + bumped_priority, bumped_priority),
+    };
+
+    Ok(Fees {
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    })
+}
+
+/// When and how to replace a transaction that has not confirmed.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplacementPolicy {
+    /// How long to wait for a mined transaction before replacing it.
+    pub confirmation_timeout: Duration,
+    /// How many escalated resubmissions after the original (0 = watch only).
+    pub max_replacements: u32,
+    /// Fee multiplier per replacement, as a percentage. Must be >= 110.
+    pub escalation_percent: u64,
+}
+
+/// Escalate both fee fields for a replacement transaction by
+/// `escalation_percent`. With `escalation_percent >= 110` (enforced at
+/// construction) both fields rise by at least the node's ~10% minimum bump,
+/// and the `priority <= max_fee` invariant is preserved.
+fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
+    let scale = |v: u128| {
+        // Multiply-then-divide keeps the result exact for the realistic fee
+        // range; if the intermediate product overflows, saturate to `u128::MAX`
+        // rather than wrapping or losing the `/100` precision on small fees.
+        match v.checked_mul(escalation_percent as u128) {
+            Some(product) => product / 100,
+            None => u128::MAX,
+        }
+    };
+    Fees {
+        max_fee_per_gas: scale(fees.max_fee_per_gas),
+        max_priority_fee_per_gas: scale(fees.max_priority_fee_per_gas),
+    }
+}
+
 /// An executor that sends transactions to the mempool.
 pub struct MempoolExecutor<M> {
     client: Arc<M>,
     /// Timeout for individual RPC calls.
     rpc_timeout: Duration,
+    /// Percentage applied to the provider's suggested priority fee (100 = as-is).
+    priority_fee_bump_percent: u64,
+    /// When set, watch for confirmation and replace a stuck transaction.
+    replacement: Option<ReplacementPolicy>,
 }
 
 impl<M: Provider> MempoolExecutor<M> {
@@ -25,12 +114,40 @@ impl<M: Provider> MempoolExecutor<M> {
         Self {
             client,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            priority_fee_bump_percent: 100,
+            replacement: None,
         }
     }
 
     /// Sets the timeout for individual RPC calls.
     pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
         self.rpc_timeout = timeout;
+        self
+    }
+
+    /// Scale the provider's suggested priority fee by `percent` (100 = as-is).
+    pub fn with_priority_fee_bump(mut self, percent: u64) -> Self {
+        self.priority_fee_bump_percent = percent;
+        self
+    }
+
+    /// Watch each submission for confirmation and replace it at an escalated
+    /// fee if it stays unmined. Requires `tx.from` to be set on each action so
+    /// the nonce can be pinned across replacements. Use this *or* the
+    /// [`retry`](crate::executor_ext::ExecutorExt::retry) wrapper, not both:
+    /// `retry` resubmits on a send error, replacement resubmits a sent-but-
+    /// unmined transaction.
+    ///
+    /// Panics if `policy.escalation_percent < 110` — a node rejects a
+    /// replacement that does not raise both fee fields by ~10%.
+    pub fn with_replacement(mut self, policy: ReplacementPolicy) -> Self {
+        assert!(
+            policy.escalation_percent >= 110,
+            "escalation_percent must be >= 110 to clear the node's minimum \
+             replacement bump; got {}",
+            policy.escalation_percent
+        );
+        self.replacement = Some(policy);
         self
     }
 }
@@ -63,13 +180,13 @@ where
         // Refuse an over-100% bid before spending any RPC on it: it would
         // price gas above the opportunity's total profit, making the
         // transaction itself the loss.
-        if let Some(gas_bid_info) = &action.gas_bid_info
-            && gas_bid_info.bid_percentage > 100
+        if let Some(bid) = &action.gas_bid_info
+            && bid.bid_percentage > 100
         {
             return Err(anyhow::anyhow!(
                 "bid_percentage {} exceeds 100: the gas bid would cost more \
                  than the opportunity's total profit",
-                gas_bid_info.bid_percentage
+                bid.bid_percentage
             ));
         }
 
@@ -81,35 +198,227 @@ where
         .context("Timeout estimating gas usage")?
         .context("Error estimating gas usage")?;
 
-        let bid_gas_price;
-        if let Some(gas_bid_info) = action.gas_bid_info {
-            if gas_usage == 0 {
-                return Err(anyhow::anyhow!(
-                    "Gas estimation returned 0, cannot calculate bid price"
-                ));
+        let estimate = {
+            let est = tokio::time::timeout(self.rpc_timeout, self.client.estimate_eip1559_fees())
+                .await
+                .context("Timeout estimating EIP-1559 fees")?
+                .context("Error estimating EIP-1559 fees")?;
+            FeeEstimate {
+                max_fee_per_gas: est.max_fee_per_gas,
+                max_priority_fee_per_gas: est.max_priority_fee_per_gas,
             }
-            // gas price at which we'd break even, meaning 100% of profit goes to validator
-            let breakeven_gas_price = gas_bid_info.total_profit / gas_usage as u128;
-            // gas price corresponding to bid percentage
-            bid_gas_price = breakeven_gas_price
-                .mul(gas_bid_info.bid_percentage as u128)
-                .div(100);
-        } else {
-            bid_gas_price = tokio::time::timeout(self.rpc_timeout, self.client.get_gas_price())
-                .await
-                .context("Timeout getting gas price")?
-                .context("Error getting gas price")?;
-        }
-        // The estimate priced the bid; set it as the limit too, so the
-        // provider's filler doesn't estimate a second time (an extra RPC per
-        // action, and a limit that could diverge from the one priced).
+        };
+
+        let mut fees = price_1559(
+            estimate,
+            gas_usage,
+            self.priority_fee_bump_percent,
+            action.gas_bid_info.as_ref(),
+        )?;
+
+        // The estimate priced the bid; set the gas limit too, so the provider's
+        // filler doesn't estimate a second time (an extra RPC per action, and a
+        // limit that could diverge from the one priced).
         action.tx.set_gas_limit(gas_usage);
-        action.tx.set_gas_price(bid_gas_price);
-        let _pending_tx =
-            tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))
-                .await
-                .context("Timeout sending transaction")?
-                .context("Error sending transaction")?;
-        Ok(())
+        action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
+        action
+            .tx
+            .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+
+        let Some(policy) = self.replacement else {
+            // Fire-and-forget: today's behaviour, 1559-priced.
+            let _pending_tx =
+                tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))
+                    .await
+                    .context("Timeout sending transaction")?
+                    .context("Error sending transaction")?;
+            return Ok(());
+        };
+
+        // Replacement path: pin the nonce so each resend replaces the prior.
+        let from = action
+            .tx
+            .from
+            .context("replacement requires `tx.from` to pin the nonce")?;
+        let nonce = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.get_transaction_count(from).pending(),
+        )
+        .await
+        .context("Timeout fetching nonce")?
+        .context("Error fetching nonce")?;
+        action.tx.set_nonce(nonce);
+
+        let mut pending = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.send_transaction(action.tx.clone()),
+        )
+        .await
+        .context("Timeout sending transaction")?
+        .context("Error sending transaction")?;
+
+        for replacement in 0..=policy.max_replacements {
+            // Await confirmation up to the timeout. `watch` consumes the
+            // builder (alloy 1.0 `PendingTransactionBuilder` is not `Clone`),
+            // so on timeout we resend to obtain a fresh one — the loop logic is
+            // otherwise the plan's.
+            let confirmed = pending
+                .with_timeout(Some(policy.confirmation_timeout))
+                .watch()
+                .await;
+
+            match confirmed {
+                Ok(_hash) => return Ok(()),
+                Err(_) if replacement == policy.max_replacements => {
+                    return Err(anyhow::anyhow!(
+                        "transaction unconfirmed after {} replacement(s)",
+                        policy.max_replacements
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        replacement,
+                        "transaction unconfirmed ({e:#}); replacing at escalated fee"
+                    );
+                    fees = escalate(fees, policy.escalation_percent);
+                    action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
+                    action
+                        .tx
+                        .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+                    pending = tokio::time::timeout(
+                        self.rpc_timeout,
+                        self.client.send_transaction(action.tx.clone()),
+                    )
+                    .await
+                    .context("Timeout sending replacement")?
+                    .context("Error sending replacement")?;
+                }
+            }
+        }
+        unreachable!("loop returns on the final iteration")
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn est(max_fee: u128, priority: u128) -> FeeEstimate {
+        FeeEstimate {
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority,
+        }
+    }
+
+    #[test]
+    fn no_bid_rides_priority_on_base_headroom() {
+        // headroom = 100 - 10 = 90; bump 100% leaves priority = 10.
+        let fees = price_1559(est(100, 10), 21_000, 100, None).unwrap();
+        assert_eq!(fees.max_priority_fee_per_gas, 10);
+        assert_eq!(fees.max_fee_per_gas, 90 + 10);
+    }
+
+    #[test]
+    fn no_bid_applies_the_priority_bump() {
+        // bump 150% on priority 10 -> 15; headroom 90 unchanged.
+        let fees = price_1559(est(100, 10), 21_000, 150, None).unwrap();
+        assert_eq!(fees.max_priority_fee_per_gas, 15);
+        assert_eq!(fees.max_fee_per_gas, 90 + 15);
+    }
+
+    #[test]
+    fn bid_caps_max_fee_at_the_breakeven_share() {
+        // total_profit 2_100_000, gas 21_000 -> breakeven 100/gas unit;
+        // bid 50% -> max_fee 50.
+        let bid = GasBidInfo {
+            total_profit: 2_100_000,
+            bid_percentage: 50,
+        };
+        let fees = price_1559(est(1_000, 10), 21_000, 100, Some(&bid)).unwrap();
+        assert_eq!(fees.max_fee_per_gas, 50);
+        // priority (bumped 10) fits under the cap.
+        assert_eq!(fees.max_priority_fee_per_gas, 10);
+    }
+
+    #[test]
+    fn a_low_bid_cap_clamps_priority_to_max_fee() {
+        // breakeven 100/unit, bid 5% -> max_fee 5; priority would be 10, clamps to 5.
+        let bid = GasBidInfo {
+            total_profit: 2_100_000,
+            bid_percentage: 5,
+        };
+        let fees = price_1559(est(1_000, 10), 21_000, 100, Some(&bid)).unwrap();
+        assert_eq!(fees.max_fee_per_gas, 5);
+        assert_eq!(fees.max_priority_fee_per_gas, 5);
+        assert!(fees.max_priority_fee_per_gas <= fees.max_fee_per_gas);
+    }
+
+    #[test]
+    fn over_100_percent_bid_is_rejected() {
+        let bid = GasBidInfo {
+            total_profit: 100,
+            bid_percentage: 101,
+        };
+        assert!(price_1559(est(100, 10), 21_000, 100, Some(&bid)).is_err());
+    }
+
+    #[test]
+    fn zero_gas_with_a_bid_is_rejected() {
+        let bid = GasBidInfo {
+            total_profit: 100,
+            bid_percentage: 50,
+        };
+        assert!(price_1559(est(100, 10), 0, 100, Some(&bid)).is_err());
+    }
+
+    #[test]
+    fn a_malformed_estimate_yields_zero_headroom_without_panic() {
+        // priority > max_fee: saturating headroom = 0; priority bump = 100.
+        // max_fee = headroom (0) + bumped priority (100) = 100.
+        let fees = price_1559(est(10, 100), 21_000, 100, None).unwrap();
+        assert_eq!(fees.max_fee_per_gas, 100);
+        assert_eq!(fees.max_priority_fee_per_gas, 100);
+    }
+
+    #[test]
+    fn escalate_raises_both_fields_by_the_percentage() {
+        let fees = Fees {
+            max_fee_per_gas: 200,
+            max_priority_fee_per_gas: 20,
+        };
+        let bumped = escalate(fees, 125);
+        assert_eq!(bumped.max_fee_per_gas, 250);
+        assert_eq!(bumped.max_priority_fee_per_gas, 25);
+    }
+
+    #[test]
+    fn escalate_at_the_minimum_raises_at_least_ten_percent() {
+        let fees = Fees {
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+        };
+        let bumped = escalate(fees, 110);
+        assert!(bumped.max_fee_per_gas >= 110);
+        assert!(bumped.max_priority_fee_per_gas >= 11);
+    }
+
+    #[test]
+    fn escalate_preserves_the_invariant() {
+        let fees = Fees {
+            max_fee_per_gas: 200,
+            max_priority_fee_per_gas: 200,
+        };
+        let bumped = escalate(fees, 130);
+        assert!(bumped.max_priority_fee_per_gas <= bumped.max_fee_per_gas);
+    }
+
+    #[test]
+    fn escalate_saturates_on_huge_fees() {
+        let fees = Fees {
+            max_fee_per_gas: u128::MAX,
+            max_priority_fee_per_gas: u128::MAX,
+        };
+        let bumped = escalate(fees, 200);
+        assert_eq!(bumped.max_fee_per_gas, u128::MAX);
     }
 }

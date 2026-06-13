@@ -66,9 +66,10 @@ impl Strategy<NewBlock, SubmitTxToMempool> for TransferStrategy {
         let tx = TransactionRequest::default()
             .with_to(self.to)
             .with_value(U256::from(TRANSFER_WEI));
-        // `gas_bid_info: None` bids the current network gas price. For an MEV
-        // opportunity with a known profit, `Some(GasBidInfo { total_profit,
-        // bid_percentage })` spends that share of the profit on gas instead.
+        // `gas_bid_info: None` prices the transaction from the provider's
+        // EIP-1559 fee estimate. For an MEV opportunity with a known profit,
+        // `Some(GasBidInfo { total_profit, bid_percentage })` caps
+        // `max_fee_per_gas` at that share of the profit instead.
         let action = SubmitTxToMempool {
             tx,
             gas_bid_info: None,
