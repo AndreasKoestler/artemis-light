@@ -77,6 +77,18 @@ _Avoid_: action filter, sanity check
 A Strategy wrapper that suppresses a strategy's actions for a period after it fires. A cooling strategy still sees every event — only its actions are dropped — so its internal state stays current; an actionless event does not start the cooldown, and a multi-action batch passes whole before the cooldown engages.
 _Avoid_: debounce, rate limit (that is the Executor-side wrapper)
 
+**Execution Outcome**:
+The verdict the Executor stack reached for one action — the action plus `Ok(())` or `Err(message)` — fed back into the pipeline as an event. `Ok` means the stack *accepted* the action (submitted, or deliberately dropped by a **Gated**/**Deadline** layer), not that the transaction landed on chain. The error is stringified because it rides a broadcast channel.
+_Avoid_: receipt, confirmation, result
+
+**Report**:
+The transparent Executor wrapper that publishes an **Execution Outcome** per action and then returns the inner executor's verdict unchanged, so it never alters control flow and composes anywhere in the reliability stack. Outermost, it reports the stack's final post-retry/post-fallback verdict.
+_Avoid_: callback, hook, notify
+
+**Channel Collector**:
+A Collector over an in-process broadcast channel: it holds the Sender and mints a fresh receiver on every subscribe, so it survives the Collector Driver's re-subscription where a single receiver could not. The seam through which an **Execution Outcome** — or any in-process source — re-enters the pipeline as events.
+_Avoid_: feedback channel, back-channel
+
 **Persisted Collector**:
 A Collector wrapper that records every event it sees into a Store and, on subscribe, delivers three **Segments** in fixed order: **Replay**, then **Backfill**, then the **Live Tail**.
 _Avoid_: indexer, archiver, recorder
@@ -112,6 +124,7 @@ _Avoid_: live stream, subscription
 - The reliability wrappers (**Deadline**, **Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them; `deadline` belongs innermost, so every queueing and waiting layer above it has already elapsed by the time the expiry check runs.
 - A **Risk Gate** and a **Cooldown** wrap one **Strategy**; the Cooldown counts only actions that survive the layers inside it as firing.
 - Every built-in **Collector**'s subscribe carries a **Polling Fallback**; a failed poll feeds the **Reconnect Policy**'s counter like any subscribe failure.
+- A **Report** and a **Channel Collector** sharing one broadcast channel close the execution-feedback loop *without* a back-channel in the **Engine**: the Report publishes each verdict, the Channel Collector re-enters it through the normal Collector → Strategy path, and a Strategy reacts. The one-way topology is preserved — the loop is explicit caller wiring, not a hidden feedback edge.
 
 ## Example dialogue
 
