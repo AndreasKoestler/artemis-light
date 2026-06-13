@@ -71,3 +71,7 @@ path = "examples/persistence_example.rs"
 [[example]]
 name = "onchain_example"
 path = "examples/onchain_example.rs"
+
+[[example]]
+name = "feedback_example"
+path = "examples/feedback_example.rs"
