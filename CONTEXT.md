@@ -65,6 +65,10 @@ _Avoid_: fuse, trip switch
 An Executor wrapper guarded by a kill switch the caller keeps (an `AtomicBool`): flag on, actions execute; flag off, actions are logged and dropped with `Ok`. Flipping the flag at runtime is the emergency stop. **Dry Run** is a Gated whose flag is permanently off — paper-trading mode.
 _Avoid_: toggle, feature flag
 
+**Deadline**:
+An Executor wrapper that drops actions whose freshness window has passed instead of submitting them. The deadline travels with the action (the `Expires` trait), stamped by the Strategy that priced it; the check runs at every execute, so inside a **Retry** each attempt re-checks and an action that expires mid-backoff stops the loop. An expired drop is `Ok` — invisible to **Retry** and **Circuit Breaker** — because expiry is normal operation, not a fault.
+_Avoid_: TTL, expiry, timeout (the MempoolExecutor's `rpc_timeout` is a different thing)
+
 **Risk Gate**:
 A Strategy wrapper (`filter_actions`) that drops every action failing a predicate — minimum profit, maximum notional, allowlisted targets. As a combinator, the risk policy is visible at composition time rather than buried inside strategy logic.
 _Avoid_: action filter, sanity check
@@ -105,7 +109,7 @@ _Avoid_: live stream, subscription
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
-- The reliability wrappers (**Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them.
+- The reliability wrappers (**Deadline**, **Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them; `deadline` belongs innermost, so every queueing and waiting layer above it has already elapsed by the time the expiry check runs.
 - A **Risk Gate** and a **Cooldown** wrap one **Strategy**; the Cooldown counts only actions that survive the layers inside it as firing.
 - Every built-in **Collector**'s subscribe carries a **Polling Fallback**; a failed poll feeds the **Reconnect Policy**'s counter like any subscribe failure.
 

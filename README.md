@@ -82,6 +82,23 @@ let collector = mempool_collector.filter_map(|tx| {
 let collector = block_collector.merge(mempool_collector);
 ```
 
+Executors compose the same way. Actions that implement `Expires` carry the
+freshness window their strategy priced them against; the `deadline` wrapper
+drops expired actions with `Ok`, so expiry neither trips the circuit breaker
+nor keeps a retry loop alive:
+
+```rust
+// Reliability-wrap an executor: innermost deadline drops stale actions
+// (each retry attempt re-checks expiry; every wait above it has elapsed
+// by the time the check runs)
+let executor = mempool_executor
+    .deadline()
+    .retry(RetryPolicy::default())
+    .rate_limit(5)
+    .circuit_breaker(3)
+    .gated(kill_switch);
+```
+
 ## Observers
 
 An **Observer** is one more subscriber on the engine's event and action

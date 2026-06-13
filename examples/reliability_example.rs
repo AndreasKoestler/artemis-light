@@ -1,8 +1,9 @@
 //! The reliability layer for executors and the risk guards for strategies:
-//! `ExecutorExt::retry`, `fallback`, `rate_limit`, `circuit_breaker`, and
-//! `gated`/`dry_run` wrap a submission sink the way `reconnect` guards a
-//! collector; `StrategyExt::filter_actions` and `cooldown` keep the risk
-//! policy visible at composition time. No external node required.
+//! `ExecutorExt::retry`, `fallback`, `rate_limit`, `circuit_breaker`,
+//! `deadline`, and `gated`/`dry_run` wrap a submission sink the way
+//! `reconnect` guards a collector; `StrategyExt::filter_actions` and
+//! `cooldown` keep the risk policy visible at composition time. No external
+//! node required.
 //!
 //! Run with:
 //! ```sh
@@ -17,7 +18,7 @@ use std::time::Duration;
 use anyhow::Result;
 use artemis_light::{
     engine::Engine,
-    executor_ext::{ExecutorExt, RetryPolicy},
+    executor_ext::{ExecutorExt, Expires, RetryPolicy},
     strategy_ext::StrategyExt,
     types::{ActionStream, Collector, CollectorStream, Executor, Strategy},
 };
@@ -166,6 +167,30 @@ impl Executor<Trade> for PrintingRpc {
     }
 }
 
+/// A trade stamped with the freshness window it was priced against.
+#[derive(Clone, Debug)]
+struct DatedTrade {
+    id: u64,
+    expires_at: Instant,
+}
+
+impl Expires for DatedTrade {
+    fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+}
+
+/// A sink that prints what it submits, for the deadline scene.
+struct DatedRpc;
+
+#[async_trait]
+impl Executor<DatedTrade> for DatedRpc {
+    async fn execute(&mut self, trade: DatedTrade) -> Result<()> {
+        println!("[dated]    submitted trade {}", trade.id);
+        Ok(())
+    }
+}
+
 fn trade(id: u64) -> Trade {
     Trade { id, profit_bps: 10 }
 }
@@ -250,6 +275,28 @@ async fn main() -> Result<()> {
         "4 submissions through rate_limit(2) took {:?} — the cap waits, it never drops",
         start.elapsed()
     );
+
+    // ── Scene 5: the deadline drops stale actions ──────────────────────────
+    // The strategy stamps the freshness window when it prices the trade; the
+    // wrapper checks it at submission. Trade 401's window has already passed
+    // (the check is `now >= expires_at`), so it is dropped — logged, Ok —
+    // exactly like a gated-off action.
+    println!("\n── deadline ──\n");
+    let mut dated = DatedRpc.deadline();
+    let now = Instant::now();
+    dated
+        .execute(DatedTrade {
+            id: 400,
+            expires_at: now + Duration::from_secs(1),
+        })
+        .await?;
+    dated
+        .execute(DatedTrade {
+            id: 401,
+            expires_at: now,
+        })
+        .await?;
+    println!("trade 401 expired before submission: dropped (logged, Ok)");
 
     println!("\nDone!");
     Ok(())

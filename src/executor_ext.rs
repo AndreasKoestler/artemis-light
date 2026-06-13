@@ -1,6 +1,7 @@
 use crate::types::Executor;
 
 mod circuit_breaker;
+mod deadline;
 mod fallback;
 mod filter_map_action;
 mod gated;
@@ -8,6 +9,7 @@ mod rate_limit;
 mod retry;
 
 pub use circuit_breaker::*;
+pub use deadline::*;
 pub use fallback::*;
 pub use filter_map_action::*;
 pub use gated::*;
@@ -79,6 +81,22 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
         self.gated(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )))
+    }
+
+    /// Drop actions whose deadline has passed instead of submitting them:
+    /// the deadline travels with each action via [`Expires`], stamped by the
+    /// strategy that priced it. Place it innermost in the reliability stack —
+    /// the check runs at every `execute`, so every queueing or waiting layer
+    /// outside has already elapsed, and each [`retry`](ExecutorExt::retry)
+    /// attempt re-checks. An expired action is logged and dropped with
+    /// `Ok(())`: invisible to `retry` and
+    /// [`circuit_breaker`](ExecutorExt::circuit_breaker), because expiry is
+    /// normal operation, not a fault.
+    fn deadline(self) -> Deadline<A>
+    where
+        A: Expires,
+    {
+        Deadline::new(Box::new(self))
     }
 }
 
