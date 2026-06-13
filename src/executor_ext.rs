@@ -6,6 +6,7 @@ mod fallback;
 mod filter_map_action;
 mod gated;
 mod rate_limit;
+mod report;
 mod retry;
 
 pub use circuit_breaker::*;
@@ -14,6 +15,7 @@ pub use fallback::*;
 pub use filter_map_action::*;
 pub use gated::*;
 pub use rate_limit::*;
+pub use report::*;
 pub use retry::*;
 
 /// Extension trait that provides adapter combinators for types implementing
@@ -97,6 +99,20 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
         A: Expires,
     {
         Deadline::new(Box::new(self))
+    }
+
+    /// Publish each action's verdict to `outcomes` after submitting it, then
+    /// return the inner executor's result unchanged. Transparent — it never
+    /// alters control flow — so it composes anywhere; place it outermost to
+    /// report the stack's final post-retry/post-fallback verdict. Pair it with
+    /// a [`ChannelCollector`](crate::collectors::ChannelCollector) over the
+    /// same channel to feed verdicts back to strategies as events. Reporting
+    /// is best-effort: a dropped receiver is logged and ignored.
+    fn report(self, outcomes: tokio::sync::broadcast::Sender<ExecutionOutcome<A>>) -> Report<A>
+    where
+        A: Clone,
+    {
+        Report::new(Box::new(self), outcomes)
     }
 }
 
