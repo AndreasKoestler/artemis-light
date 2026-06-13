@@ -182,4 +182,50 @@ mod test {
         assert_eq!(err.to_string(), "submission failed");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_action_expiring_mid_backoff_stops_the_retry_loop() {
+        use crate::executor_ext::RetryPolicy;
+
+        let (executor, attempts) = failing();
+        let mut stack = executor.deadline().retry(RetryPolicy {
+            max_retries: 3,
+            base_delay: Duration::from_secs(1),
+        });
+        let action = TimedAction {
+            id: 7,
+            expires_at: Instant::now() + Duration::from_millis(1500),
+        };
+
+        stack
+            .execute(action)
+            .await
+            .expect("expiry mid-backoff resolves Ok, not exhausted-retries Err");
+
+        // Attempts at t=0 and t=1s are live and fail; the t=3s attempt finds
+        // the action expired, returns Ok, and the retry loop stops — the
+        // inner executor never sees a third attempt.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_drop_does_not_count_against_the_circuit_breaker() {
+        let (executor, attempts) = failing();
+        let breaker = executor.deadline().circuit_breaker(1);
+        let operator = breaker.handle();
+        let mut breaker = breaker;
+
+        breaker.execute(expired(1)).await.unwrap();
+        breaker.execute(expired(2)).await.unwrap();
+
+        assert!(
+            !operator.is_open(),
+            "expired drops are Ok and must not trip the breaker"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "expired actions never reach the failing inner executor"
+        );
+    }
 }
