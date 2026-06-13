@@ -5,6 +5,9 @@
 /// This collector listens to a stream of new blocks.
 mod block_collector;
 
+/// This collector turns an in-process broadcast channel into events.
+mod channel_collector;
+
 /// This collector listens to a stream of new event logs.
 mod log_collector;
 
@@ -18,6 +21,7 @@ mod event_collector;
 mod fallback;
 
 pub use block_collector::*;
+pub use channel_collector::*;
 pub use event_collector::*;
 pub use log_collector::*;
 pub use mempool_collector::*;
