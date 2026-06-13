@@ -59,9 +59,16 @@ The **Engine** fans-out every event to every strategy via a `tokio::sync::broadc
 | | `LogCollector` | Subscribes to on-chain event logs matching a filter |
 | | `EventCollector` | Subscribes to an arbitrary `alloy` subscription |
 | **Strategy** | `Strategy<E, A>` | User-defined: receives events, produces action streams |
-| **Executor** | `MempoolExecutor` | Submits transactions to the public mempool |
+| **Executor** | `MempoolExecutor` | Submits EIP-1559-priced transactions to the public mempool; optionally watches for confirmation and replaces a stuck transaction at an escalated fee |
 | **Observer** | `Observer<E, A>` | Passive consumer of every event and action crossing the channels |
 | **Persistence** | `Persisted<C, S>` | Wraps a block-aware collector to record events to a SQL `Store` and replay them on restart |
+
+`MempoolExecutor` prices transactions with EIP-1559 fields from the provider's
+fee estimate (with a configurable `with_priority_fee_bump`). By default it is
+fire-and-forget; `with_replacement(policy)` makes it watch for confirmation and
+resubmit a stuck transaction at the same nonce with escalated fees. Use
+replacement *or* the `retry` wrapper, not both — `retry` resubmits on a send
+error, replacement resubmits a sent-but-unmined transaction.
 
 ## Combinators
 

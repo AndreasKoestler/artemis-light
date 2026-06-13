@@ -59,6 +59,18 @@ _Avoid_: failover, degraded mode
 An Executor wrapper that caps submissions per sliding one-second window, to respect provider limits. An over-cap action waits (backpressure on the action channel) — it is never dropped. Every attempt counts against the window, including failed ones: a failed submission still spent provider quota.
 _Avoid_: throttle, debounce
 
+**EIP-1559 Pricing**:
+The Executor prices `max_fee_per_gas` and `max_priority_fee_per_gas` from the provider's fee estimate, scaling the suggested priority fee by a configurable bump. With a `GasBidInfo`, the opportunity's break-even (`total_profit / gas_usage`) caps `max_fee_per_gas` rather than the legacy single gas price; the priority fee is clamped to stay at or below that cap.
+_Avoid_: gas price, legacy pricing
+
+**Replacement**:
+The opt-in loop that resubmits an unconfirmed transaction at the same nonce with escalated fees, up to `max_replacements`, after each **Confirmation Timeout**. Distinct from the Executor **Retry** wrapper: Retry resubmits on a *send* error; Replacement resubmits a *sent-but-unmined* transaction. Use one or the other, not both.
+_Avoid_: resend, speed-up, retry (that is the wrapper)
+
+**Confirmation Timeout**:
+How long the Executor waits for a transaction to mine before escalating its fees and replacing it. Distinct from the action-side **Deadline** (which drops stale actions before submission) and from `rpc_timeout` (which bounds a single RPC call).
+_Avoid_: deadline, rpc_timeout
+
 **Circuit Breaker**:
 An Executor wrapper that stops submitting after N consecutive failures: an open circuit fails fast without reaching the inner executor, until an operator resets it through its **Handle** (taken before the engine consumes the executor). For a bot that signs transactions, failing closed is a safety feature, not just resilience. A success closes the counter; only an explicit reset closes an open circuit.
 _Avoid_: fuse, trip switch

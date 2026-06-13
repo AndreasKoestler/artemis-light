@@ -320,12 +320,11 @@ async fn replacement_speeds_up_a_stuck_transaction() {
     // Turn off auto-mining so the first send stays pending.
     provider.anvil_set_auto_mine(false).await.unwrap();
 
-    let mut executor =
-        MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
-            confirmation_timeout: Duration::from_millis(300),
-            max_replacements: 1,
-            escalation_percent: 125,
-        });
+    let mut executor = MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
+        confirmation_timeout: Duration::from_millis(300),
+        max_replacements: 1,
+        escalation_percent: 125,
+    });
 
     // Drive execute on a task: it will send, time out waiting for a mine,
     // escalate, and resend at the same nonce.
