@@ -70,6 +70,39 @@ fn price_1559(
     })
 }
 
+/// When and how to replace a transaction that has not confirmed.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplacementPolicy {
+    /// How long to wait for a mined transaction before replacing it.
+    pub confirmation_timeout: Duration,
+    /// How many escalated resubmissions after the original (0 = watch only).
+    pub max_replacements: u32,
+    /// Fee multiplier per replacement, as a percentage. Must be >= 110.
+    pub escalation_percent: u64,
+}
+
+/// Escalate both fee fields for a replacement transaction by
+/// `escalation_percent`. With `escalation_percent >= 110` (enforced at
+/// construction) both fields rise by at least the node's ~10% minimum bump,
+/// and the `priority <= max_fee` invariant is preserved.
+// `allow(dead_code)`: wired into `execute` in a later step.
+#[allow(dead_code)]
+fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
+    let scale = |v: u128| {
+        // Multiply-then-divide keeps the result exact for the realistic fee
+        // range; if the intermediate product overflows, saturate to `u128::MAX`
+        // rather than wrapping or losing the `/100` precision on small fees.
+        match v.checked_mul(escalation_percent as u128) {
+            Some(product) => product / 100,
+            None => u128::MAX,
+        }
+    };
+    Fees {
+        max_fee_per_gas: scale(fees.max_fee_per_gas),
+        max_priority_fee_per_gas: scale(fees.max_priority_fee_per_gas),
+    }
+}
+
 /// An executor that sends transactions to the mempool.
 pub struct MempoolExecutor<M> {
     client: Arc<M>,
@@ -251,5 +284,47 @@ mod test {
         let fees = price_1559(est(10, 100), 21_000, 100, None).unwrap();
         assert_eq!(fees.max_fee_per_gas, 100);
         assert_eq!(fees.max_priority_fee_per_gas, 100);
+    }
+
+    #[test]
+    fn escalate_raises_both_fields_by_the_percentage() {
+        let fees = Fees {
+            max_fee_per_gas: 200,
+            max_priority_fee_per_gas: 20,
+        };
+        let bumped = escalate(fees, 125);
+        assert_eq!(bumped.max_fee_per_gas, 250);
+        assert_eq!(bumped.max_priority_fee_per_gas, 25);
+    }
+
+    #[test]
+    fn escalate_at_the_minimum_raises_at_least_ten_percent() {
+        let fees = Fees {
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+        };
+        let bumped = escalate(fees, 110);
+        assert!(bumped.max_fee_per_gas >= 110);
+        assert!(bumped.max_priority_fee_per_gas >= 11);
+    }
+
+    #[test]
+    fn escalate_preserves_the_invariant() {
+        let fees = Fees {
+            max_fee_per_gas: 200,
+            max_priority_fee_per_gas: 200,
+        };
+        let bumped = escalate(fees, 130);
+        assert!(bumped.max_priority_fee_per_gas <= bumped.max_fee_per_gas);
+    }
+
+    #[test]
+    fn escalate_saturates_on_huge_fees() {
+        let fees = Fees {
+            max_fee_per_gas: u128::MAX,
+            max_priority_fee_per_gas: u128::MAX,
+        };
+        let bumped = escalate(fees, 200);
+        assert_eq!(bumped.max_fee_per_gas, u128::MAX);
     }
 }
