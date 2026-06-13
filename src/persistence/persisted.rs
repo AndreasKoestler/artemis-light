@@ -922,4 +922,77 @@ mod tests {
         assert_eq!(store.written(), vec![1, 2]);
         assert_eq!(w.buffered_blocks(), vec![3], "block 3 stays open");
     }
+
+    /// A shallow reorg — a block re-emitted while still inside the unflushed
+    /// window — must be corrected in the buffer: the old fork's higher blocks
+    /// are dropped, `head` rewinds, and only the canonical row is ever written.
+    /// This is the whole point of the lag, so it must hold before any flush.
+    #[tokio::test]
+    async fn in_window_reorg_replaces_buffered_rows_before_flush() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        // Original fork: blocks 5 and 6 buffered (neither matured yet at depth 2).
+        w.record(5, &ping(50)).await;
+        w.record(6, &ping(60)).await;
+        assert_eq!(store.written(), Vec::<u64>::new());
+
+        // Reorg: block 5 re-emitted. Block 6's buffered rows are dropped; head
+        // rewinds to 5.
+        w.record(5, &ping(51)).await;
+        assert_eq!(
+            w.buffered_blocks(),
+            vec![5],
+            "the old fork's block 6 is gone"
+        );
+
+        // Re-advance: the canonical 6, then 7 matures block 5.
+        w.record(6, &ping(61)).await;
+        w.record(7, &ping(70)).await; // head 7: block 5 matures (5+2<=7)
+        assert_eq!(
+            store.written(),
+            vec![5],
+            "block 5 written once, after correction"
+        );
+    }
+
+    /// A reorg deeper than the confirmation depth re-emits an already-flushed
+    /// block. That row is finalized — undoing it would need a delete the writer
+    /// doesn't do — so persistence halts rather than writing the orphaned and
+    /// canonical versions over each other. The stored height stays put for a
+    /// restart to re-sync from.
+    #[tokio::test]
+    async fn deep_reorg_past_the_watermark_halts() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 1);
+
+        w.record(5, &ping(1)).await;
+        w.record(6, &ping(2)).await; // block 5 flushes (watermark = 5)
+        assert_eq!(store.written(), vec![5]);
+
+        // Block 5 re-emitted after being finalized: deeper than depth -> halt.
+        w.record(5, &ping(3)).await;
+        // No further writes; later events are ignored.
+        w.record(7, &ping(4)).await;
+        assert_eq!(
+            store.written(),
+            vec![5],
+            "nothing written after a deep reorg"
+        );
+    }
+
+    /// As with [`BlockWriter`], an unencodable event halts the windowed writer
+    /// rather than being skipped: progress must not advance past a block whose
+    /// row was never written, or a restart's replay exposes the hole.
+    #[tokio::test]
+    async fn windowed_writer_halts_on_unencodable_event() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, BadPing>(&store, 2);
+
+        w.record(1, &bad_ping(1)).await;
+        w.record(2, &bad_ping(0)).await; // unencodable -> halt
+        w.record(3, &bad_ping(3)).await;
+        w.record(4, &bad_ping(4)).await; // would otherwise mature block 1/2
+        assert_eq!(store.written(), Vec::<u64>::new());
+    }
 }
