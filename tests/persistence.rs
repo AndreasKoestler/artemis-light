@@ -962,6 +962,55 @@ async fn persisted_halts_on_write_failure_to_avoid_gaps() {
     assert_eq!(stored_values(&inner).await, vec!["0x1".to_string()]);
 }
 
+/// At confirmation depth 2, a block re-emitted before it matures (a shallow
+/// reorg) is corrected in the buffer: the store ends with the canonical row,
+/// never the orphaned one.
+#[tokio::test]
+async fn confirmation_depth_corrects_a_shallow_reorg() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    // Live: block 10 (value 1), block 11 (value 2), then block 10 re-emitted
+    // (value 3 — the reorg) and block 11 re-emitted (value 4), then 12 and 13
+    // advance so the corrected 10 and 11 mature at depth 2 (head reaches
+    // 10+2=12 and 11+2=13). Blocks 12 and 13 stay buffered.
+    let collector = FakeCollector::default()
+        .live(vec![(10, 1), (11, 2), (10, 3), (11, 4), (12, 5), (13, 6)])
+        .tip(9); // live filter is > tip, so all of the above pass
+
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_confirmation_depth(2);
+
+    let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Block 10 matures once head reaches 12 (10+2), block 11 once head reaches
+    // 13. Their stored values are the corrected 3 and 4, not the orphaned 1
+    // and 2; the orphaned fork's rows were dropped before any write.
+    assert_eq!(store.last_block("value_set").await.unwrap(), Some(11));
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x3".to_string(), "0x4".to_string()],
+        "the store holds the corrected chain, never the orphaned rows"
+    );
+}
+
+/// The default (no confirmation-depth override) is depth 1: a block flushes
+/// when the next block arrives, and the open block stays unflushed.
+#[tokio::test]
+async fn default_confirmation_depth_is_one() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    let collector = FakeCollector::default().live(vec![(10, 1), (10, 2), (11, 3)]);
+    let persisted = collector.with_persistence(store.clone());
+
+    let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    assert_eq!(store.last_block("value_set").await.unwrap(), Some(10));
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x1".to_string(), "0x2".to_string()]
+    );
+}
+
 /// The backfill and live segments must be disjoint at the tip: an event that
 /// appears in both (because a live subscription re-delivers blocks `<= tip`)
 /// is emitted once downstream and stored once.

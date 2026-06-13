@@ -1,6 +1,7 @@
 //! [`Persisted`]: a [`Collector`] wrapper that records every event it sees and,
 //! on subscribe, replays stored history before following the chain tip.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -65,6 +66,13 @@ pub struct Persisted<C, S> {
     /// Upper bound on blocks per backfill `query_range` call; the gap is
     /// sliced into windows of this size, queried one at a time.
     backfill_chunk_size: u64,
+    /// How many blocks deep a block must be buried before the live tail writes
+    /// it (default 1). The most recent `confirmation_depth` blocks are buffered
+    /// unwritten so an in-window reorg can be corrected before any orphaned row
+    /// reaches the store; see [`with_confirmation_depth`].
+    ///
+    /// [`with_confirmation_depth`]: Persisted::with_confirmation_depth
+    confirmation_depth: u64,
     /// Whether stored history has already been replayed to a subscriber. The
     /// engine re-subscribes after a stream ends, and replaying the full archive
     /// on every reconnect would re-deliver the entire history to strategies —
@@ -82,6 +90,7 @@ impl<C, S> Persisted<C, S> {
             schema: None,
             start_block: 0,
             backfill_chunk_size: DEFAULT_BACKFILL_CHUNK_SIZE,
+            confirmation_depth: 1,
             replayed: AtomicBool::new(false),
         }
     }
@@ -124,6 +133,21 @@ impl<C, S> Persisted<C, S> {
     pub fn with_backfill_chunk_size(mut self, blocks: u64) -> Self {
         assert!(blocks >= 1, "backfill chunk size must be at least 1 block");
         self.backfill_chunk_size = blocks;
+        self
+    }
+
+    /// Persist a block only once it is `depth` blocks deep (default 1). Events
+    /// are still delivered downstream live and immediately; only the Store
+    /// write lags. A reorg shallower than `depth` is corrected in the buffer
+    /// before any orphaned row is written; a reorg deeper than `depth` halts
+    /// persistence (a restart re-syncs). Choose `depth` above the deepest reorg
+    /// you expect.
+    ///
+    /// # Panics
+    /// Panics if `depth` is zero.
+    pub fn with_confirmation_depth(mut self, depth: u64) -> Self {
+        assert!(depth >= 1, "confirmation depth must be at least 1 block");
+        self.confirmation_depth = depth;
         self
     }
 }
@@ -237,10 +261,14 @@ where
         // 3. Live tail, strictly above the backfill cut so the two segments are
         //    disjoint. A live subscription streams from "now", whose lower edge
         //    is fuzzy around the head (it may re-deliver blocks `<= tip`), so we
-        //    enforce the `> tip` boundary rather than assume it. Live events end
-        //    an "open" block only when a higher block arrives, so the final
-        //    in-progress block is left unflushed (`flush_final = false`) and
-        //    re-fetched on restart.
+        //    enforce the `> tip` boundary rather than assume it. The live tail
+        //    persists through a `ConfirmationWindow` instead of `BlockWriter`:
+        //    a block is written only once it is `confirmation_depth` blocks deep
+        //    (default 1, which reproduces the single-block "flush on the next
+        //    block, leave the open block unflushed" behaviour exactly), so the
+        //    most recent depth blocks stay buffered and a reorg shallower than
+        //    the depth is corrected before any orphaned row is written. The
+        //    buffered window is left for a restart's backfill to re-fetch.
         //
         //    The disjoint split assumes the backfill query reliably covers block
         //    `tip`. If an RPC node's `eth_getLogs` lags behind its reported tip,
@@ -264,7 +292,8 @@ where
                 })
                 .take_until(poison.cancelled_owned()),
         ) as CollectorStream<'_, (u64, E)>;
-        let live = persist_and_emit(live_source, &self.store, record, false);
+        let live =
+            persist_and_emit_windowed(live_source, &self.store, record, self.confirmation_depth);
 
         Ok(Segments {
             replay,
@@ -399,6 +428,33 @@ where
     Box::pin(stream)
 }
 
+/// Like [`persist_and_emit`], but persists with a [`ConfirmationWindow`]: a
+/// block is written only once it is `depth` confirmations deep, and an
+/// in-window reorg is corrected before any orphaned row is written. There is no
+/// `flush_final` — the live tail never ends, and the unflushed window is
+/// intentionally left for a restart's backfill to re-fetch (the whole window,
+/// not just a single open block).
+fn persist_and_emit_windowed<'a, E, S>(
+    mut source: CollectorStream<'a, (u64, E)>,
+    store: &'a S,
+    record: Arc<Record<E>>,
+    depth: u64,
+) -> CollectorStream<'a, E>
+where
+    E: Serialize + Send + Sync + 'static,
+    S: Store + 'a,
+{
+    let stream = async_stream::stream! {
+        let mut writer = ConfirmationWindow::new(store, record, depth);
+        while let Some((block, event)) = source.next().await {
+            writer.record(block, &event).await;
+            yield event;
+        }
+    };
+
+    Box::pin(stream)
+}
+
 /// Buffers one block's rows at a time and writes each complete block to the
 /// store in a single transaction. A block is complete once a higher block
 /// number is observed; the trailing block is written only by [`finish`].
@@ -506,6 +562,143 @@ impl<'a, S: Store, E: Serialize> BlockWriter<'a, S, E> {
     }
 }
 
+/// Buffers the most recent `depth` blocks of a live tail and writes a block
+/// only once it is buried `depth` blocks deep (`head >= block + depth`). Unlike
+/// [`BlockWriter`], a backwards block within the unflushed window is treated as
+/// a reorg re-emission and corrected in place rather than halting: the node has
+/// rewound to a forked block whose row was never written, so dropping the old
+/// fork's buffered blocks and rewinding `head` lets the canonical chain re-fill
+/// the window. Only a write at or below the already-flushed watermark (a reorg
+/// *deeper* than `depth`, which would need a delete to undo) or an unencodable
+/// event halts.
+///
+/// The unflushed window is deliberately never drained at stream end: there is
+/// no "stream end" on a live tail, and on a restart the Backfill segment
+/// re-fetches the whole window (`[last+1 ..= tip]`) from the canonical chain.
+struct ConfirmationWindow<'a, S, E> {
+    store: &'a S,
+    record: Arc<Record<E>>,
+    /// Blocks buried this many deep are mature and get written.
+    depth: u64,
+    /// Buffered rows keyed by block number, lowest first — the order they must
+    /// be flushed in to keep the stored height a gap-free prefix.
+    pending: BTreeMap<u64, Vec<Row>>,
+    /// Highest block number seen so far; maturity is measured against it.
+    head: Option<u64>,
+    /// Highest block already written — the finalized watermark. A re-emission
+    /// at or below it is a reorg deeper than `depth`.
+    flushed: Option<u64>,
+    healthy: bool,
+}
+
+impl<'a, S: Store, E: Serialize> ConfirmationWindow<'a, S, E> {
+    fn new(store: &'a S, record: Arc<Record<E>>, depth: u64) -> Self {
+        Self {
+            store,
+            record,
+            depth,
+            pending: BTreeMap::new(),
+            head: None,
+            flushed: None,
+            healthy: true,
+        }
+    }
+
+    /// Buffer one event's row, correcting an in-window reorg, then flush every
+    /// block that has matured to `depth` confirmations. No-op once unhealthy.
+    async fn record(&mut self, block: u64, event: &E) {
+        if !self.healthy {
+            return;
+        }
+
+        // A finalized block being rewritten is a reorg deeper than `depth`:
+        // unfixable without a delete, so halt (the stored height stays; a
+        // restart re-syncs).
+        if let Some(f) = self.flushed
+            && block <= f
+        {
+            // Read `depth` into a local first: `halt` takes `&mut self`, so the
+            // format args may not also borrow `self` immutably.
+            let depth = self.depth;
+            self.halt(format_args!(
+                "block {block} rewritten at/below the finalized watermark {f} \
+                 (reorg deeper than confirmation depth {depth})"
+            ));
+            return;
+        }
+
+        let row = match self.record.encode(event) {
+            Ok(row) => row,
+            // As in BlockWriter: an unencodable event must not be skipped, or
+            // progress advances past a hole replay would expose.
+            Err(e) => {
+                self.halt(format_args!("failed to encode row: {e}"));
+                return;
+            }
+        };
+
+        // Shallow reorg: the chain forked above `block`. Drop the old fork's
+        // buffered blocks (the node re-emits the canonical ones) and rewind the
+        // head so those blocks must re-confirm. Blocks strictly below `block`
+        // are untouched — they belong to the shared prefix.
+        if let Some(h) = self.head
+            && block < h
+        {
+            self.pending.retain(|&b, _| b < block);
+            self.head = Some(block);
+        }
+
+        self.pending.entry(block).or_default().push(row);
+        self.head = Some(self.head.map_or(block, |h| h.max(block)));
+
+        self.flush_matured().await;
+    }
+
+    /// Flush every buffered block now buried `depth` deep, lowest first.
+    async fn flush_matured(&mut self) {
+        let Some(head) = self.head else { return };
+        // Collect the matured block numbers first to avoid borrowing `pending`
+        // across the await inside the flush loop.
+        let matured: Vec<u64> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|&b| head >= b + self.depth)
+            .collect();
+        for b in matured {
+            let rows = self.pending.remove(&b).unwrap_or_default();
+            let schema = self.record.schema().expect("frozen by first encode");
+            if !flush(self.store, &schema, b, rows).await {
+                // A failed write means a later block must not advance the
+                // stored height past the gap; drop the rest of the window and
+                // stop, exactly as BlockWriter does on a flush failure.
+                self.healthy = false;
+                self.pending.clear();
+                return;
+            }
+            self.flushed = Some(b);
+        }
+    }
+
+    /// Stop persisting for the rest of the stream and discard the buffered
+    /// window (its blocks will be re-fetched by a restart's backfill). The
+    /// stored height stays at the last fully written block.
+    fn halt(&mut self, reason: std::fmt::Arguments<'_>) {
+        self.healthy = false;
+        self.pending.clear();
+        tracing::error!(
+            "halting persistence ({reason}); events keep flowing, and a \
+             restart will re-sync from the last stored block"
+        );
+    }
+
+    /// Block numbers currently buffered, lowest first.
+    #[cfg(test)]
+    fn buffered_blocks(&self) -> Vec<u64> {
+        self.pending.keys().copied().collect()
+    }
+}
+
 /// Persist one block's buffered rows. Returns `false` (and logs) on failure so
 /// the caller can stop advancing the stored block height rather than leave a
 /// gap; never tears down the event stream.
@@ -571,6 +764,15 @@ mod tests {
         BlockWriter::new(store, Arc::new(Record::new(None).unwrap()))
     }
 
+    /// A windowed writer over a fresh inferred [`Record`] for `E`.
+    fn window<S, E>(store: &S, depth: u64) -> ConfirmationWindow<'_, S, E>
+    where
+        S: Store,
+        E: alloy::sol_types::SolEvent + Serialize,
+    {
+        ConfirmationWindow::new(store, Arc::new(Record::new(None).unwrap()), depth)
+    }
+
     /// A store whose every write fails.
     struct FailingStore;
 
@@ -621,6 +823,22 @@ mod tests {
         async fn replay(&self, _schema: &TableSchema, _to: u64) -> Result<Vec<Row>> {
             Ok(vec![])
         }
+    }
+
+    /// A zero confirmation depth is nonsensical (a block can never be buried
+    /// zero deep before it is written — that is the same block) and a builder
+    /// that silently accepted it would defeat the reorg protection it exists
+    /// for. Reject it at construction, as the other knobs reject their invalid
+    /// values.
+    #[test]
+    #[should_panic(expected = "confirmation depth must be at least 1")]
+    fn zero_confirmation_depth_panics() {
+        let store = RecordingStore::default();
+        // The collector type is irrelevant to the panic — neither `new` nor
+        // `with_confirmation_depth` requires the `PersistableCollector` bound,
+        // so the unit `()` collector compiles and keeps the test focused on
+        // the assertion alone.
+        let _ = Persisted::new((), store).with_confirmation_depth(0);
     }
 
     /// Once a write fails, persistence is halted for the rest of the stream —
@@ -700,5 +918,113 @@ mod tests {
             "nothing may be written once an event cannot be persisted"
         );
         assert_eq!(writer.buffered(), 0);
+    }
+
+    /// At depth `n` a block is written only once a block `n` higher arrives
+    /// (`head >= block + n`). The window holds the most recent `n` blocks
+    /// unwritten so a shallow reorg can still rewrite them.
+    #[tokio::test]
+    async fn windowed_writer_flushes_only_blocks_buried_depth_deep() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        w.record(1, &ping(1)).await; // head 1: nothing matured
+        w.record(2, &ping(2)).await; // head 2: block 1 needs head>=3
+        assert_eq!(store.written(), Vec::<u64>::new());
+
+        w.record(3, &ping(3)).await; // head 3: block 1 matures (1+2<=3)
+        assert_eq!(store.written(), vec![1]);
+
+        w.record(4, &ping(4)).await; // head 4: block 2 matures
+        assert_eq!(store.written(), vec![1, 2]);
+        assert_eq!(w.buffered_blocks(), vec![3, 4]);
+    }
+
+    /// Depth 1 must reproduce the single-block flush semantics exactly: a block
+    /// is written as soon as the next block arrives, leaving the open block
+    /// buffered — the behaviour [`BlockWriter`] gives a live tail today.
+    #[tokio::test]
+    async fn depth_one_matches_single_block_behaviour() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 1);
+
+        w.record(1, &ping(1)).await;
+        w.record(2, &ping(2)).await; // block 1 matures (1+1<=2)
+        w.record(3, &ping(3)).await; // block 2 matures
+        assert_eq!(store.written(), vec![1, 2]);
+        assert_eq!(w.buffered_blocks(), vec![3], "block 3 stays open");
+    }
+
+    /// A shallow reorg — a block re-emitted while still inside the unflushed
+    /// window — must be corrected in the buffer: the old fork's higher blocks
+    /// are dropped, `head` rewinds, and only the canonical row is ever written.
+    /// This is the whole point of the lag, so it must hold before any flush.
+    #[tokio::test]
+    async fn in_window_reorg_replaces_buffered_rows_before_flush() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        // Original fork: blocks 5 and 6 buffered (neither matured yet at depth 2).
+        w.record(5, &ping(50)).await;
+        w.record(6, &ping(60)).await;
+        assert_eq!(store.written(), Vec::<u64>::new());
+
+        // Reorg: block 5 re-emitted. Block 6's buffered rows are dropped; head
+        // rewinds to 5.
+        w.record(5, &ping(51)).await;
+        assert_eq!(
+            w.buffered_blocks(),
+            vec![5],
+            "the old fork's block 6 is gone"
+        );
+
+        // Re-advance: the canonical 6, then 7 matures block 5.
+        w.record(6, &ping(61)).await;
+        w.record(7, &ping(70)).await; // head 7: block 5 matures (5+2<=7)
+        assert_eq!(
+            store.written(),
+            vec![5],
+            "block 5 written once, after correction"
+        );
+    }
+
+    /// A reorg deeper than the confirmation depth re-emits an already-flushed
+    /// block. That row is finalized — undoing it would need a delete the writer
+    /// doesn't do — so persistence halts rather than writing the orphaned and
+    /// canonical versions over each other. The stored height stays put for a
+    /// restart to re-sync from.
+    #[tokio::test]
+    async fn deep_reorg_past_the_watermark_halts() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 1);
+
+        w.record(5, &ping(1)).await;
+        w.record(6, &ping(2)).await; // block 5 flushes (watermark = 5)
+        assert_eq!(store.written(), vec![5]);
+
+        // Block 5 re-emitted after being finalized: deeper than depth -> halt.
+        w.record(5, &ping(3)).await;
+        // No further writes; later events are ignored.
+        w.record(7, &ping(4)).await;
+        assert_eq!(
+            store.written(),
+            vec![5],
+            "nothing written after a deep reorg"
+        );
+    }
+
+    /// As with [`BlockWriter`], an unencodable event halts the windowed writer
+    /// rather than being skipped: progress must not advance past a block whose
+    /// row was never written, or a restart's replay exposes the hole.
+    #[tokio::test]
+    async fn windowed_writer_halts_on_unencodable_event() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, BadPing>(&store, 2);
+
+        w.record(1, &bad_ping(1)).await;
+        w.record(2, &bad_ping(0)).await; // unencodable -> halt
+        w.record(3, &bad_ping(3)).await;
+        w.record(4, &bad_ping(4)).await; // would otherwise mature block 1/2
+        assert_eq!(store.written(), Vec::<u64>::new());
     }
 }

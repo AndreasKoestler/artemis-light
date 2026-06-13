@@ -119,12 +119,16 @@ The Segment that reconstructs stored history from the Store. Runs only on the **
 _Avoid_: re-emit, history dump
 
 **Backfill**:
-The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`, never below the configured start block) from the source, sliced into bounded block-aligned chunks queried one at a time. These are complete blocks, so all of them — including the trailing one — are persisted. When there is no gap (stored height at or past the tip) no query is issued. A chunk that fails mid-backfill ends the whole subscription — live tail included — so the stored height cannot advance over the hole; the Reconnect Policy drives the resubscribe, which backfills again from the last stored block.
+The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`, never below the configured start block) from the source, sliced into bounded block-aligned chunks queried one at a time. These are complete blocks, so all of them — including the trailing one — are persisted. When there is no gap (stored height at or past the tip) no query is issued. A chunk that fails mid-backfill ends the whole subscription — live tail included — so the stored height cannot advance over the hole; the Reconnect Policy drives the resubscribe, which backfills again from the last stored block. A reorg shallower than the **Confirmation Depth** never reaches the Store: it is absorbed in the Live Tail's confirmation window before any orphaned row is written, so the Backfill never has to re-fetch over a corrected fork (a reorg deeper than the depth still halts persistence and a restart re-syncs).
 _Avoid_: catch-up, gap fill
 
 **Live Tail**:
-The unbounded Segment following the chain tip, strictly above the Backfill's cut (`> tip`). Its final in-progress block is never flushed to the Store; a restart re-fetches it via Backfill.
+The unbounded Segment following the chain tip, strictly above the Backfill's cut (`> tip`). Persistence lags the live edge by the **Confirmation Depth**: the most recent depth blocks are buffered unwritten, and a restart re-fetches that whole window (not just a single open block) via Backfill.
 _Avoid_: live stream, subscription
+
+**Confirmation Depth**:
+The number of blocks a block must be buried under before the Persisted Collector writes it (default 1). The Live Tail buffers the most recent Confirmation-Depth blocks; a reorg shallower than the depth is corrected in the buffer before any orphaned row is written, while a reorg deeper than it halts persistence and a restart re-syncs. Events are still delivered live and immediately — only the Store write lags.
+_Avoid_: finality, confirmations count, lag
 
 ## Relationships
 
@@ -132,7 +136,7 @@ _Avoid_: live stream, subscription
 - A **Merge** or **Chain** composite is one **Collector** to the **Engine**: its sources share one **Collector Driver** and one **Reconnect Policy** (one lifecycle). Register sources as separate Collectors instead when each should reconnect — and go **Fatal** — independently.
 - A **Collector Fallback** composite is one **Collector** to the **Engine**: mid-stream failover happens when the live stream ends and the **Collector Driver** re-subscribes — the combinator holds no health state, it just prefers the primary on every subscribe. Register sources separately if each should reconnect independently.
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
-- A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail.
+- A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail. The Live Tail's write lags the live edge by the **Confirmation Depth**, so a reorg shallower than that depth is corrected in the buffer rather than halting persistence (a deeper reorg still halts).
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.

@@ -205,6 +205,14 @@ blocks, `.with_backfill_chunk_size(..)`) so no single call exceeds provider
 range caps, and `.with_start_block(..)` sets where the very first sync begins
 instead of genesis.
 
+By default a block is persisted once the next block arrives. Set
+`.with_confirmation_depth(n)` to persist a block only once it is `n` blocks
+deep: events are still delivered to strategies live and immediately, but the
+write to the store lags `n` blocks, so a reorg shallower than `n` is corrected
+in the buffer before any orphaned row is written. A reorg deeper than `n` halts
+persistence and a restart re-syncs, so choose `n` above the deepest reorg you
+expect.
+
 See [`examples/persistence_example.rs`](examples/persistence_example.rs) for a
 runnable demo (record live events, then recover them on a simulated restart):
 
