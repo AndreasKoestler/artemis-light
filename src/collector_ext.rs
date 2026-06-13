@@ -1,11 +1,13 @@
 use crate::types::Collector;
 
 mod chain;
+mod fallback;
 mod filter_map;
 mod map;
 mod merge;
 
 pub use chain::*;
+pub use fallback::*;
 pub use filter_map::*;
 pub use map::*;
 pub use merge::*;
@@ -47,13 +49,23 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     {
         Chain::new(self, other)
     }
+
+    /// Subscribe to this collector; if its subscribe fails, fall back to
+    /// `other`. Prefers this collector on every (re)subscribe, and subscribes
+    /// `other` only when this one fails. See [`Fallback`] for the full contract.
+    fn fallback<C>(self, other: C) -> Fallback<Self, C>
+    where
+        C: Collector<E> + Send + Sync + 'static,
+    {
+        Fallback::new(self, other)
+    }
 }
 
 impl<T: Collector<E> + 'static, E> CollectorExt<E> for T {}
 
 #[cfg(test)]
 mod test {
-    use super::{CollectorExt, chain_all, merge_all};
+    use super::{CollectorExt, chain_all, fallback_all, merge_all};
     use crate::types::{Collector, CollectorStream};
     use anyhow::Result;
     use async_trait::async_trait;
@@ -229,6 +241,67 @@ mod test {
             Box::new(FailingCollector),
         ];
         assert!(merge_all(sources).subscribe().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_primary_and_never_subscribes_the_backup() {
+        let subscribes = Arc::new(AtomicUsize::new(0));
+        let composite = TestCollector::new(vec![1, 2, 3]).fallback(CountingCollector {
+            subscribes: Arc::clone(&subscribes),
+        });
+        let stream = composite.subscribe().await.unwrap();
+        assert_eq!(stream.collect::<Vec<_>>().await, vec![1, 2, 3]);
+        assert_eq!(
+            subscribes.load(Ordering::SeqCst),
+            0,
+            "a healthy primary must not subscribe the backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_backup_when_primary_subscribe_fails() {
+        let composite = FailingCollector.fallback(TestCollector::new(vec![7, 8, 9]));
+        let stream = composite.subscribe().await.unwrap();
+        assert_eq!(stream.collect::<Vec<_>>().await, vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn fallback_fails_subscribe_only_when_all_sources_fail() {
+        let composite = FailingCollector.fallback(FailingCollector);
+        assert!(composite.subscribe().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_all_returns_the_first_succeeding_source_in_order() {
+        let subscribes = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<Box<dyn Collector<i32>>> = vec![
+            Box::new(FailingCollector),
+            Box::new(TestCollector::new(vec![1, 2])),
+            Box::new(CountingCollector {
+                subscribes: Arc::clone(&subscribes),
+            }),
+        ];
+        let composite = fallback_all(sources);
+        let stream = composite.subscribe().await.unwrap();
+        assert_eq!(stream.collect::<Vec<_>>().await, vec![1, 2]);
+        assert_eq!(
+            subscribes.load(Ordering::SeqCst),
+            0,
+            "sources after the first success are never subscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_all_fails_when_every_source_fails() {
+        let sources: Vec<Box<dyn Collector<i32>>> =
+            vec![Box::new(FailingCollector), Box::new(FailingCollector)];
+        assert!(fallback_all(sources).subscribe().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_all_with_no_sources_fails_subscribe() {
+        let sources: Vec<Box<dyn Collector<i32>>> = vec![];
+        assert!(fallback_all(sources).subscribe().await.is_err());
     }
 
     #[tokio::test]

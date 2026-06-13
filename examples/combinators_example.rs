@@ -6,6 +6,8 @@
 //! - `filter_map`: drop and transform events in one step
 //! - `merge`: interleave two live sources into one collector
 //! - `chain`: deliver one source's events strictly before another's
+//! - `fallback`: prefer a primary source, falling back to a backup if the
+//!   primary's subscribe fails
 //! - `merge_all` / `chain_all`: the same over a dynamic list of sources
 //!
 //! Run with:
@@ -37,6 +39,17 @@ impl<T> VecCollector<T> {
 impl<T: Clone + Send + Sync + 'static> Collector<T> for VecCollector<T> {
     async fn subscribe(&self) -> Result<CollectorStream<'_, T>> {
         Ok(Box::pin(futures::stream::iter(self.items.clone())))
+    }
+}
+
+/// A collector whose subscribe always fails — a stand-in for a primary
+/// endpoint that is currently down.
+struct DownCollector;
+
+#[async_trait]
+impl Collector<Event> for DownCollector {
+    async fn subscribe(&self) -> Result<CollectorStream<'_, Event>> {
+        anyhow::bail!("primary endpoint is down")
     }
 }
 
@@ -110,6 +123,20 @@ async fn main() -> Result<()> {
     while let Some(n) = stream.next().await {
         println!("  {n}");
     }
+
+    // ---- `fallback`: the primary endpoint is down, so the composite
+    // transparently delivers the backup's events. A healthy primary would be
+    // used instead, and the backup never subscribed.
+    println!("\nfallback: primary is down, backup takes over");
+    let resilient = DownCollector.fallback(VecCollector::new(vec![
+        Event::Block(200),
+        Event::Quote {
+            symbol: "ETH",
+            cents: 300_000,
+        },
+    ]));
+    let events: Vec<Event> = resilient.subscribe().await?.collect().await;
+    println!("  fallback delivered from backup: {events:?}");
 
     println!("\nDone!");
     Ok(())

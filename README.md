@@ -80,6 +80,10 @@ let collector = mempool_collector.filter_map(|tx| {
 
 // Merge two collectors into one stream
 let collector = block_collector.merge(mempool_collector);
+
+// Prefer a primary source, fall back to a backup if its subscribe fails
+// (primary-preferring: each reconnect retries the primary first)
+let collector = primary_ws_collector.fallback(backup_ws_collector);
 ```
 
 Executors compose the same way. Actions that implement `Expires` carry the

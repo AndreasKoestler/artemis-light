@@ -46,8 +46,10 @@ An Executor wrapper that re-submits a failed action with exponential backoff, pe
 _Avoid_: resubmit loop, retry handler
 
 **Fallback**:
-An Executor wrapper that tries a primary executor and re-submits the action to a secondary on error — primary RPC → backup RPC, or private relay → public mempool. The primary's error is logged; only the fallback's verdict is returned.
-_Avoid_: failover, backup executor
+Tries a primary and re-routes to a secondary on failure. Two duals:
+- **Executor Fallback**: tries a primary Executor and re-submits the action to a secondary on a *submit* error — primary RPC → backup RPC, or private relay → public mempool. The primary's error is logged; only the fallback's verdict is returned.
+- **Collector Fallback**: subscribes a primary Collector, falling back to a secondary on a *subscribe* error — primary WS → backup WS. Stateless and primary-preferring: every re-subscribe tries the primary first, so a recovered primary is picked back up automatically; the backup is subscribed only when the primary fails (unlike **Merge**, which subscribes every source). One shared lifecycle (one Collector Driver, one Reconnect Policy), like **Merge** and **Chain**.
+_Avoid_: failover, backup executor/collector
 
 **Polling Fallback**:
 The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. While polling, event latency is the provider's poll interval rather than push-on-arrival. Distinct from **Fallback**, the executor-side wrapper.
@@ -116,6 +118,7 @@ _Avoid_: live stream, subscription
 
 - An **Engine** spawns one **Collector Driver** per **Collector**; each Driver owns one **Reconnect Policy** instance.
 - A **Merge** or **Chain** composite is one **Collector** to the **Engine**: its sources share one **Collector Driver** and one **Reconnect Policy** (one lifecycle). Register sources as separate Collectors instead when each should reconnect — and go **Fatal** — independently.
+- A **Collector Fallback** composite is one **Collector** to the **Engine**: mid-stream failover happens when the live stream ends and the **Collector Driver** re-subscribes — the combinator holds no health state, it just prefers the primary on every subscribe. Register sources separately if each should reconnect independently.
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail.
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
