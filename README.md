@@ -122,6 +122,36 @@ impl Observer<MyEvent, MyAction> for Telemetry {
 engine.add_observer(Box::new(Telemetry));
 ```
 
+## Execution feedback
+
+Submission is otherwise fire-and-forget: a strategy never learns whether the
+action it produced was submitted or failed. `ExecutorExt::report` publishes an
+`ExecutionOutcome` — the action plus an `Ok`/`Err` verdict — to a broadcast
+channel after each submission, returning the inner executor's result unchanged
+(it is transparent, so it composes anywhere in the reliability stack; place it
+outermost for the final post-retry verdict). A `ChannelCollector` over the same
+channel feeds those verdicts back as events through the normal
+collector → strategy path — no back-channel in the engine:
+
+```rust
+use artemis_light::{collectors::ChannelCollector, collector_ext::CollectorExt,
+    executor_ext::{ExecutionOutcome, ExecutorExt}};
+use tokio::sync::broadcast;
+
+let (outcomes, _) = broadcast::channel(256);
+
+engine.add_executor(Box::new(
+    mempool_executor.retry(policy).report(outcomes.clone()),  // outermost
+));
+engine.add_collector(Box::new(
+    ChannelCollector::new(outcomes).map(Event::Outcome),      // back in as an event
+));
+```
+
+The verdict is the executor stack's `Ok`/`Err`, not on-chain confirmation: a
+layer that drops with `Ok` (`gated`, `deadline`) reports `Ok`. Knowing whether a
+transaction actually mined or reverted is a separate, larger facility.
+
 ## Persistence
 
 A long-running strategy that restarts shouldn't have to re-sync from genesis.
