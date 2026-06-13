@@ -177,7 +177,9 @@ async fn test_mempool_collector_polls_when_subscriptions_are_unavailable() {
     assert_eq!(tx.inner.hash(), &tx_hash);
 }
 
-/// Test that the mempool executor correctly sends txs
+/// Test that the mempool executor correctly sends a 1559-priced tx. The
+/// executor now prices `max_fee_per_gas`/`max_priority_fee_per_gas` itself from
+/// the provider's fee estimate, so the request carries no manual gas price.
 #[tokio::test]
 async fn test_mempool_executor_sends_tx_simple() {
     let (provider, _anvil) = spawn_anvil().await.unwrap();
@@ -186,12 +188,10 @@ async fn test_mempool_executor_sends_tx_simple() {
 
     let account = provider.get_accounts().await.unwrap()[0];
     let value: u64 = 42;
-    let gas_price = 100_000_000_000_000_000u128;
     let tx = TransactionRequest::default()
         .with_to(account)
         .with_from(account)
-        .with_value(U256::from(value))
-        .with_gas_price(gas_price);
+        .with_value(U256::from(value));
 
     let action = SubmitTxToMempool {
         tx,
@@ -236,7 +236,7 @@ async fn test_mempool_executor_rejects_bid_percentage_above_100() {
     assert_eq!(provider.get_transaction_count(account).await.unwrap(), 0);
 }
 
-/// With a gas bid, the executor prices the tx at
+/// With a gas bid, the executor caps `max_fee_per_gas` at
 /// `total_profit / gas_usage * bid_percentage / 100` and sets the gas limit
 /// from its own estimate (so the provider's filler doesn't re-estimate).
 #[tokio::test]
@@ -285,9 +285,13 @@ async fn test_mempool_executor_prices_tx_from_gas_bid() {
     let sent = sent.expect("the bid-priced transaction should have been mined");
 
     assert_eq!(
-        sent.gas_price(),
-        Some(2 * GWEI),
-        "tx must be priced at breakeven * bid_percentage"
+        sent.max_fee_per_gas(),
+        2 * GWEI,
+        "max_fee_per_gas must be capped at breakeven * bid_percentage"
+    );
+    assert!(
+        sent.max_priority_fee_per_gas().unwrap_or_default() <= sent.max_fee_per_gas(),
+        "the EIP-1559 invariant must hold: priority <= max_fee"
     );
     assert_eq!(
         sent.gas_limit(),
