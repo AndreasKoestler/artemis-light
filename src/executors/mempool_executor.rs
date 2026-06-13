@@ -1,4 +1,3 @@
-use std::ops::{Div, Mul};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,9 +27,6 @@ pub struct FeeEstimate {
 }
 
 /// Price a transaction's EIP-1559 fees. See the module/spec for the algorithm.
-// `allow(dead_code)`: wired into `execute` in a later step; the pricing
-// function and its tests land first.
-#[allow(dead_code)]
 fn price_1559(
     est: FeeEstimate,
     gas_usage: u64,
@@ -85,8 +81,6 @@ pub struct ReplacementPolicy {
 /// `escalation_percent`. With `escalation_percent >= 110` (enforced at
 /// construction) both fields rise by at least the node's ~10% minimum bump,
 /// and the `priority <= max_fee` invariant is preserved.
-// `allow(dead_code)`: wired into `execute` in a later step.
-#[allow(dead_code)]
 fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
     let scale = |v: u128| {
         // Multiply-then-divide keeps the result exact for the realistic fee
@@ -108,6 +102,10 @@ pub struct MempoolExecutor<M> {
     client: Arc<M>,
     /// Timeout for individual RPC calls.
     rpc_timeout: Duration,
+    /// Percentage applied to the provider's suggested priority fee (100 = as-is).
+    priority_fee_bump_percent: u64,
+    /// When set, watch for confirmation and replace a stuck transaction.
+    replacement: Option<ReplacementPolicy>,
 }
 
 impl<M: Provider> MempoolExecutor<M> {
@@ -116,12 +114,40 @@ impl<M: Provider> MempoolExecutor<M> {
         Self {
             client,
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            priority_fee_bump_percent: 100,
+            replacement: None,
         }
     }
 
     /// Sets the timeout for individual RPC calls.
     pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
         self.rpc_timeout = timeout;
+        self
+    }
+
+    /// Scale the provider's suggested priority fee by `percent` (100 = as-is).
+    pub fn with_priority_fee_bump(mut self, percent: u64) -> Self {
+        self.priority_fee_bump_percent = percent;
+        self
+    }
+
+    /// Watch each submission for confirmation and replace it at an escalated
+    /// fee if it stays unmined. Requires `tx.from` to be set on each action so
+    /// the nonce can be pinned across replacements. Use this *or* the
+    /// [`retry`](crate::executor_ext::ExecutorExt::retry) wrapper, not both:
+    /// `retry` resubmits on a send error, replacement resubmits a sent-but-
+    /// unmined transaction.
+    ///
+    /// Panics if `policy.escalation_percent < 110` — a node rejects a
+    /// replacement that does not raise both fee fields by ~10%.
+    pub fn with_replacement(mut self, policy: ReplacementPolicy) -> Self {
+        assert!(
+            policy.escalation_percent >= 110,
+            "escalation_percent must be >= 110 to clear the node's minimum \
+             replacement bump; got {}",
+            policy.escalation_percent
+        );
+        self.replacement = Some(policy);
         self
     }
 }
@@ -154,13 +180,13 @@ where
         // Refuse an over-100% bid before spending any RPC on it: it would
         // price gas above the opportunity's total profit, making the
         // transaction itself the loss.
-        if let Some(gas_bid_info) = &action.gas_bid_info
-            && gas_bid_info.bid_percentage > 100
+        if let Some(bid) = &action.gas_bid_info
+            && bid.bid_percentage > 100
         {
             return Err(anyhow::anyhow!(
                 "bid_percentage {} exceeds 100: the gas bid would cost more \
                  than the opportunity's total profit",
-                gas_bid_info.bid_percentage
+                bid.bid_percentage
             ));
         }
 
@@ -172,36 +198,104 @@ where
         .context("Timeout estimating gas usage")?
         .context("Error estimating gas usage")?;
 
-        let bid_gas_price;
-        if let Some(gas_bid_info) = action.gas_bid_info {
-            if gas_usage == 0 {
-                return Err(anyhow::anyhow!(
-                    "Gas estimation returned 0, cannot calculate bid price"
-                ));
+        let estimate = {
+            let est = tokio::time::timeout(self.rpc_timeout, self.client.estimate_eip1559_fees())
+                .await
+                .context("Timeout estimating EIP-1559 fees")?
+                .context("Error estimating EIP-1559 fees")?;
+            FeeEstimate {
+                max_fee_per_gas: est.max_fee_per_gas,
+                max_priority_fee_per_gas: est.max_priority_fee_per_gas,
             }
-            // gas price at which we'd break even, meaning 100% of profit goes to validator
-            let breakeven_gas_price = gas_bid_info.total_profit / gas_usage as u128;
-            // gas price corresponding to bid percentage
-            bid_gas_price = breakeven_gas_price
-                .mul(gas_bid_info.bid_percentage as u128)
-                .div(100);
-        } else {
-            bid_gas_price = tokio::time::timeout(self.rpc_timeout, self.client.get_gas_price())
-                .await
-                .context("Timeout getting gas price")?
-                .context("Error getting gas price")?;
-        }
-        // The estimate priced the bid; set it as the limit too, so the
-        // provider's filler doesn't estimate a second time (an extra RPC per
-        // action, and a limit that could diverge from the one priced).
+        };
+
+        let mut fees = price_1559(
+            estimate,
+            gas_usage,
+            self.priority_fee_bump_percent,
+            action.gas_bid_info.as_ref(),
+        )?;
+
+        // The estimate priced the bid; set the gas limit too, so the provider's
+        // filler doesn't estimate a second time (an extra RPC per action, and a
+        // limit that could diverge from the one priced).
         action.tx.set_gas_limit(gas_usage);
-        action.tx.set_gas_price(bid_gas_price);
-        let _pending_tx =
-            tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))
-                .await
-                .context("Timeout sending transaction")?
-                .context("Error sending transaction")?;
-        Ok(())
+        action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
+        action
+            .tx
+            .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+
+        let Some(policy) = self.replacement else {
+            // Fire-and-forget: today's behaviour, 1559-priced.
+            let _pending_tx =
+                tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))
+                    .await
+                    .context("Timeout sending transaction")?
+                    .context("Error sending transaction")?;
+            return Ok(());
+        };
+
+        // Replacement path: pin the nonce so each resend replaces the prior.
+        let from = action
+            .tx
+            .from
+            .context("replacement requires `tx.from` to pin the nonce")?;
+        let nonce = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.get_transaction_count(from).pending(),
+        )
+        .await
+        .context("Timeout fetching nonce")?
+        .context("Error fetching nonce")?;
+        action.tx.set_nonce(nonce);
+
+        let mut pending = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.send_transaction(action.tx.clone()),
+        )
+        .await
+        .context("Timeout sending transaction")?
+        .context("Error sending transaction")?;
+
+        for replacement in 0..=policy.max_replacements {
+            // Await confirmation up to the timeout. `watch` consumes the
+            // builder (alloy 1.0 `PendingTransactionBuilder` is not `Clone`),
+            // so on timeout we resend to obtain a fresh one — the loop logic is
+            // otherwise the plan's.
+            let confirmed = pending
+                .with_timeout(Some(policy.confirmation_timeout))
+                .watch()
+                .await;
+
+            match confirmed {
+                Ok(_hash) => return Ok(()),
+                Err(_) if replacement == policy.max_replacements => {
+                    return Err(anyhow::anyhow!(
+                        "transaction unconfirmed after {} replacement(s)",
+                        policy.max_replacements
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        replacement,
+                        "transaction unconfirmed ({e:#}); replacing at escalated fee"
+                    );
+                    fees = escalate(fees, policy.escalation_percent);
+                    action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
+                    action
+                        .tx
+                        .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+                    pending = tokio::time::timeout(
+                        self.rpc_timeout,
+                        self.client.send_transaction(action.tx.clone()),
+                    )
+                    .await
+                    .context("Timeout sending replacement")?
+                    .context("Error sending replacement")?;
+                }
+            }
+        }
+        unreachable!("loop returns on the final iteration")
     }
 }
 
