@@ -195,4 +195,29 @@ mod test {
             "retry's internal failure is not reported"
         );
     }
+
+    #[tokio::test]
+    async fn report_and_channel_collector_close_the_loop() {
+        use crate::collectors::ChannelCollector;
+        use crate::types::Collector;
+        use tokio_stream::StreamExt;
+
+        let (tx, _rx) = broadcast::channel(8);
+
+        // Collector side, subscribed before the submission so it sees it.
+        let collector = ChannelCollector::new(tx.clone());
+        let mut events = collector.subscribe().await.unwrap();
+
+        // Executor side.
+        let (executor, _received) = recording();
+        let mut reporting = executor.report(tx);
+        reporting.execute(123).await.unwrap();
+
+        let outcome = events
+            .next()
+            .await
+            .expect("the verdict re-entered as an event");
+        assert_eq!(outcome.action, 123);
+        assert!(outcome.result.is_ok());
+    }
 }
