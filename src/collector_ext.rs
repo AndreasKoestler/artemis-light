@@ -1,11 +1,13 @@
 use crate::types::Collector;
 
 mod chain;
+mod fallback;
 mod filter_map;
 mod map;
 mod merge;
 
 pub use chain::*;
+pub use fallback::*;
 pub use filter_map::*;
 pub use map::*;
 pub use merge::*;
@@ -46,6 +48,16 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
         C: Collector<E> + Send + Sync + 'static,
     {
         Chain::new(self, other)
+    }
+
+    /// Subscribe to this collector; if its subscribe fails, fall back to
+    /// `other`. Prefers this collector on every (re)subscribe, and subscribes
+    /// `other` only when this one fails. See [`Fallback`] for the full contract.
+    fn fallback<C>(self, other: C) -> Fallback<Self, C>
+    where
+        C: Collector<E> + Send + Sync + 'static,
+    {
+        Fallback::new(self, other)
     }
 }
 
