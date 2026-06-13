@@ -300,6 +300,65 @@ async fn test_mempool_executor_prices_tx_from_gas_bid() {
     );
 }
 
+/// With auto-mining off, the first submission stays pending past the
+/// confirmation timeout; the executor escalates the fee and resends at the same
+/// nonce. Mining a block then confirms the replacement and `execute` returns
+/// `Ok`. We assert the strong, deterministic invariant the plan permits: the
+/// nonce advanced by exactly 1 (so exactly one tx mined at the pinned nonce),
+/// and the executor returned `Ok`.
+#[tokio::test]
+async fn replacement_speeds_up_a_stuck_transaction() {
+    use alloy::providers::ext::AnvilApi;
+    use artemis_light::executors::ReplacementPolicy;
+    use std::time::Duration;
+
+    let (provider, anvil) = spawn_anvil_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+    let from = anvil.addresses()[0];
+    let to = anvil.addresses()[1];
+
+    // Turn off auto-mining so the first send stays pending.
+    provider.anvil_set_auto_mine(false).await.unwrap();
+
+    let mut executor =
+        MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
+            confirmation_timeout: Duration::from_millis(300),
+            max_replacements: 1,
+            escalation_percent: 125,
+        });
+
+    // Drive execute on a task: it will send, time out waiting for a mine,
+    // escalate, and resend at the same nonce.
+    let tx = TransactionRequest::default()
+        .with_from(from)
+        .with_to(to)
+        .with_value(U256::from(1u64));
+    let exec_handle = tokio::spawn(async move {
+        executor
+            .execute(SubmitTxToMempool {
+                tx,
+                gas_bid_info: None,
+            })
+            .await
+    });
+
+    // After the confirmation timeout has fired at least once (forcing the
+    // escalated replacement), mine a block; the replacement at the pinned nonce
+    // is what gets mined.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    provider.evm_mine(None).await.unwrap();
+
+    // execute resolves Ok once the replacement confirms.
+    exec_handle.await.unwrap().unwrap();
+
+    // Exactly one transaction from `from` mined at the pinned nonce.
+    assert_eq!(
+        provider.get_transaction_count(from).await.unwrap(),
+        1,
+        "exactly one tx (the replacement) should have mined at the pinned nonce"
+    );
+}
+
 /// Test that LogCollector receives logs emitted by a contract.
 #[tokio::test]
 async fn test_log_collector_receives_logs() {
