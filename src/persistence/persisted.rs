@@ -261,10 +261,14 @@ where
         // 3. Live tail, strictly above the backfill cut so the two segments are
         //    disjoint. A live subscription streams from "now", whose lower edge
         //    is fuzzy around the head (it may re-deliver blocks `<= tip`), so we
-        //    enforce the `> tip` boundary rather than assume it. Live events end
-        //    an "open" block only when a higher block arrives, so the final
-        //    in-progress block is left unflushed (`flush_final = false`) and
-        //    re-fetched on restart.
+        //    enforce the `> tip` boundary rather than assume it. The live tail
+        //    persists through a `ConfirmationWindow` instead of `BlockWriter`:
+        //    a block is written only once it is `confirmation_depth` blocks deep
+        //    (default 1, which reproduces the single-block "flush on the next
+        //    block, leave the open block unflushed" behaviour exactly), so the
+        //    most recent depth blocks stay buffered and a reorg shallower than
+        //    the depth is corrected before any orphaned row is written. The
+        //    buffered window is left for a restart's backfill to re-fetch.
         //
         //    The disjoint split assumes the backfill query reliably covers block
         //    `tip`. If an RPC node's `eth_getLogs` lags behind its reported tip,
@@ -288,7 +292,8 @@ where
                 })
                 .take_until(poison.cancelled_owned()),
         ) as CollectorStream<'_, (u64, E)>;
-        let live = persist_and_emit(live_source, &self.store, record, false);
+        let live =
+            persist_and_emit_windowed(live_source, &self.store, record, self.confirmation_depth);
 
         Ok(Segments {
             replay,
@@ -417,6 +422,33 @@ where
 
         if flush_final {
             writer.finish().await;
+        }
+    };
+
+    Box::pin(stream)
+}
+
+/// Like [`persist_and_emit`], but persists with a [`ConfirmationWindow`]: a
+/// block is written only once it is `depth` confirmations deep, and an
+/// in-window reorg is corrected before any orphaned row is written. There is no
+/// `flush_final` — the live tail never ends, and the unflushed window is
+/// intentionally left for a restart's backfill to re-fetch (the whole window,
+/// not just a single open block).
+fn persist_and_emit_windowed<'a, E, S>(
+    mut source: CollectorStream<'a, (u64, E)>,
+    store: &'a S,
+    record: Arc<Record<E>>,
+    depth: u64,
+) -> CollectorStream<'a, E>
+where
+    E: Serialize + Send + Sync + 'static,
+    S: Store + 'a,
+{
+    let stream = async_stream::stream! {
+        let mut writer = ConfirmationWindow::new(store, record, depth);
+        while let Some((block, event)) = source.next().await {
+            writer.record(block, &event).await;
+            yield event;
         }
     };
 
