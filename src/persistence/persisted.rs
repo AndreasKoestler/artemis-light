@@ -65,6 +65,13 @@ pub struct Persisted<C, S> {
     /// Upper bound on blocks per backfill `query_range` call; the gap is
     /// sliced into windows of this size, queried one at a time.
     backfill_chunk_size: u64,
+    /// How many blocks deep a block must be buried before the live tail writes
+    /// it (default 1). The most recent `confirmation_depth` blocks are buffered
+    /// unwritten so an in-window reorg can be corrected before any orphaned row
+    /// reaches the store; see [`with_confirmation_depth`].
+    ///
+    /// [`with_confirmation_depth`]: Persisted::with_confirmation_depth
+    confirmation_depth: u64,
     /// Whether stored history has already been replayed to a subscriber. The
     /// engine re-subscribes after a stream ends, and replaying the full archive
     /// on every reconnect would re-deliver the entire history to strategies —
@@ -82,6 +89,7 @@ impl<C, S> Persisted<C, S> {
             schema: None,
             start_block: 0,
             backfill_chunk_size: DEFAULT_BACKFILL_CHUNK_SIZE,
+            confirmation_depth: 1,
             replayed: AtomicBool::new(false),
         }
     }
@@ -124,6 +132,21 @@ impl<C, S> Persisted<C, S> {
     pub fn with_backfill_chunk_size(mut self, blocks: u64) -> Self {
         assert!(blocks >= 1, "backfill chunk size must be at least 1 block");
         self.backfill_chunk_size = blocks;
+        self
+    }
+
+    /// Persist a block only once it is `depth` blocks deep (default 1). Events
+    /// are still delivered downstream live and immediately; only the Store
+    /// write lags. A reorg shallower than `depth` is corrected in the buffer
+    /// before any orphaned row is written; a reorg deeper than `depth` halts
+    /// persistence (a restart re-syncs). Choose `depth` above the deepest reorg
+    /// you expect.
+    ///
+    /// # Panics
+    /// Panics if `depth` is zero.
+    pub fn with_confirmation_depth(mut self, depth: u64) -> Self {
+        assert!(depth >= 1, "confirmation depth must be at least 1 block");
+        self.confirmation_depth = depth;
         self
     }
 }
@@ -621,6 +644,22 @@ mod tests {
         async fn replay(&self, _schema: &TableSchema, _to: u64) -> Result<Vec<Row>> {
             Ok(vec![])
         }
+    }
+
+    /// A zero confirmation depth is nonsensical (a block can never be buried
+    /// zero deep before it is written — that is the same block) and a builder
+    /// that silently accepted it would defeat the reorg protection it exists
+    /// for. Reject it at construction, as the other knobs reject their invalid
+    /// values.
+    #[test]
+    #[should_panic(expected = "confirmation depth must be at least 1")]
+    fn zero_confirmation_depth_panics() {
+        let store = RecordingStore::default();
+        // The collector type is irrelevant to the panic — neither `new` nor
+        // `with_confirmation_depth` requires the `PersistableCollector` bound,
+        // so the unit `()` collector compiles and keeps the test focused on
+        // the assertion alone.
+        let _ = Persisted::new((), store).with_confirmation_depth(0);
     }
 
     /// Once a write fails, persistence is halted for the rest of the stream —
