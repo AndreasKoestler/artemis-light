@@ -58,3 +58,19 @@ pub mod strategy_ext;
 
 /// This module contains syntax extensions for the `Executor` trait.
 pub mod executor_ext;
+
+/// Opt-in, read-only HTTP serving layer over the persisted tables. Compiled
+/// only when the `serving` feature is enabled; absent otherwise so existing
+/// pipelines build unchanged (serving-layer.OPTIN.1/.2).
+#[cfg(feature = "serving")]
+pub mod serving;
+
+#[cfg(feature = "serving")]
+pub use serving::ServingLayer;
+
+// `tempfile` and `tower` are dev-dependencies used only by the serving-layer
+// integration tests (`tests/serving.rs`, a separate crate). Reference them here
+// in the lib's own test build so `#![warn(unused_crate_dependencies)]` does not
+// flag them — the compiler-recommended resolution for test-only dev-deps.
+#[cfg(test)]
+use {tempfile as _, tower as _};

@@ -9,6 +9,11 @@ readme = "README.md"
 keywords = ["ethereum", "web3", "alloy", "bot", "indexer"]
 categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
+[features]
+## Opt-in, read-only HTTP serving layer over the persisted tables. Off by
+## default so consumers who never serve pay no dependency cost (serving-layer.OPTIN.1/.2).
+serving = ["dep:axum", "tokio/net"]
+
 [dependencies]
 ## async
 async-trait = "0.1"
@@ -24,6 +29,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-stream = "0.3"
+## serving (opt-in; compiled only under the `serving` feature).
+## Pinned to 0.7: axum 0.8 requires serde_core >=1.0.221, which breaks
+## alloy-consensus 1.0.8's use of `serde::__private` (the project pins serde 1.0.219).
+axum = { version = "0.7", optional = true }
 ## misc
 anyhow = "1.0.97"
 tracing = "0.1.41"
@@ -35,6 +44,10 @@ tokio = { version = "1.44", features = ["full", "test-util"] }
 ## `node-bindings` (Anvil process spawning) is test/example tooling only; it
 ## must not ship to downstream consumers of the library.
 alloy = { version = "1.0", features = ["node-bindings"] }
+## serving-layer integration tests: in-process router exercise + temp-file DBs.
+axum = { version = "0.7" }
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
 
 [[example]]
 name = "basic_example"
