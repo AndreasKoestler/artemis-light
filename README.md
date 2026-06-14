@@ -211,7 +211,8 @@ deep: events are still delivered to strategies live and immediately, but the
 write to the store lags `n` blocks, so a reorg shallower than `n` is corrected
 in the buffer before any orphaned row is written. A reorg deeper than `n` halts
 persistence and a restart re-syncs, so choose `n` above the deepest reorg you
-expect.
+expect. [`examples/confirmation_depth_example.rs`](examples/confirmation_depth_example.rs)
+shows the resulting write lag (`cargo run --example confirmation_depth_example`).
 
 See [`examples/persistence_example.rs`](examples/persistence_example.rs) for a
 runnable demo (record live events, then recover them on a simulated restart):

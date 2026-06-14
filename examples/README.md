@@ -16,6 +16,7 @@ Suggested reading order:
 | [`liquidation_bot_example`](liquidation_bot_example.rs) | The same combinators in their production seats: a risk-gated, cooled-down liquidation strategy feeding a `retry` → `fallback` → `rate_limit` → `circuit_breaker` → `gated` submission stack, per-route policies under an umbrella `Action`, and a dry-run shadow executor | No |
 | [`reconnect_example`](reconnect_example.rs) | The collector reconnect lifecycle: `ReconnectConfig`, exponential backoff, recovery, and escalation to the fatal token | No |
 | [`persistence_example`](persistence_example.rs) | Recording events to SQLite with `.with_persistence(store)` and replaying them after a restart | Anvil |
+| [`confirmation_depth_example`](confirmation_depth_example.rs) | Lagging the store behind the live edge with `.with_confirmation_depth(n)` so a shallow reorg is absorbed before any row is written; events still arrive live | Anvil |
 | [`onchain_example`](onchain_example.rs) | An end-to-end on-chain pipeline: `BlockCollector` → strategy → `MempoolExecutor` submitting real transactions | Anvil |
 
 Run any of them with:
@@ -24,5 +25,5 @@ Run any of them with:
 cargo run --example <name>
 ```
 
-The two Anvil-backed examples spawn their own local chain; they only need
+The three Anvil-backed examples spawn their own local chain; they only need
 `anvil` on `$PATH` (it ships with [Foundry](https://getfoundry.sh)).

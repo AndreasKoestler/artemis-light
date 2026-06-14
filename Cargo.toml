@@ -69,6 +69,10 @@ name = "persistence_example"
 path = "examples/persistence_example.rs"
 
 [[example]]
+name = "confirmation_depth_example"
+path = "examples/confirmation_depth_example.rs"
+
+[[example]]
 name = "onchain_example"
 path = "examples/onchain_example.rs"
 
