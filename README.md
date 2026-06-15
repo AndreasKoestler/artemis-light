@@ -221,6 +221,54 @@ runnable demo (record live events, then recover them on a simulated restart):
 cargo run --example persistence_example
 ```
 
+## Serving layer (opt-in)
+
+Behind the **non-default `serving` cargo feature**, a `ServingLayer` exposes the
+persisted tables over a read-only HTTP/JSON API — list tables, inspect a table's
+schema, query its rows (paged, block-range filtered), and read per-table indexing
+progress. It is purely additive: with the feature off, nothing is compiled and no
+existing pipeline behavior changes.
+
+```toml
+artemis-light = { version = "0.1", features = ["serving"] }
+```
+
+```rust,ignore
+use artemis_light::ServingLayer;
+use tokio_util::sync::CancellationToken;
+
+// Same database URL the SqliteStore writer uses; serves on 127.0.0.1:8080.
+let shutdown = CancellationToken::new();
+ServingLayer::new("sqlite:events.db", "127.0.0.1:8080".parse()?)
+    .serve(shutdown) // returns when the token is cancelled
+    .await?;
+```
+
+Endpoints: `GET /health`, `GET /tables`, `GET /tables/{table}/schema`,
+`GET /tables/{table}/rows?from_block&to_block&limit&offset`, `GET /status`.
+
+For a runnable end-to-end demo — index events, serve them, and walk every
+endpoint with a minimal client — see
+[`examples/serving_example.rs`](examples/serving_example.rs):
+
+```sh
+cargo run --example serving_example --features serving
+```
+
+The serving layer opens its **own read-only connection pool** to the same SQLite
+file the writer uses (it never reuses the writer's single-connection pool); under
+WAL, reads run concurrently with the live writer and observe only committed
+blocks.
+
+**Deployment notes.**
+- The API has **no authentication, TLS, or rate limiting** — front it with a
+  reverse proxy (or bind to localhost) if exposed beyond a trusted network.
+- Row queries are not backed by a `block_number` index, so `GET …/rows` is a full
+  scan + sort per request and large `offset` paging degrades linearly; size for
+  operator/dashboard traffic over modest tables.
+- File-backed databases only — `:memory:` is not servable (a separate pool would
+  see an empty database).
+
 ## Quickstart
 
 Add the dependency to your `Cargo.toml`:
