@@ -247,6 +247,14 @@ ServingLayer::new("sqlite:events.db", "127.0.0.1:8080".parse()?)
 Endpoints: `GET /health`, `GET /tables`, `GET /tables/{table}/schema`,
 `GET /tables/{table}/rows?from_block&to_block&limit&offset`, `GET /status`.
 
+For a runnable end-to-end demo — index events, serve them, and walk every
+endpoint with a minimal client — see
+[`examples/serving_example.rs`](examples/serving_example.rs):
+
+```sh
+cargo run --example serving_example --features serving
+```
+
 The serving layer opens its **own read-only connection pool** to the same SQLite
 file the writer uses (it never reuses the writer's single-connection pool); under
 WAL, reads run concurrently with the live writer and observe only committed

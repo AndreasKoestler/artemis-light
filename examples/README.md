@@ -18,6 +18,7 @@ Suggested reading order:
 | [`persistence_example`](persistence_example.rs) | Recording events to SQLite with `.with_persistence(store)` and replaying them after a restart | Anvil |
 | [`confirmation_depth_example`](confirmation_depth_example.rs) | Lagging the store behind the live edge with `.with_confirmation_depth(n)` so a shallow reorg is absorbed before any row is written; events still arrive live | Anvil |
 | [`onchain_example`](onchain_example.rs) | An end-to-end on-chain pipeline: `BlockCollector` → strategy → `MempoolExecutor` submitting real transactions | Anvil |
+| [`serving_example`](serving_example.rs) | Indexing events into a file-backed SQLite store, standing up the read-only `ServingLayer` over it, and navigating the HTTP/JSON API (health, status, tables, schema, paged rows) with a tiny client | Anvil |
 
 Run any of them with:
 
@@ -25,5 +26,11 @@ Run any of them with:
 cargo run --example <name>
 ```
 
-The three Anvil-backed examples spawn their own local chain; they only need
+The Anvil-backed examples spawn their own local chain; they only need
 `anvil` on `$PATH` (it ships with [Foundry](https://getfoundry.sh)).
+
+`serving_example` additionally needs the opt-in `serving` feature:
+
+```sh
+cargo run --example serving_example --features serving
+```
