@@ -12,8 +12,9 @@ use serde_json::{Map, Number, Value};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-/// Name of the implicit lossless-event-JSON column added by the writer.
-const PAYLOAD_COLUMN: &str = "_payload";
+// Shared with the writer: the implicit lossless-event-JSON column whose contents
+// are re-parsed into nested JSON rather than echoed as a string.
+use crate::persistence::PAYLOAD_COLUMN;
 
 /// Convert one queried row to a JSON object keyed by column name, decoding each
 /// cell by its declared `columns` affinity.

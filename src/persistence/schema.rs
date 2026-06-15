@@ -12,6 +12,14 @@ pub const PAYLOAD_COLUMN: &str = "_payload";
 /// per-table progress in.
 pub(crate) const PROGRESS_TABLE: &str = "_artemis_progress";
 
+/// Quote a SQL identifier (table/column name) for inclusion in a statement by
+/// wrapping it in double quotes and doubling any interior double quotes. Shared
+/// by every [`Store`](super::Store) and the serving layer so identifier quoting
+/// can never diverge between writer and reader.
+pub(crate) fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// A SQL column type. SQLite is dynamically typed, so these act as type
 /// affinities / a best-guess mapping from event field types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

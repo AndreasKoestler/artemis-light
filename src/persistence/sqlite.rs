@@ -11,7 +11,9 @@ use sqlx::sqlite::{
 };
 use sqlx::{Arguments, Row as _, sqlite::SqliteArguments};
 
-use super::schema::{BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema};
+use super::schema::{
+    BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema, quote_ident,
+};
 use super::store::Store;
 
 /// A SQLite-backed [`Store`].
@@ -44,11 +46,6 @@ impl SqliteStore {
             .await?;
         Ok(Self { pool })
     }
-}
-
-/// Quote a SQL identifier (table/column name) for inclusion in a statement.
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Bind a [`SqlValue`] onto a `sqlx` argument list.

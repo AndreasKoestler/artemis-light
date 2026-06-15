@@ -5,9 +5,11 @@
 
 use sqlx::{Row, SqlitePool};
 
-/// Internal bookkeeping table the writer maintains; never exposed as an event
-/// table. Mirrors `PROGRESS_TABLE` in `crate::persistence`.
-const PROGRESS_TABLE: &str = "_artemis_progress";
+// Shared with the writer so the serving layer can never diverge on the internal
+// table name or identifier quoting: `PROGRESS_TABLE` is the bookkeeping table
+// that must stay hidden from `/tables`, and `quote_ident` matches the writer's
+// quoting exactly.
+use crate::persistence::{PROGRESS_TABLE, quote_ident};
 
 /// List the persisted event tables: every `sqlite_master` table except the
 /// internal progress table and SQLite's own `sqlite_%` tables, sorted ascending.
@@ -84,14 +86,6 @@ pub(crate) async fn table_watermarks(pool: &SqlitePool) -> anyhow::Result<Vec<(S
             )
         })
         .collect())
-}
-
-/// Quote a SQL identifier by wrapping in double quotes and doubling any interior
-/// double quotes. Mirrors the writer's `quote_ident` in `crate::persistence`
-/// (duplicated locally to avoid changing the persistence module's visibility).
-/// Only ever applied to names that passed [`table_exists`].
-pub(crate) fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 #[cfg(test)]

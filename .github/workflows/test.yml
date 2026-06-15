@@ -36,8 +36,8 @@ jobs:
       
       - name: Run fmt
         run: cargo fmt --all -- --check
-      - name: Build default features (no serving — opt-in/OPTIN check)
-        run: cargo build
+      - name: Clippy default features (no serving — opt-in/OPTIN check)
+        run: cargo clippy
       - name: Run clippy
         run: cargo clippy --all-features
 
