@@ -13,6 +13,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 ## Opt-in, read-only HTTP serving layer over the persisted tables. Off by
 ## default so consumers who never serve pay no dependency cost (serving-layer.OPTIN.1/.2).
 serving = ["dep:axum", "tokio/net"]
+## Opt-in PostgreSQL store + serving backend. Off by default so consumers who
+## only use SQLite pay no PostgreSQL driver cost (postgres-store.FEATURE.1/.2).
+postgres = ["sqlx/postgres"]
 
 [dependencies]
 ## async
@@ -48,6 +51,11 @@ alloy = { version = "1.0", features = ["node-bindings"] }
 axum = { version = "0.7" }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+## PostgreSQL integration tests (`tests/postgres.rs`, gated `#![cfg(feature =
+## "postgres")]`) provision a throwaway PostgreSQL container so the default
+## `cargo test` needs no Docker (postgres-store.TESTING.1/.2).
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers = "0.27"
 
 [[example]]
 name = "basic_example"

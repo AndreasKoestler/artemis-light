@@ -72,5 +72,8 @@ pub use serving::ServingLayer;
 // integration tests (`tests/serving.rs`, a separate crate). Reference them here
 // in the lib's own test build so `#![warn(unused_crate_dependencies)]` does not
 // flag them — the compiler-recommended resolution for test-only dev-deps.
+// `testcontainers` / `testcontainers-modules` are the same case for the
+// PostgreSQL integration tests (`tests/postgres.rs`); referenced unconditionally
+// in the test build so the lint stays quiet whether or not `postgres` is enabled.
 #[cfg(test)]
-use {tempfile as _, tower as _};
+use {tempfile as _, testcontainers as _, testcontainers_modules as _, tower as _};
