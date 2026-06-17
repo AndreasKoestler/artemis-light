@@ -157,4 +157,20 @@ mod tests {
             .await;
         assert!(result.is_err(), "an unknown URL scheme must error");
     }
+
+    /// With the `postgres` feature off, a `postgres://` URL is rejected
+    /// (UnknownSchemeOrFeatureOff) rather than panicking or failing to link
+    /// (postgres-store.FEATURE.2). Runs under `cargo test --features serving`
+    /// (serving on, postgres off).
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn into_router_rejects_postgres_url_when_feature_off() {
+        let result = ServingLayer::new("postgres://localhost/db", any_addr())
+            .into_router()
+            .await;
+        assert!(
+            result.is_err(),
+            "a postgres URL must error when the postgres feature is off"
+        );
+    }
 }
