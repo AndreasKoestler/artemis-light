@@ -14,6 +14,7 @@ use sqlx::{Arguments, Row as _, sqlite::SqliteArguments};
 use super::schema::{
     BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema, quote_ident,
 };
+use super::sql;
 use super::store::Store;
 
 /// A SQLite-backed [`Store`].
@@ -98,8 +99,7 @@ impl Store for SqliteStore {
         sqlx::query(&create).execute(&mut *tx).await?;
 
         // Insert every row in the block.
-        let mut col_names = vec![BLOCK_NUMBER_COLUMN.to_string()];
-        col_names.extend(schema.columns.iter().map(|c| quote_ident(&c.name)));
+        let col_names = sql::insert_column_names(schema);
         let placeholders = vec!["?"; col_names.len()].join(", ");
         let insert = format!(
             "INSERT INTO {} ({}) VALUES ({})",
@@ -109,18 +109,7 @@ impl Store for SqliteStore {
         );
 
         for row in &rows {
-            // Guard against shape mismatches: sqlx silently binds NULL for a
-            // short argument list, so a row that does not match the schema
-            // would corrupt the table rather than error. Bail (rolling the
-            // transaction back) instead.
-            if row.0.len() != schema.columns.len() {
-                anyhow::bail!(
-                    "row has {} values but table {:?} has {} columns",
-                    row.0.len(),
-                    schema.table,
-                    schema.columns.len()
-                );
-            }
+            sql::check_row_shape(schema, row)?;
             let mut args = SqliteArguments::default();
             bind_value(&mut args, &SqlValue::Integer(block as i64))?;
             for value in &row.0 {
@@ -144,7 +133,7 @@ impl Store for SqliteStore {
     }
 
     async fn last_block(&self, table: &str) -> Result<Option<u64>> {
-        let query = format!("SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = ?");
+        let query = sql::last_block_query("?");
         let row = match sqlx::query(&query)
             .bind(table)
             .fetch_optional(&self.pool)
@@ -159,20 +148,9 @@ impl Store for SqliteStore {
     }
 
     async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>> {
-        let select_cols = schema
-            .columns
-            .iter()
-            .map(|c| quote_ident(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= ? \
-             ORDER BY {BLOCK_NUMBER_COLUMN} ASC, rowid ASC",
-            select_cols,
-            quote_ident(&schema.table)
-        );
+        let query = sql::replay_query(schema, "?", "rowid");
 
-        let sqlx_rows = match sqlx::query(&sql)
+        let sqlx_rows = match sqlx::query(&query)
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
@@ -185,14 +163,6 @@ impl Store for SqliteStore {
             Err(e) => return Err(e.into()),
         };
 
-        let mut out = Vec::with_capacity(sqlx_rows.len());
-        for r in &sqlx_rows {
-            let mut values = Vec::with_capacity(schema.columns.len());
-            for (idx, c) in schema.columns.iter().enumerate() {
-                values.push(decode_value(r, idx, c.ty)?);
-            }
-            out.push(Row(values));
-        }
-        Ok(out)
+        sql::collect_rows(&sqlx_rows, schema, decode_value)
     }
 }

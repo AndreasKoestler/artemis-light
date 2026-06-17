@@ -158,24 +158,11 @@ mod pg {
         }
     }
 
-    /// Extract typed, nullable cells from a `PgRow` so the shared
-    /// [`json::row_to_json`] decoder renders PostgreSQL rows identically to
-    /// SQLite (postgres-store.SERVE.3). The decode *rule* lives in `json`; this
-    /// supplies only the per-type extraction.
-    impl json::Cell for PgRow {
-        fn try_i64(&self, name: &str) -> anyhow::Result<Option<i64>> {
-            Ok(self.try_get::<Option<i64>, _>(name)?)
-        }
-        fn try_f64(&self, name: &str) -> anyhow::Result<Option<f64>> {
-            Ok(self.try_get::<Option<f64>, _>(name)?)
-        }
-        fn try_bytes(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
-            Ok(self.try_get::<Option<Vec<u8>>, _>(name)?)
-        }
-        fn try_string(&self, name: &str) -> anyhow::Result<Option<String>> {
-            Ok(self.try_get::<Option<String>, _>(name)?)
-        }
-    }
+    // Extract typed, nullable cells from a `PgRow` so the shared
+    // [`json::row_to_json`] decoder renders PostgreSQL rows identically to
+    // SQLite (postgres-store.SERVE.3). The decode *rule* lives in `json`; the
+    // macro supplies only the per-type extraction, shared with `SqliteRow`.
+    json::impl_cell!(PgRow);
 
     #[async_trait]
     impl ServingBackend for PgBackend {

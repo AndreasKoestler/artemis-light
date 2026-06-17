@@ -12,7 +12,6 @@
 use std::fmt::Write as _;
 
 use serde_json::{Map, Number, Value};
-use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 // Shared with the writer: the implicit lossless-event-JSON column whose contents
@@ -31,20 +30,32 @@ pub(crate) trait Cell {
     fn try_string(&self, name: &str) -> anyhow::Result<Option<String>>;
 }
 
-impl Cell for SqliteRow {
-    fn try_i64(&self, name: &str) -> anyhow::Result<Option<i64>> {
-        Ok(self.try_get::<Option<i64>, _>(name)?)
-    }
-    fn try_f64(&self, name: &str) -> anyhow::Result<Option<f64>> {
-        Ok(self.try_get::<Option<f64>, _>(name)?)
-    }
-    fn try_bytes(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(self.try_get::<Option<Vec<u8>>, _>(name)?)
-    }
-    fn try_string(&self, name: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.try_get::<Option<String>, _>(name)?)
-    }
+/// Implement [`Cell`] for a concrete `sqlx` row type. Every backend extracts
+/// the same four typed, nullable cells via `Row::try_get`, differing only in
+/// the row type — so the bodies are generated rather than copied per backend
+/// (postgres-store.SERVE.3). Used here for `SqliteRow` and by the PostgreSQL
+/// serving backend for `PgRow`.
+macro_rules! impl_cell {
+    ($row:ty) => {
+        impl $crate::serving::json::Cell for $row {
+            fn try_i64(&self, name: &str) -> ::anyhow::Result<Option<i64>> {
+                Ok(::sqlx::Row::try_get::<Option<i64>, _>(self, name)?)
+            }
+            fn try_f64(&self, name: &str) -> ::anyhow::Result<Option<f64>> {
+                Ok(::sqlx::Row::try_get::<Option<f64>, _>(self, name)?)
+            }
+            fn try_bytes(&self, name: &str) -> ::anyhow::Result<Option<Vec<u8>>> {
+                Ok(::sqlx::Row::try_get::<Option<Vec<u8>>, _>(self, name)?)
+            }
+            fn try_string(&self, name: &str) -> ::anyhow::Result<Option<String>> {
+                Ok(::sqlx::Row::try_get::<Option<String>, _>(self, name)?)
+            }
+        }
+    };
 }
+pub(crate) use impl_cell;
+
+impl_cell!(SqliteRow);
 
 /// Convert one queried row to a JSON object keyed by column name, decoding each
 /// cell by its declared `columns` affinity. Generic over the backend via
