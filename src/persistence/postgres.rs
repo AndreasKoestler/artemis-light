@@ -225,3 +225,47 @@ impl Store for PostgresStore {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::schema::{SqlType, TableSchema};
+
+    // Reserved-name rejection (postgres-store.PGSTORE.7; NoReservedNames →
+    // ReservedNameRejected) is backend-agnostic: `Record`/`Persisted` call
+    // `TableSchema::ensure_no_reserved_names` on the user's schema BEFORE any
+    // Store sees it (persisted.rs / record.rs). `PostgresStore` deliberately
+    // does NOT re-check inside `write_block` — exactly like `SqliteStore` — both
+    // because that would duplicate the upstream guard and because the schema
+    // reaching the Store legitimately carries the reserved `_payload` column.
+    // This test pins the shared guard `PostgresStore` relies on.
+    #[test]
+    fn shared_reserved_name_guard_rejects_reserved_identifiers() {
+        // Reserved bookkeeping table name.
+        assert!(
+            TableSchema::new("_artemis_progress")
+                .col("value", SqlType::Text)
+                .ensure_no_reserved_names()
+                .is_err()
+        );
+        // Reserved implicit column names.
+        assert!(
+            TableSchema::new("evt")
+                .col("block_number", SqlType::Integer)
+                .ensure_no_reserved_names()
+                .is_err()
+        );
+        assert!(
+            TableSchema::new("evt")
+                .col("_payload", SqlType::Text)
+                .ensure_no_reserved_names()
+                .is_err()
+        );
+        // A clean user schema passes.
+        assert!(
+            TableSchema::new("evt")
+                .col("value", SqlType::Text)
+                .ensure_no_reserved_names()
+                .is_ok()
+        );
+    }
+}

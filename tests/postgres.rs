@@ -95,3 +95,95 @@ async fn postgres_connect_invalid_url_errors() {
         "connect to an unreachable server must error"
     );
 }
+
+/// A row whose value count does not match the column count is rejected and the
+/// whole block rolls back, leaving prior committed data and the watermark
+/// untouched (postgres-store.PGSTORE.6, ATOMICITY.1, DURABILITY.2;
+/// RowShapeMatchesColumnCount → ShapeMismatchRejected, rollback → StoreWriteFailed).
+#[tokio::test]
+async fn write_block_shape_mismatch_rolls_back() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStore::connect(&url).await.unwrap();
+    let schema = value_set_schema(); // one column
+
+    // Block 5 is written cleanly.
+    store
+        .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("ok".into())])])
+        .await
+        .unwrap();
+
+    // Block 9's second row has too few values for the schema, so the shape
+    // guard bails partway through the batch.
+    let result = store
+        .write_block(
+            &schema,
+            9,
+            vec![
+                Row(vec![SqlValue::Text("good".into())]),
+                Row(vec![]), // missing the `value` column
+            ],
+        )
+        .await;
+    assert!(result.is_err(), "malformed batch must fail");
+
+    // Block 9 rolled back entirely: only block 5's row survives and the
+    // watermark still points at block 5 (gap-free prefix preserved).
+    assert_eq!(
+        store.replay(&schema, 100).await.unwrap(),
+        vec![Row(vec![SqlValue::Text("ok".into())])]
+    );
+    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
+}
+
+/// `replay` on a table that has never been written returns an empty vec, not an
+/// error — the undefined-table SQLSTATE (42P01) is classified as "nothing
+/// stored" (postgres-store.PGSTORE.4-1; ReadEmptyOrMissingTable).
+#[tokio::test]
+async fn replay_missing_table_returns_empty() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStore::connect(&url).await.unwrap();
+    let schema = value_set_schema();
+
+    let rows = store.replay(&schema, 100).await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "replay of a never-written table must be empty"
+    );
+}
+
+/// `last_block` on a table that has never been written returns `None` — the
+/// progress table does not yet exist (42P01) (postgres-store.PGSTORE.5;
+/// ReadEmptyOrMissingTable).
+#[tokio::test]
+async fn last_block_missing_table_returns_none() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStore::connect(&url).await.unwrap();
+
+    assert_eq!(store.last_block("never_written").await.unwrap(), None);
+}
+
+/// A block number at the top of the supported range (`i64::MAX`) round-trips
+/// through the BIGINT column without loss (postgres-store.TYPES.2; the
+/// supported range is [0, i64::MAX]).
+#[tokio::test]
+async fn block_number_near_i64_max_round_trips() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStore::connect(&url).await.unwrap();
+    let schema = value_set_schema();
+    let height = i64::MAX as u64; // top of the supported block-height range
+
+    store
+        .write_block(
+            &schema,
+            height,
+            vec![Row(vec![SqlValue::Text("edge".into())])],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(height));
+    assert_eq!(
+        store.replay(&schema, height).await.unwrap(),
+        vec![Row(vec![SqlValue::Text("edge".into())])]
+    );
+}
