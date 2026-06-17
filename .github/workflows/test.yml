@@ -46,6 +46,14 @@ jobs:
       - name: Run tests (default features, no Docker)
         run: cargo test
 
+      # Serving on, postgres off: the only combination that compiles and runs
+      # the feature-off guard `into_router_rejects_postgres_url_when_feature_off`
+      # (a `postgres://` URL must error, not panic — postgres-store.FEATURE.2).
+      # `--all-features` turns postgres on and cfg's that test out, so without
+      # this job it would never execute. No Docker needed (no postgres suite).
+      - name: Run tests (serving only, postgres feature off)
+        run: cargo test --features serving
+
       # `--all-features` includes the `postgres` suite, whose integration tests
       # provision a throwaway PostgreSQL container via testcontainers. The
       # ubuntu-latest runner ships a running Docker daemon, so no extra service

@@ -68,12 +68,15 @@ pub mod serving;
 #[cfg(feature = "serving")]
 pub use serving::ServingLayer;
 
-// `tempfile` and `tower` are dev-dependencies used only by the serving-layer
-// integration tests (`tests/serving.rs`, a separate crate). Reference them here
-// in the lib's own test build so `#![warn(unused_crate_dependencies)]` does not
-// flag them — the compiler-recommended resolution for test-only dev-deps.
+// `axum`, `tempfile`, and `tower` are dev-dependencies used only by the
+// serving-layer integration tests (`tests/serving.rs`, a separate crate gated
+// on the `serving` feature). Reference them here in the lib's own test build so
+// `#![warn(unused_crate_dependencies)]` does not flag them under a default
+// (serving-off) `cargo test` — the compiler-recommended resolution for
+// test-only dev-deps. (`axum` is also the optional `serving` dependency; the
+// `as _` alias is harmless when the feature is on and it is genuinely used.)
 // `testcontainers` / `testcontainers-modules` are the same case for the
 // PostgreSQL integration tests (`tests/postgres.rs`); referenced unconditionally
 // in the test build so the lint stays quiet whether or not `postgres` is enabled.
 #[cfg(test)]
-use {tempfile as _, testcontainers as _, testcontainers_modules as _, tower as _};
+use {axum as _, tempfile as _, testcontainers as _, testcontainers_modules as _, tower as _};

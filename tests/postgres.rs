@@ -406,9 +406,14 @@ mod serving_parity {
     /// Write the same two-block archive to any `Store` (used to seed both the
     /// PostgreSQL and the SQLite databases identically).
     async fn seed_serving<S: Store>(store: &S) {
+        // Includes a `Numeric` column: it is declared NUMERIC in SQLite and
+        // TEXT in PostgreSQL, but both `/schema` responses must normalise to
+        // TEXT (the type the cell decodes to). A hex-string amount stays text
+        // under SQLite's NUMERIC affinity, matching PostgreSQL's TEXT column.
         let schema = TableSchema::new("evt")
             .col("name", SqlType::Text)
-            .col("count", SqlType::Integer);
+            .col("count", SqlType::Integer)
+            .col("amount", SqlType::Numeric);
         store
             .write_block(
                 &schema,
@@ -416,6 +421,7 @@ mod serving_parity {
                 vec![Row(vec![
                     SqlValue::Text("alpha".into()),
                     SqlValue::Integer(10),
+                    SqlValue::Text("0x2a".into()),
                 ])],
             )
             .await
@@ -427,6 +433,7 @@ mod serving_parity {
                 vec![Row(vec![
                     SqlValue::Text("beta".into()),
                     SqlValue::Integer(20),
+                    SqlValue::Text("0x2b".into()),
                 ])],
             )
             .await
