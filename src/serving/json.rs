@@ -53,6 +53,10 @@ macro_rules! impl_cell {
         }
     };
 }
+// Re-exported only for the PostgreSQL serving backend (`PgRow`); the local
+// `impl_cell!(SqliteRow)` below sees the macro textually without it. Gated so a
+// postgres-off build does not flag the re-export as unused under `-Dwarnings`.
+#[cfg(feature = "postgres")]
 pub(crate) use impl_cell;
 
 impl_cell!(SqliteRow);
