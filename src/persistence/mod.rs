@@ -16,6 +16,7 @@ mod record;
 mod schema;
 mod sqlite;
 mod store;
+mod writer;
 
 pub use persisted::*;
 #[cfg(feature = "postgres")]
