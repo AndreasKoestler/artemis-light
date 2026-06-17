@@ -14,6 +14,7 @@ mod persisted;
 mod postgres;
 mod record;
 mod schema;
+mod sql;
 mod sqlite;
 mod store;
 mod writer;

@@ -17,6 +17,7 @@ use sqlx::{Arguments, Row as _};
 use super::schema::{
     BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema, quote_ident,
 };
+use super::sql;
 use super::store::Store;
 
 /// A PostgreSQL-backed [`Store`].
@@ -123,8 +124,7 @@ impl Store for PostgresStore {
         sqlx::query(&create).execute(&mut *tx).await?;
 
         // Insert every row in the block with positional ($N) placeholders.
-        let mut col_names = vec![BLOCK_NUMBER_COLUMN.to_string()];
-        col_names.extend(schema.columns.iter().map(|c| quote_ident(&c.name)));
+        let col_names = sql::insert_column_names(schema);
         let placeholders = (1..=col_names.len())
             .map(|i| format!("${i}"))
             .collect::<Vec<_>>()
@@ -137,18 +137,7 @@ impl Store for PostgresStore {
         );
 
         for row in &rows {
-            // Guard against shape mismatches before binding: a short argument
-            // list would desync columns from values. Bail (rolling the
-            // transaction back) instead, mirroring SqliteStore's guard
-            // (postgres-store.PGSTORE.6).
-            if row.0.len() != schema.columns.len() {
-                anyhow::bail!(
-                    "row has {} values but table {:?} has {} columns",
-                    row.0.len(),
-                    schema.table,
-                    schema.columns.len()
-                );
-            }
+            sql::check_row_shape(schema, row)?;
             let mut args = PgArguments::default();
             bind_value(&mut args, &SqlValue::Integer(block as i64))?;
             for value in &row.0 {
@@ -175,7 +164,7 @@ impl Store for PostgresStore {
     }
 
     async fn last_block(&self, table: &str) -> Result<Option<u64>> {
-        let query = format!("SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = $1");
+        let query = sql::last_block_query("$1");
         let row = match sqlx::query(&query)
             .bind(table)
             .fetch_optional(&self.pool)
@@ -190,20 +179,9 @@ impl Store for PostgresStore {
     }
 
     async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>> {
-        let select_cols = schema
-            .columns
-            .iter()
-            .map(|c| quote_ident(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= $1 \
-             ORDER BY {BLOCK_NUMBER_COLUMN} ASC, ctid ASC",
-            select_cols,
-            quote_ident(&schema.table)
-        );
+        let query = sql::replay_query(schema, "$1", "ctid");
 
-        let pg_rows = match sqlx::query(&sql)
+        let pg_rows = match sqlx::query(&query)
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
@@ -214,15 +192,7 @@ impl Store for PostgresStore {
             Err(e) => return Err(e.into()),
         };
 
-        let mut out = Vec::with_capacity(pg_rows.len());
-        for r in &pg_rows {
-            let mut values = Vec::with_capacity(schema.columns.len());
-            for (idx, c) in schema.columns.iter().enumerate() {
-                values.push(decode_value(r, idx, c.ty)?);
-            }
-            out.push(Row(values));
-        }
-        Ok(out)
+        sql::collect_rows(&pg_rows, schema, decode_value)
     }
 }
 
