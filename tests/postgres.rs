@@ -379,3 +379,139 @@ async fn sqlite_postgres_replay_parity() {
     let expected: Vec<Row> = block1.into_iter().chain(block2).collect();
     assert_eq!(pg_rows, expected);
 }
+
+/// Serving-layer parity tests: an archive served over PostgreSQL must produce
+/// the same routes and JSON as the same archive served over SQLite
+/// (postgres-store.SERVE.1/.2/.3), and the serving connection must reject writes
+/// (postgres-store.SERVE.4 — also covered by the within-crate
+/// `read_only_serving_pool_rejects_writes`). Gated on `serving` so
+/// `cargo test --features postgres` (without `serving`) still compiles.
+#[cfg(feature = "serving")]
+mod serving_parity {
+    use super::*;
+
+    use std::net::SocketAddr;
+
+    use artemis_light::ServingLayer;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    fn any_addr() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// Write the same two-block archive to any `Store` (used to seed both the
+    /// PostgreSQL and the SQLite databases identically).
+    async fn seed_serving<S: Store>(store: &S) {
+        let schema = TableSchema::new("evt")
+            .col("name", SqlType::Text)
+            .col("count", SqlType::Integer);
+        store
+            .write_block(
+                &schema,
+                1,
+                vec![Row(vec![
+                    SqlValue::Text("alpha".into()),
+                    SqlValue::Integer(10),
+                ])],
+            )
+            .await
+            .unwrap();
+        store
+            .write_block(
+                &schema,
+                2,
+                vec![Row(vec![
+                    SqlValue::Text("beta".into()),
+                    SqlValue::Integer(20),
+                ])],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// GET `uri` from `router` and return its parsed JSON body.
+    async fn get_json(router: &Router, uri: &str) -> Value {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The same logical archive served over PostgreSQL and over SQLite yields
+    /// identical JSON for `/tables`, `/tables/{t}/schema`, `/tables/{t}/rows`,
+    /// and `/status` (postgres-store.SERVE.3, PARITY.1).
+    #[tokio::test]
+    async fn pg_serving_matches_sqlite_across_routes() {
+        // PostgreSQL archive, served via a postgres:// URL (SERVE.1/.2).
+        let (_container, pg_url) = start_postgres().await;
+        let pg_store = PostgresStore::connect(&pg_url).await.unwrap();
+        seed_serving(&pg_store).await;
+        let pg_router = ServingLayer::new(pg_url.clone(), any_addr())
+            .into_router()
+            .await
+            .unwrap();
+
+        // SQLite archive over a temp file (serving rejects in-memory); drop the
+        // writer before opening the read-only serving pool.
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite_url = format!("sqlite:{}", dir.path().join("events.db").to_str().unwrap());
+        {
+            let sqlite_store = SqliteStore::connect(&sqlite_url).await.unwrap();
+            seed_serving(&sqlite_store).await;
+        }
+        let sqlite_router = ServingLayer::new(sqlite_url, any_addr())
+            .into_router()
+            .await
+            .unwrap();
+
+        for uri in [
+            "/tables",
+            "/tables/evt/schema",
+            "/tables/evt/rows",
+            "/status",
+        ] {
+            let pg = get_json(&pg_router, uri).await;
+            let sqlite = get_json(&sqlite_router, uri).await;
+            assert_eq!(pg, sqlite, "route {uri} must match across backends");
+        }
+    }
+
+    /// A `_payload` cell that is not valid JSON is surfaced as the raw string,
+    /// not an error, on the PostgreSQL serving path (postgres-store.SERVE.3 —
+    /// payload-fallback parity with SQLite).
+    #[tokio::test]
+    async fn pg_serving_payload_non_json_falls_back_to_raw_string() {
+        let (_container, url) = start_postgres().await;
+        let store = PostgresStore::connect(&url).await.unwrap();
+        // A table whose `_payload` column holds a non-JSON string.
+        let schema = TableSchema::new("raw_evt").col("_payload", SqlType::Text);
+        store
+            .write_block(
+                &schema,
+                1,
+                vec![Row(vec![SqlValue::Text("not valid json".into())])],
+            )
+            .await
+            .unwrap();
+
+        let router = ServingLayer::new(url, any_addr())
+            .into_router()
+            .await
+            .unwrap();
+        let body = get_json(&router, "/tables/raw_evt/rows").await;
+        assert_eq!(
+            body["rows"][0]["_payload"],
+            Value::String("not valid json".into()),
+            "a non-JSON _payload must fall back to the raw string"
+        );
+    }
+}

@@ -56,12 +56,16 @@ fn cell_to_json(row: &SqliteRow, name: &str, ty: &str) -> anyhow::Result<Value> 
 }
 
 /// Surface `_payload` as nested JSON, or the raw string if it does not parse.
-fn parse_payload(raw: String) -> Value {
+/// Shared with the PostgreSQL serving backend so payload rendering cannot
+/// diverge between backends (postgres-store.SERVE.3).
+pub(crate) fn parse_payload(raw: String) -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::String(raw))
 }
 
-/// Render bytes as a `0x`-prefixed lowercase hex string.
-fn to_hex(bytes: &[u8]) -> String {
+/// Render bytes as a `0x`-prefixed lowercase hex string. Shared with the
+/// PostgreSQL serving backend so blob rendering cannot diverge
+/// (postgres-store.SERVE.3).
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("0x");
     for b in bytes {

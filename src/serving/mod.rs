@@ -100,10 +100,15 @@ impl ServingLayer {
     async fn build_backend(&self) -> anyhow::Result<Arc<dyn ServingBackend>> {
         let url = self.database_url.as_str();
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            anyhow::bail!(
-                "PostgreSQL serving backend is not available in this build \
-                 (the `postgres` serving backend is not yet wired)"
-            );
+            #[cfg(feature = "postgres")]
+            {
+                let backend = backend::PgBackend::connect(url, self.max_connections)
+                    .await
+                    .context("cannot start serving layer")?;
+                return Ok(Arc::new(backend));
+            }
+            #[cfg(not(feature = "postgres"))]
+            anyhow::bail!("PostgreSQL serving requires the `postgres` feature to be enabled");
         }
         if url.starts_with("sqlite:") || !url.contains("://") {
             let pool = pool::open_read_only_pool(url, self.max_connections)
