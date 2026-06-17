@@ -46,6 +46,20 @@ pub(crate) async fn table_exists(pool: &SqlitePool, table: &str) -> anyhow::Resu
     Ok(row.is_some())
 }
 
+/// Normalise a SQLite declared column type to the canonical serving type
+/// keyword, so `/schema` responses are identical across backends
+/// (postgres-store.SERVE.3). `NUMERIC` columns decode to text on both backends
+/// (a `Numeric` value round-trips as `SqlValue::Text`), and the PostgreSQL
+/// store stores them as `TEXT`, so they report `TEXT` here rather than the raw
+/// `NUMERIC` affinity declared in `CREATE TABLE`. The remaining writer types
+/// (`INTEGER`/`REAL`/`TEXT`/`BLOB`) are already canonical.
+fn normalize_type(declared: &str) -> String {
+    match declared.to_ascii_uppercase().as_str() {
+        "NUMERIC" => "TEXT".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Column `(name, type)` pairs for `table`, in declared order, from
 /// `PRAGMA table_info` (serving-layer.TABLES.2). `table` MUST have passed
 /// [`table_exists`] first; it is quoted defensively before interpolation.
@@ -57,7 +71,12 @@ pub(crate) async fn table_columns(
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     Ok(rows
         .iter()
-        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("type")))
+        .map(|r| {
+            (
+                r.get::<String, _>("name"),
+                normalize_type(&r.get::<String, _>("type")),
+            )
+        })
         .collect())
 }
 
@@ -145,6 +164,34 @@ mod tests {
     fn quote_ident_doubles_interior_quotes() {
         assert_eq!(quote_ident("value_set"), "\"value_set\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[tokio::test]
+    async fn table_columns_reports_numeric_as_text() {
+        // A `Numeric` column decodes to text and the PostgreSQL store stores it
+        // as TEXT, so the SQLite `/schema` path must report TEXT too — otherwise
+        // the two backends would disagree on the column type (SERVE.3).
+        let pool = mem_pool().await;
+        sqlx::query(
+            "CREATE TABLE evt (block_number INTEGER NOT NULL, amount NUMERIC, \
+             note TEXT, count INTEGER, raw BLOB, ratio REAL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cols = table_columns(&pool, "evt").await.unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                ("block_number".to_string(), "INTEGER".to_string()),
+                ("amount".to_string(), "TEXT".to_string()),
+                ("note".to_string(), "TEXT".to_string()),
+                ("count".to_string(), "INTEGER".to_string()),
+                ("raw".to_string(), "BLOB".to_string()),
+                ("ratio".to_string(), "REAL".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

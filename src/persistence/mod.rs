@@ -10,12 +10,16 @@
 //! event type and its SQL rows.
 
 mod persisted;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod record;
 mod schema;
 mod sqlite;
 mod store;
 
 pub use persisted::*;
+#[cfg(feature = "postgres")]
+pub use postgres::*;
 pub use record::Record;
 pub use schema::*;
 pub use sqlite::*;

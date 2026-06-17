@@ -36,12 +36,29 @@ jobs:
       
       - name: Run fmt
         run: cargo fmt --all -- --check
-      - name: Clippy default features (no serving — opt-in/OPTIN check)
+      - name: Clippy default features (no serving/postgres — opt-in/OPTIN check)
         run: cargo clippy
       - name: Run clippy
         run: cargo clippy --all-features
 
-      - name: Run tests
+      # Default-feature tests must pass with no Docker and compile no PostgreSQL
+      # code (postgres-store.FEATURE.2 / TESTING.2).
+      - name: Run tests (default features, no Docker)
+        run: cargo test
+
+      # Serving on, postgres off: the only combination that compiles and runs
+      # the feature-off guard `into_router_rejects_postgres_url_when_feature_off`
+      # (a `postgres://` URL must error, not panic — postgres-store.FEATURE.2).
+      # `--all-features` turns postgres on and cfg's that test out, so without
+      # this job it would never execute. No Docker needed (no postgres suite).
+      - name: Run tests (serving only, postgres feature off)
+        run: cargo test --features serving
+
+      # `--all-features` includes the `postgres` suite, whose integration tests
+      # provision a throwaway PostgreSQL container via testcontainers. The
+      # ubuntu-latest runner ships a running Docker daemon, so no extra service
+      # setup is needed (postgres-store.TESTING.1).
+      - name: Run tests (all features, provisions PostgreSQL via Docker)
         run: cargo test --all-features
 
       - name: Clean docs folder
