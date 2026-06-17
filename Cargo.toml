@@ -33,8 +33,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-stream = "0.3"
 ## serving (opt-in; compiled only under the `serving` feature).
-## Pinned to 0.7: axum 0.8 requires serde_core >=1.0.221, which breaks
-## alloy-consensus 1.0.8's use of `serde::__private` (the project pins serde 1.0.219).
+## Held at 0.7 because the serving routes use axum 0.7's path-parameter syntax
+## (`/tables/:table/...`); axum 0.8 renamed it to `/tables/{table}/...` and is a
+## separate migration. (The original serde_core pin rationale no longer applies:
+## alloy was bumped to 1.x-latest, lifting the serde 1.0.219 pin.)
 axum = { version = "0.7", optional = true }
 ## misc
 anyhow = "1.0.97"
