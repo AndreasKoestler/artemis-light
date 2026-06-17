@@ -1186,4 +1186,133 @@ mod engine_tests {
 
         while handle.tasks.join_next().await.is_some() {}
     }
+
+    /// An executor whose `execute` returns `Err` must not tear the pipeline
+    /// down: the error is logged and the loop moves on to the next action. A
+    /// second, healthy executor (with its own subscription) must still receive
+    /// every action. Exercises the `execute` error arm in `executor_task`.
+    #[tokio::test]
+    async fn test_engine_executor_error_does_not_stop_the_pipeline() {
+        /// An executor whose every `execute` fails.
+        struct FailingExecutor;
+
+        #[async_trait]
+        impl Executor<u32> for FailingExecutor {
+            async fn execute(&mut self, _action: u32) -> Result<()> {
+                Err(anyhow::anyhow!("execute boom"))
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1, 2, 3])));
+        engine.add_strategy(Box::new(EchoStrategy));
+        engine.add_executor(Box::new(FailingExecutor));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let mut handle = engine.run().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.token.cancel();
+        while handle.tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "a sibling executor's failures must not stop the healthy executor"
+        );
+    }
+
+    /// A strategy whose `process_event` returns `Err` for one event must log and
+    /// skip it, then keep processing later events — a single bad event is not
+    /// fatal to the strategy. The executor receives actions for every event
+    /// except the one that errored. Exercises the `process_event` error arm in
+    /// `strategy_task`.
+    #[tokio::test]
+    async fn test_engine_strategy_process_error_skips_and_continues() {
+        /// Errors on one event value, echoes every other.
+        struct ErrOnValue {
+            bad: u32,
+        }
+
+        #[async_trait]
+        impl Strategy<u32, u32> for ErrOnValue {
+            async fn sync_state(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                if event == self.bad {
+                    Err(anyhow::anyhow!("process boom on {event}"))
+                } else {
+                    Ok(Box::pin(futures::stream::iter(vec![event])))
+                }
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1, 2, 3])));
+        engine.add_strategy(Box::new(ErrOnValue { bad: 2 }));
+        engine.add_executor(Box::new(CountingExecutor {
+            count: count.clone(),
+        }));
+
+        let mut handle = engine.run().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.token.cancel();
+        while handle.tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "events 1 and 3 produce actions; the errored event 2 is skipped, not fatal"
+        );
+    }
+
+    /// A strategy that produces actions while no executor is registered hits the
+    /// "no receivers" send error on every action. That error is logged, not
+    /// propagated: the strategy keeps draining events and the engine shuts down
+    /// cleanly. Exercises the action-send error arm in `strategy_task`.
+    #[tokio::test]
+    async fn test_engine_action_send_without_executors_is_logged_not_fatal() {
+        /// Counts the events it processes, emitting one action per event.
+        struct CountingStrategy {
+            seen: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Strategy<u32, u32> for CountingStrategy {
+            async fn sync_state(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
+                self.seen.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::iter(vec![event])))
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::<u32, u32>::default();
+        engine.add_collector(Box::new(FixedCollector::new(vec![1, 2, 3])));
+        engine.add_strategy(Box::new(CountingStrategy { seen: seen.clone() }));
+        // No executors registered: every action send finds no receiver.
+
+        let mut handle = engine.run().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.token.cancel();
+        while handle.tasks.join_next().await.is_some() {}
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "the strategy must drain every event even when no executor receives its actions"
+        );
+    }
 }
