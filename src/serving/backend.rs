@@ -97,14 +97,14 @@ pub(crate) use pg::PgBackend;
 #[cfg(feature = "postgres")]
 mod pg {
     use async_trait::async_trait;
-    use serde_json::{Map, Number, Value};
+    use serde_json::{Map, Value};
     use sqlx::Row as _;
     use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 
     use super::super::json;
     use super::super::rows::Bounds;
     use super::ServingBackend;
-    use crate::persistence::{BLOCK_NUMBER_COLUMN, PAYLOAD_COLUMN, PROGRESS_TABLE, quote_ident};
+    use crate::persistence::{BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, quote_ident};
 
     /// A read-only PostgreSQL serving backend.
     pub(crate) struct PgBackend {
@@ -158,44 +158,23 @@ mod pg {
         }
     }
 
-    /// Decode one cell to JSON by its normalised column type, matching
-    /// `json::row_to_json`'s rules exactly (postgres-store.SERVE.3): integer →
-    /// number, real → number (non-finite → null), blob → `0x`-hex, text →
-    /// string, and `_payload` → nested JSON (raw string on parse failure).
-    fn cell_to_json(row: &PgRow, name: &str, ty: &str) -> anyhow::Result<Value> {
-        let value = match ty {
-            "INTEGER" => row
-                .try_get::<Option<i64>, _>(name)?
-                .map(Value::from)
-                .unwrap_or(Value::Null),
-            "REAL" => match row.try_get::<Option<f64>, _>(name)? {
-                Some(f) => Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null),
-                None => Value::Null,
-            },
-            "BLOB" => row
-                .try_get::<Option<Vec<u8>>, _>(name)?
-                .map(|bytes| Value::String(json::to_hex(&bytes)))
-                .unwrap_or(Value::Null),
-            _ => match row.try_get::<Option<String>, _>(name)? {
-                Some(s) if name == PAYLOAD_COLUMN => json::parse_payload(s),
-                Some(s) => Value::String(s),
-                None => Value::Null,
-            },
-        };
-        Ok(value)
-    }
-
-    fn row_to_json(
-        row: &PgRow,
-        columns: &[(String, String)],
-    ) -> anyhow::Result<Map<String, Value>> {
-        let mut obj = Map::with_capacity(columns.len());
-        for (name, ty) in columns {
-            obj.insert(name.clone(), cell_to_json(row, name, ty)?);
+    /// Extract typed, nullable cells from a `PgRow` so the shared
+    /// [`json::row_to_json`] decoder renders PostgreSQL rows identically to
+    /// SQLite (postgres-store.SERVE.3). The decode *rule* lives in `json`; this
+    /// supplies only the per-type extraction.
+    impl json::Cell for PgRow {
+        fn try_i64(&self, name: &str) -> anyhow::Result<Option<i64>> {
+            Ok(self.try_get::<Option<i64>, _>(name)?)
         }
-        Ok(obj)
+        fn try_f64(&self, name: &str) -> anyhow::Result<Option<f64>> {
+            Ok(self.try_get::<Option<f64>, _>(name)?)
+        }
+        fn try_bytes(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.try_get::<Option<Vec<u8>>, _>(name)?)
+        }
+        fn try_string(&self, name: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.try_get::<Option<String>, _>(name)?)
+        }
     }
 
     #[async_trait]
@@ -270,7 +249,9 @@ mod pg {
                 .bind(bounds.offset as i64)
                 .fetch_all(&self.pool)
                 .await?;
-            rows.iter().map(|r| row_to_json(r, &columns)).collect()
+            rows.iter()
+                .map(|r| json::row_to_json(r, &columns))
+                .collect()
         }
 
         async fn watermarks(&self) -> anyhow::Result<Vec<(String, i64)>> {
@@ -299,7 +280,9 @@ mod pg {
 }
 
 #[cfg(all(test, feature = "postgres"))]
-mod pg_read_only_tests {
+mod pg_backend_tests {
+    use super::super::rows::Bounds;
+    use super::ServingBackend;
     use super::pg::PgBackend;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -323,5 +306,60 @@ mod pg_read_only_tests {
             result.is_err(),
             "the read-only serving pool must reject writes"
         );
+    }
+
+    /// The PostgreSQL backend decodes each column type to the same JSON shape as
+    /// the SQLite backend (the shared `json::row_to_json` rule, exercised here
+    /// through `PgRow`): integer → number, real → number, bytea → `0x`-hex, NULL
+    /// → null, and `_payload` → nested JSON (postgres-store.SERVE.3). The SQLite
+    /// twin is `serving::json::tests::converts_cells_payload_and_blob`.
+    #[tokio::test]
+    async fn pg_decodes_each_column_type_to_the_shared_json_shape() {
+        let node = Postgres::default()
+            .start()
+            .await
+            .expect("start postgres container");
+        let port = node.get_host_port_ipv4(5432).await.expect("map port");
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+        // The serving pool is read-only, so set the fixture up over a separate
+        // writable connection.
+        let setup = sqlx::PgPool::connect(&url).await.expect("writable connect");
+        sqlx::query(
+            "CREATE TABLE decode_t (block_number bigint, n bigint, ratio double precision, \
+             raw bytea, missing bigint, _payload text)",
+        )
+        .execute(&setup)
+        .await
+        .expect("create table");
+        sqlx::query(
+            "INSERT INTO decode_t (block_number, n, ratio, raw, missing, _payload) \
+             VALUES (100, 7, 1.5, '\\x00ff', NULL, '{\"value\":\"7\"}')",
+        )
+        .execute(&setup)
+        .await
+        .expect("insert row");
+
+        let backend = PgBackend::connect(&url, 2).await.expect("connect");
+        let bounds = Bounds {
+            from_block: 0,
+            to_block: 1_000,
+            limit: 10,
+            offset: 0,
+        };
+        let rows = backend
+            .query_rows("decode_t", &bounds)
+            .await
+            .expect("query_rows");
+
+        assert_eq!(rows.len(), 1);
+        let obj = &rows[0];
+        assert_eq!(obj["block_number"], serde_json::json!(100));
+        assert_eq!(obj["n"], serde_json::json!(7));
+        assert_eq!(obj["ratio"], serde_json::json!(1.5));
+        assert_eq!(obj["raw"], serde_json::json!("0x00ff"));
+        assert_eq!(obj["missing"], serde_json::Value::Null);
+        // `_payload` parsed into nested JSON, not echoed as a string.
+        assert_eq!(obj["_payload"], serde_json::json!({ "value": "7" }));
     }
 }

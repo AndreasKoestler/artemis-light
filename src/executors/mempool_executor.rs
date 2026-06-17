@@ -97,6 +97,54 @@ fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
     }
 }
 
+/// The escalate-or-give-up half of the replacement loop, factored out of the
+/// I/O so the fee schedule and the give-up boundary are testable without a
+/// chain — the execution-side counterpart of the collector-side
+/// [`ReconnectPolicy`](crate::engine::reconnect::ReconnectPolicy): this owns the
+/// fee schedule and the replacement counter; [`send_with_replacement`] supplies
+/// the actual send and confirmation watch.
+///
+/// [`send_with_replacement`]: MempoolExecutor::send_with_replacement
+struct ReplacementSchedule {
+    escalation_percent: u64,
+    max_replacements: u32,
+    /// The fees the *next* submission would use; advanced by [`escalate`].
+    ///
+    /// [`escalate`]: ReplacementSchedule::escalate
+    fees: Fees,
+    /// Replacements issued so far (0 = only the original has been sent).
+    issued: u32,
+}
+
+impl ReplacementSchedule {
+    fn new(policy: ReplacementPolicy, initial: Fees) -> Self {
+        Self {
+            escalation_percent: policy.escalation_percent,
+            max_replacements: policy.max_replacements,
+            fees: initial,
+            issued: 0,
+        }
+    }
+
+    /// After a submission failed to confirm, escalate to the next replacement's
+    /// fees, or return `None` once `max_replacements` escalations have been
+    /// issued — the signal to give up. The `priority <= max_fee` invariant is
+    /// preserved by [`escalate`].
+    fn escalate(&mut self) -> Option<Fees> {
+        if self.issued >= self.max_replacements {
+            return None;
+        }
+        self.issued += 1;
+        self.fees = escalate(self.fees, self.escalation_percent);
+        Some(self.fees)
+    }
+
+    /// Replacements issued so far.
+    fn issued(&self) -> u32 {
+        self.issued
+    }
+}
+
 /// An executor that sends transactions to the mempool.
 pub struct MempoolExecutor<M> {
     client: Arc<M>,
@@ -149,6 +197,81 @@ impl<M: Provider> MempoolExecutor<M> {
         );
         self.replacement = Some(policy);
         self
+    }
+
+    /// Fire-and-forget: submit the (already 1559-priced) transaction once and
+    /// return without watching for confirmation.
+    async fn send_and_forget(&self, tx: TransactionRequest) -> Result<()> {
+        let _pending = tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(tx))
+            .await
+            .context("Timeout sending transaction")?
+            .context("Error sending transaction")?;
+        Ok(())
+    }
+
+    /// Pin the nonce, submit, and watch for confirmation; on each timeout
+    /// escalate the fee per the [`ReplacementSchedule`] and resend at the same
+    /// nonce, until the transaction confirms or the schedule is exhausted.
+    /// `initial_fees` are the priced fees already set on `tx` — the schedule
+    /// escalates from there.
+    async fn send_with_replacement(
+        &self,
+        mut tx: TransactionRequest,
+        initial_fees: Fees,
+        policy: ReplacementPolicy,
+    ) -> Result<()> {
+        // Pin the nonce so each resend replaces the prior rather than queuing.
+        let from = tx
+            .from
+            .context("replacement requires `tx.from` to pin the nonce")?;
+        let nonce = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.get_transaction_count(from).pending(),
+        )
+        .await
+        .context("Timeout fetching nonce")?
+        .context("Error fetching nonce")?;
+        tx.set_nonce(nonce);
+
+        let mut pending =
+            tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(tx.clone()))
+                .await
+                .context("Timeout sending transaction")?
+                .context("Error sending transaction")?;
+
+        let mut schedule = ReplacementSchedule::new(policy, initial_fees);
+        loop {
+            // `watch` consumes the builder (alloy 1.0 `PendingTransactionBuilder`
+            // is not `Clone`), so on timeout we resend to obtain a fresh one.
+            match pending
+                .with_timeout(Some(policy.confirmation_timeout))
+                .watch()
+                .await
+            {
+                Ok(_hash) => return Ok(()),
+                Err(e) => {
+                    let Some(next) = schedule.escalate() else {
+                        return Err(anyhow::anyhow!(
+                            "transaction unconfirmed after {} replacement(s)",
+                            policy.max_replacements
+                        ));
+                    };
+                    tracing::warn!(
+                        replacement = schedule.issued(),
+                        "transaction unconfirmed ({e:#}); replacing at escalated fee"
+                    );
+                    tx.set_max_fee_per_gas(next.max_fee_per_gas);
+                    tx.set_max_priority_fee_per_gas(next.max_priority_fee_per_gas);
+                    pending = tokio::time::timeout(
+                        self.rpc_timeout,
+                        self.client.send_transaction(tx.clone()),
+                    )
+                    .await
+                    .context("Timeout sending replacement")?
+                    .context("Error sending replacement")?;
+                }
+            }
+        }
     }
 }
 
@@ -209,7 +332,7 @@ where
             }
         };
 
-        let mut fees = price_1559(
+        let fees = price_1559(
             estimate,
             gas_usage,
             self.priority_fee_bump_percent,
@@ -225,77 +348,12 @@ where
             .tx
             .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
 
-        let Some(policy) = self.replacement else {
-            // Fire-and-forget: today's behaviour, 1559-priced.
-            let _pending_tx =
-                tokio::time::timeout(self.rpc_timeout, self.client.send_transaction(action.tx))
-                    .await
-                    .context("Timeout sending transaction")?
-                    .context("Error sending transaction")?;
-            return Ok(());
-        };
-
-        // Replacement path: pin the nonce so each resend replaces the prior.
-        let from = action
-            .tx
-            .from
-            .context("replacement requires `tx.from` to pin the nonce")?;
-        let nonce = tokio::time::timeout(
-            self.rpc_timeout,
-            self.client.get_transaction_count(from).pending(),
-        )
-        .await
-        .context("Timeout fetching nonce")?
-        .context("Error fetching nonce")?;
-        action.tx.set_nonce(nonce);
-
-        let mut pending = tokio::time::timeout(
-            self.rpc_timeout,
-            self.client.send_transaction(action.tx.clone()),
-        )
-        .await
-        .context("Timeout sending transaction")?
-        .context("Error sending transaction")?;
-
-        for replacement in 0..=policy.max_replacements {
-            // Await confirmation up to the timeout. `watch` consumes the
-            // builder (alloy 1.0 `PendingTransactionBuilder` is not `Clone`),
-            // so on timeout we resend to obtain a fresh one — the loop logic is
-            // otherwise the plan's.
-            let confirmed = pending
-                .with_timeout(Some(policy.confirmation_timeout))
-                .watch()
-                .await;
-
-            match confirmed {
-                Ok(_hash) => return Ok(()),
-                Err(_) if replacement == policy.max_replacements => {
-                    return Err(anyhow::anyhow!(
-                        "transaction unconfirmed after {} replacement(s)",
-                        policy.max_replacements
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        replacement,
-                        "transaction unconfirmed ({e:#}); replacing at escalated fee"
-                    );
-                    fees = escalate(fees, policy.escalation_percent);
-                    action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
-                    action
-                        .tx
-                        .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
-                    pending = tokio::time::timeout(
-                        self.rpc_timeout,
-                        self.client.send_transaction(action.tx.clone()),
-                    )
-                    .await
-                    .context("Timeout sending replacement")?
-                    .context("Error sending replacement")?;
-                }
-            }
+        // Fire-and-forget unless a replacement policy is configured; the
+        // confirmation-watch-and-escalate loop lives in `send_with_replacement`.
+        match self.replacement {
+            None => self.send_and_forget(action.tx).await,
+            Some(policy) => self.send_with_replacement(action.tx, fees, policy).await,
         }
-        unreachable!("loop returns on the final iteration")
     }
 }
 
@@ -420,5 +478,55 @@ mod test {
         };
         let bumped = escalate(fees, 200);
         assert_eq!(bumped.max_fee_per_gas, u128::MAX);
+    }
+
+    fn fees(max_fee: u128, priority: u128) -> Fees {
+        Fees {
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority,
+        }
+    }
+
+    fn policy(max_replacements: u32, escalation_percent: u64) -> ReplacementPolicy {
+        ReplacementPolicy {
+            confirmation_timeout: Duration::from_millis(1),
+            max_replacements,
+            escalation_percent,
+        }
+    }
+
+    /// `max_replacements = 0` means watch-only: the first unconfirmed result is
+    /// the give-up signal, with no escalated resend. Exercises the give-up
+    /// boundary that previously needed a live chain to reach.
+    #[test]
+    fn schedule_gives_up_immediately_when_no_replacements_allowed() {
+        let mut schedule = ReplacementSchedule::new(policy(0, 125), fees(200, 20));
+        assert_eq!(schedule.escalate(), None);
+        assert_eq!(schedule.issued(), 0);
+    }
+
+    /// Each replacement escalates the previous fees, compounding, and the
+    /// schedule gives up after exactly `max_replacements` escalations.
+    #[test]
+    fn schedule_escalates_each_replacement_then_gives_up() {
+        let mut schedule = ReplacementSchedule::new(policy(2, 125), fees(200, 20));
+
+        // First replacement: 200 -> 250, 20 -> 25.
+        assert_eq!(schedule.escalate(), Some(fees(250, 25)));
+        // Second replacement compounds: 250 -> 312, 25 -> 31.
+        assert_eq!(schedule.escalate(), Some(fees(312, 31)));
+        // Budget exhausted: give up, and the count stays at the cap.
+        assert_eq!(schedule.escalate(), None);
+        assert_eq!(schedule.issued(), 2);
+    }
+
+    /// Whatever the fee path, the escalated fees never violate the EIP-1559
+    /// invariant — the schedule delegates to [`escalate`], which preserves it.
+    #[test]
+    fn schedule_preserves_the_eip1559_invariant_across_replacements() {
+        let mut schedule = ReplacementSchedule::new(policy(3, 130), fees(200, 200));
+        while let Some(f) = schedule.escalate() {
+            assert!(f.max_priority_fee_per_gas <= f.max_fee_per_gas);
+        }
     }
 }
