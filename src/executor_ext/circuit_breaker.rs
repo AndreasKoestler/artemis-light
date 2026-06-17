@@ -1,6 +1,7 @@
 use crate::types::Executor;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::num::NonZeroU32;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -33,20 +34,13 @@ pub struct CircuitBreaker<A> {
 
 impl<A> CircuitBreaker<A> {
     /// Creates a new `CircuitBreaker` that opens after `max_failures`
-    /// consecutive failures of `executor`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `max_failures` is zero — the circuit would start open.
-    pub fn new(executor: Box<dyn Executor<A>>, max_failures: u32) -> Self {
-        assert!(
-            max_failures > 0,
-            "circuit breaker must tolerate at least one failure"
-        );
+    /// consecutive failures of `executor`. A [`NonZeroU32`] makes a
+    /// zero threshold (a circuit that starts open) unrepresentable.
+    pub fn new(executor: Box<dyn Executor<A>>, max_failures: NonZeroU32) -> Self {
         Self {
             executor,
             state: Arc::new(BreakerState {
-                max_failures,
+                max_failures: max_failures.get(),
                 failures: AtomicU32::new(0),
             }),
         }
@@ -115,6 +109,10 @@ mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
 
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
+
     /// Fails or succeeds per a script of outcomes, counting every attempt.
     struct ScriptedExecutor {
         outcomes: Vec<bool>,
@@ -147,7 +145,7 @@ mod test {
     #[tokio::test]
     async fn an_open_circuit_fails_fast_without_reaching_the_inner_executor() {
         let (executor, attempts) = scripted(&[]);
-        let mut breaker = executor.circuit_breaker(2);
+        let mut breaker = executor.circuit_breaker(nz(2));
         assert!(breaker.execute(0).await.is_err());
         assert!(breaker.execute(1).await.is_err());
         // The circuit is now open: rejected before the inner executor.
@@ -159,7 +157,7 @@ mod test {
     #[tokio::test]
     async fn a_success_resets_the_consecutive_failure_count() {
         let (executor, attempts) = scripted(&[false, true, false, false]);
-        let mut breaker = executor.circuit_breaker(2);
+        let mut breaker = executor.circuit_breaker(nz(2));
         assert!(breaker.execute(0).await.is_err());
         breaker.execute(1).await.unwrap();
         assert!(breaker.execute(2).await.is_err());
@@ -175,7 +173,7 @@ mod test {
     #[tokio::test]
     async fn the_handle_observes_and_resets_the_circuit() {
         let (executor, attempts) = scripted(&[false, true]);
-        let mut breaker = executor.circuit_breaker(1);
+        let mut breaker = executor.circuit_breaker(nz(1));
         let handle = breaker.handle();
 
         assert!(!handle.is_open());
@@ -191,10 +189,6 @@ mod test {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    #[should_panic(expected = "at least one failure")]
-    fn a_zero_threshold_is_rejected_at_construction() {
-        let (executor, _) = scripted(&[]);
-        let _ = executor.circuit_breaker(0);
-    }
+    // A zero threshold is unrepresentable: `circuit_breaker` takes a
+    // `NonZeroU32`, so a circuit that would start open cannot be constructed.
 }

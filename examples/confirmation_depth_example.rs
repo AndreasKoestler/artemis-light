@@ -26,6 +26,7 @@
 //! cargo run --example confirmation_depth_example
 //! ```
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use alloy::node_bindings::Anvil;
@@ -39,7 +40,9 @@ use artemis_light::persistence::{PersistExt, SqliteStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 
-const CONFIRMATION_DEPTH: u64 = 3;
+// A compile-time `NonZeroU64`: the `.unwrap()` is evaluated by the compiler,
+// so a zero would be a build error, never a runtime panic.
+const CONFIRMATION_DEPTH: NonZeroU64 = NonZeroU64::new(3).unwrap();
 
 sol! {
     #[sol(rpc, bytecode = "6080604052348015600e575f5ffd5b5060d980601a5f395ff3fe6080604052348015600e575f5ffd5b50600436106030575f3560e01c80633fa4f2451460345780635524107714604d575b5f5ffd5b603b5f5481565b60405190815260200160405180910390f35b605c6058366004608d565b605e565b005b5f81815560405182917f012c78e2b84325878b1bd9d250d772cfe5bda7722d795f45036fa5e1e6e303fc91a250565b5f60208284031215609c575f5ffd5b503591905056fea264697066735822122050fddb04e40945ebc7c51aef06d27a86c4aa98943b773d9ffdc789caf784441064736f6c634300081e0033")]

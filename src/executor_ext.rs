@@ -56,16 +56,17 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
 
     /// Cap submissions to `per_second` per sliding second, to respect
     /// provider limits. An action over the cap waits rather than being
-    /// dropped. Panics if `per_second` is zero.
-    fn rate_limit(self, per_second: u32) -> RateLimit<A> {
+    /// dropped. A [`NonZeroU32`](std::num::NonZeroU32) rules out a zero cap.
+    fn rate_limit(self, per_second: std::num::NonZeroU32) -> RateLimit<A> {
         RateLimit::new(Box::new(self), per_second)
     }
 
     /// Stop submitting after `max_failures` consecutive failures: an open
     /// circuit fails fast until [`CircuitBreakerHandle::reset`]. Take a
     /// [`handle`](CircuitBreaker::handle) before handing the executor to the
-    /// engine. Panics if `max_failures` is zero.
-    fn circuit_breaker(self, max_failures: u32) -> CircuitBreaker<A> {
+    /// engine. A [`NonZeroU32`](std::num::NonZeroU32) rules out a zero
+    /// threshold (a circuit that starts open).
+    fn circuit_breaker(self, max_failures: std::num::NonZeroU32) -> CircuitBreaker<A> {
         CircuitBreaker::new(Box::new(self), max_failures)
     }
 
@@ -213,7 +214,7 @@ mod test {
             attempts: Arc::clone(&attempts),
         }
         .retry(RetryPolicy::default())
-        .circuit_breaker(2)
+        .circuit_breaker(std::num::NonZeroU32::new(2).unwrap())
         .gated(Arc::clone(&flag));
 
         // Gated off: the action is dropped before retry or breaker see it.

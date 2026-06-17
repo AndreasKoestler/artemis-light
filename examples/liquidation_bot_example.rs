@@ -21,6 +21,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -338,8 +339,8 @@ async fn main() -> Result<()> {
         base_delay: Duration::from_millis(50),
     })
     .fallback(PublicMempoolExecutor { done })
-    .rate_limit(2)
-    .circuit_breaker(3);
+    .rate_limit(const { NonZeroU32::new(2).unwrap() })
+    .circuit_breaker(const { NonZeroU32::new(3).unwrap() });
     let breaker = relay_stack.handle();
 
     engine.add_executor(Box::new(
@@ -365,12 +366,14 @@ async fn main() -> Result<()> {
     ));
 
     // Alerts get their own, lighter policy: rate-limited, never retried.
-    engine.add_executor(Box::new(DiscordAlerter.rate_limit(1).filter_map_action(
-        |a: Action| match a {
-            Action::Alert(message) => Some(message),
-            _ => None,
-        },
-    )));
+    engine.add_executor(Box::new(
+        DiscordAlerter
+            .rate_limit(const { NonZeroU32::new(1).unwrap() })
+            .filter_map_action(|a: Action| match a {
+                Action::Alert(message) => Some(message),
+                _ => None,
+            }),
+    ));
 
     let mut handle = engine.run().await?;
     let _ = done_rx.await;

@@ -1,5 +1,6 @@
 //! Behaviour tests for the persistence layer, exercised through its public API.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -392,23 +393,28 @@ impl Store for NullStore {
 /// A schema override naming a column the persistence layer adds implicitly
 /// (`block_number`, `_payload`) would produce a `CREATE TABLE` with duplicate
 /// columns — a SQL error that silently halts persistence on the first write.
-/// Misconfiguration must fail at construction instead.
+/// Misconfiguration must fail at construction instead — as an error, not a
+/// panic.
 #[test]
-#[should_panic(expected = "reserved")]
 fn with_schema_rejects_reserved_column_names() {
-    let _ = FakeCollector::default()
+    let result = FakeCollector::default()
         .with_persistence(NullStore)
-        .with_schema(TableSchema::new("t").col("block_number", SqlType::Integer));
+        .try_with_schema(TableSchema::new("t").col("block_number", SqlType::Integer));
+    let err = result
+        .err()
+        .expect("a reserved column name must be rejected");
+    assert!(err.to_string().contains("reserved"));
 }
 
 /// A schema override redirecting rows into the store's internal bookkeeping
 /// table would corrupt the progress watermarks of every other table.
 #[test]
-#[should_panic(expected = "reserved")]
 fn with_schema_rejects_the_progress_table() {
-    let _ = FakeCollector::default()
+    let result = FakeCollector::default()
         .with_persistence(NullStore)
-        .with_schema(TableSchema::new("_artemis_progress").col("value", SqlType::Text));
+        .try_with_schema(TableSchema::new("_artemis_progress").col("value", SqlType::Text));
+    let err = result.err().expect("the progress table must be rejected");
+    assert!(err.to_string().contains("reserved"));
 }
 
 sol! {
@@ -584,7 +590,7 @@ async fn backfill_is_sliced_into_bounded_chunks() {
     let queried = collector.queried();
     let persisted = collector
         .with_persistence(store.clone())
-        .with_backfill_chunk_size(10);
+        .with_backfill_chunk_size(NonZeroU64::new(10).unwrap());
 
     let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 
@@ -666,7 +672,7 @@ async fn mid_backfill_chunk_failure_ends_the_stream_without_corrupting_progress(
         .fail_query_range_on_call(2); // the second chunk
     let persisted = collector
         .with_persistence(store.clone())
-        .with_backfill_chunk_size(10);
+        .with_backfill_chunk_size(NonZeroU64::new(10).unwrap());
 
     // The first chunk is queried eagerly and is fine, so subscribe succeeds.
     let stream = persisted.subscribe().await.unwrap();
@@ -698,7 +704,8 @@ async fn override_schema_redirects_table_and_types() {
     let collector = FakeCollector::default().live(vec![(1, 7), (2, 8)]);
     let persisted = collector
         .with_persistence(store.clone())
-        .with_schema(TableSchema::new("custom_values").col("value", SqlType::Numeric));
+        .try_with_schema(TableSchema::new("custom_values").col("value", SqlType::Numeric))
+        .unwrap();
     let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 
     // Progress and rows live under the overridden table, not the derived one.
@@ -979,7 +986,7 @@ async fn confirmation_depth_corrects_a_shallow_reorg() {
 
     let persisted = collector
         .with_persistence(store.clone())
-        .with_confirmation_depth(2);
+        .with_confirmation_depth(NonZeroU64::new(2).unwrap());
 
     let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 

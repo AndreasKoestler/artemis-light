@@ -108,7 +108,7 @@ A Collector wrapper that records every event it sees into a Store and, on subscr
 _Avoid_: indexer, archiver, recorder
 
 **Record**:
-The mapping between one event type and its SQL rows. It owns the table name, the column schema — declared via an override (validated at construction, where a bad override panics) or frozen from the first encoded event — the encode-to-row and decode-from-payload directions, and the reserved-name invariant. The Store sees only the schemas and rows a Record produces.
+The mapping between one event type and its SQL rows. It owns the table name, the column schema — declared via an override (validated at construction, where a bad override returns an error rather than panicking — see `Persisted::try_with_schema`) or frozen from the first encoded event — the encode-to-row and decode-from-payload directions, and the reserved-name invariant. The Store sees only the schemas and rows a Record produces.
 _Avoid_: codec, row mapper, serializer
 
 **Segment**:

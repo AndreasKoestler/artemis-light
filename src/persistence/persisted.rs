@@ -1,6 +1,7 @@
 //! [`Persisted`]: a [`Collector`] wrapper that records every event it sees and,
 //! on subscribe, replays stored history before following the chain tip.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -100,17 +101,17 @@ impl<C, S> Persisted<C, S> {
     /// columns (event fields it does not list are dropped; the lossless
     /// payload column is always appended).
     ///
-    /// # Panics
-    /// Panics when the schema names a column the persistence layer adds
+    /// # Errors
+    /// Errors when the schema names a column the persistence layer adds
     /// implicitly (`block_number`, `_payload`) or the store's internal
     /// progress table — misconfigurations that would otherwise halt
     /// persistence with an opaque SQL error on the first write.
-    pub fn with_schema(mut self, schema: TableSchema) -> Self {
-        if let Err(reason) = schema.ensure_no_reserved_names() {
-            panic!("invalid schema override: {reason}");
-        }
+    pub fn try_with_schema(mut self, schema: TableSchema) -> Result<Self> {
+        schema
+            .ensure_no_reserved_names()
+            .map_err(|reason| anyhow::anyhow!("invalid schema override: {reason}"))?;
         self.schema = Some(schema);
-        self
+        Ok(self)
     }
 
     /// Never backfill below `block`. With an empty store, the very first sync
@@ -126,13 +127,10 @@ impl<C, S> Persisted<C, S> {
     /// Slice the backfill into `query_range` windows of at most `blocks`
     /// blocks (default 10,000), queried one at a
     /// time, so no single RPC call exceeds provider range caps or buffers an
-    /// unbounded result.
-    ///
-    /// # Panics
-    /// Panics if `blocks` is zero.
-    pub fn with_backfill_chunk_size(mut self, blocks: u64) -> Self {
-        assert!(blocks >= 1, "backfill chunk size must be at least 1 block");
-        self.backfill_chunk_size = blocks;
+    /// unbounded result. A [`NonZeroU64`] makes a zero-block chunk (which could
+    /// never make progress) unrepresentable at the call site.
+    pub fn with_backfill_chunk_size(mut self, blocks: NonZeroU64) -> Self {
+        self.backfill_chunk_size = blocks.get();
         self
     }
 
@@ -141,13 +139,10 @@ impl<C, S> Persisted<C, S> {
     /// write lags. A reorg shallower than `depth` is corrected in the buffer
     /// before any orphaned row is written; a reorg deeper than `depth` halts
     /// persistence (a restart re-syncs). Choose `depth` above the deepest reorg
-    /// you expect.
-    ///
-    /// # Panics
-    /// Panics if `depth` is zero.
-    pub fn with_confirmation_depth(mut self, depth: u64) -> Self {
-        assert!(depth >= 1, "confirmation depth must be at least 1 block");
-        self.confirmation_depth = depth;
+    /// you expect. A [`NonZeroU64`] makes a zero depth (which would write the
+    /// open live block before it can be confirmed) unrepresentable.
+    pub fn with_confirmation_depth(mut self, depth: NonZeroU64) -> Self {
+        self.confirmation_depth = depth.get();
         self
     }
 }
@@ -194,7 +189,7 @@ where
 
         // The Record fixes the table name and owns the event <-> row mapping
         // for the whole subscription; the override was already validated in
-        // `with_schema`, so this only fails on a library bug. Shared (Arc)
+        // `try_with_schema`, so this only fails on a library bug. Shared (Arc)
         // between the backfill and live writers, so a schema frozen during
         // backfill is reused by the live tail.
         let record = Arc::new(Record::<E>::new(self.schema.clone())?);
@@ -395,22 +390,9 @@ where
     Ok(Box::pin(stream))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Persisted;
-
-    /// A zero confirmation depth is nonsensical (a block can never be buried
-    /// zero deep before it is written — that is the same block) and a builder
-    /// that silently accepted it would defeat the reorg protection it exists
-    /// for. Reject it at construction, as the other knobs reject their invalid
-    /// values.
-    #[test]
-    #[should_panic(expected = "confirmation depth must be at least 1")]
-    fn zero_confirmation_depth_panics() {
-        // Neither `new` nor `with_confirmation_depth` requires a real
-        // `PersistableCollector` or `Store`, so the unit `()` stands in for
-        // both the collector and the store and keeps the test focused on the
-        // builder assertion alone.
-        let _ = Persisted::new((), ()).with_confirmation_depth(0);
-    }
-}
+// A zero confirmation depth is nonsensical (a block can never be buried zero
+// deep before it is written — that is the same block) and would defeat the
+// reorg protection the knob exists for. It is now unrepresentable:
+// `with_confirmation_depth` takes a `NonZeroU64`, so the invalid value cannot
+// reach the builder — the same way `with_backfill_chunk_size` rejects a zero
+// chunk.
