@@ -7,6 +7,7 @@
 //! under the `serving` cargo feature, so consumers who never serve pay no cost
 //! (serving-layer.OPTIN.1/.2).
 
+mod backend;
 mod catalog;
 mod error;
 mod json;
@@ -15,10 +16,12 @@ mod routes;
 mod rows;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
+use backend::{ServingBackend, SqliteBackend};
 pub use error::ServingError;
 
 /// Default size of the read-only connection pool.
@@ -84,11 +87,31 @@ impl ServingLayer {
     /// seam the integration tests drive via `oneshot`. [`serve`](Self::serve)
     /// uses it internally.
     pub async fn into_router(self) -> anyhow::Result<axum::Router> {
-        let pool = pool::open_read_only_pool(&self.database_url, self.max_connections)
-            .await
-            .context("cannot start serving layer")?;
-        let state = routes::AppState::new(pool, self.default_limit, self.max_limit);
+        let backend = self.build_backend().await?;
+        let state = routes::AppState::new(backend, self.default_limit, self.max_limit);
         Ok(routes::router(state))
+    }
+
+    /// Select and open the read-only storage backend from the database URL
+    /// scheme (postgres-store.SERVE.2): `sqlite:` (or a bare path) opens a
+    /// SQLite backend. An unrecognised scheme is an error rather than a panic
+    /// (postgres-store.SERVE.4-adjacent UnknownSchemeOrFeatureOff). The
+    /// `postgres://` scheme is wired to a PostgreSQL backend in a later phase.
+    async fn build_backend(&self) -> anyhow::Result<Arc<dyn ServingBackend>> {
+        let url = self.database_url.as_str();
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            anyhow::bail!(
+                "PostgreSQL serving backend is not available in this build \
+                 (the `postgres` serving backend is not yet wired)"
+            );
+        }
+        if url.starts_with("sqlite:") || !url.contains("://") {
+            let pool = pool::open_read_only_pool(url, self.max_connections)
+                .await
+                .context("cannot start serving layer")?;
+            return Ok(Arc::new(SqliteBackend::new(pool)));
+        }
+        anyhow::bail!("unsupported database URL scheme: {url}")
     }
 
     /// Serve the read-only HTTP API on the configured address until `shutdown`
@@ -107,5 +130,26 @@ impl ServingLayer {
             .await
             .context("cannot start serving layer")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any_addr() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// An unrecognised URL scheme is rejected by backend selection rather than
+    /// panicking (UnknownSchemeOrFeatureOff). The positive sqlite-scheme path is
+    /// covered end-to-end by the serving integration suite (`tests/serving.rs`),
+    /// which drives `into_router` over a sqlite file through the new backend.
+    #[tokio::test]
+    async fn into_router_rejects_unknown_scheme() {
+        let result = ServingLayer::new("mysql://localhost/db", any_addr())
+            .into_router()
+            .await;
+        assert!(result.is_err(), "an unknown URL scheme must error");
     }
 }

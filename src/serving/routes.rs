@@ -1,29 +1,36 @@
 //! axum router, shared state, and request handlers for the serving layer.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde::Serialize;
-use sqlx::SqlitePool;
 
-use super::catalog;
+use super::backend::ServingBackend;
 use super::error::ServingError;
-use super::rows::{self, RowsQueryParams, RowsResponse};
+use super::rows::{RowsQueryParams, RowsResponse};
 
-/// Shared handler state: the read-only pool plus the configured paging limits.
+/// Shared handler state: the read-only storage backend plus the configured
+/// paging limits. The backend is chosen by URL scheme in
+/// [`ServingLayer::into_router`](super::ServingLayer::into_router).
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) pool: SqlitePool,
+    pub(crate) backend: Arc<dyn ServingBackend>,
     pub(crate) default_limit: u64,
     pub(crate) max_limit: u64,
 }
 
 impl AppState {
-    pub(crate) fn new(pool: SqlitePool, default_limit: u64, max_limit: u64) -> Self {
+    pub(crate) fn new(
+        backend: Arc<dyn ServingBackend>,
+        default_limit: u64,
+        max_limit: u64,
+    ) -> Self {
         Self {
-            pool,
+            backend,
             default_limit,
             max_limit,
         }
@@ -84,15 +91,15 @@ pub(crate) fn router(state: AppState) -> Router {
 /// `GET /health` — liveness probe; 200 `{"status":"ok"}` when the database is
 /// reachable, 503 otherwise (serving-layer.STATUS.2).
 pub async fn get_health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match sqlx::query("SELECT 1").fetch_one(&state.pool).await {
-        Ok(_) => Json(HealthResponse { status: "ok" }).into_response(),
+    match state.backend.health().await {
+        Ok(()) => Json(HealthResponse { status: "ok" }).into_response(),
         Err(_) => ServingError::Unavailable.into_response(),
     }
 }
 
 /// `GET /tables` — list the persisted event tables (serving-layer.TABLES.1/.3).
 pub async fn list_tables_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match catalog::list_tables(&state.pool).await {
+    match state.backend.list_tables().await {
         Ok(tables) => Json(TablesResponse { tables }).into_response(),
         Err(e) => ServingError::Database(e).into_response(),
     }
@@ -104,12 +111,12 @@ pub async fn get_schema_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
 ) -> impl IntoResponse {
-    match catalog::table_exists(&state.pool, &table).await {
+    match state.backend.table_exists(&table).await {
         Ok(true) => {}
         Ok(false) => return ServingError::UnknownTable(table).into_response(),
         Err(e) => return ServingError::Database(e).into_response(),
     }
-    match catalog::table_columns(&state.pool, &table).await {
+    match state.backend.table_columns(&table).await {
         Ok(cols) => Json(SchemaResponse {
             table,
             columns: cols
@@ -130,7 +137,7 @@ pub async fn query_rows_handler(
     Path(table): Path<String>,
     Query(params): Query<RowsQueryParams>,
 ) -> impl IntoResponse {
-    match catalog::table_exists(&state.pool, &table).await {
+    match state.backend.table_exists(&table).await {
         Ok(true) => {}
         Ok(false) => return ServingError::UnknownTable(table).into_response(),
         Err(e) => return ServingError::Database(e).into_response(),
@@ -139,11 +146,7 @@ pub async fn query_rows_handler(
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let columns = match catalog::table_columns(&state.pool, &table).await {
-        Ok(c) => c,
-        Err(e) => return ServingError::Database(e).into_response(),
-    };
-    match rows::query_rows(&state.pool, &table, &columns, &bounds).await {
+    match state.backend.query_rows(&table, &bounds).await {
         Ok(rows) => Json(RowsResponse {
             rows,
             limit: bounds.limit,
@@ -157,7 +160,7 @@ pub async fn query_rows_handler(
 /// `GET /status` — per-table last-processed block from `_artemis_progress`
 /// (serving-layer.STATUS.1); empty list before anything is written.
 pub async fn get_status_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match catalog::table_watermarks(&state.pool).await {
+    match state.backend.watermarks().await {
         Ok(watermarks) => Json(StatusResponse {
             tables: watermarks
                 .into_iter()
