@@ -11,6 +11,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -228,8 +229,8 @@ async fn main() -> Result<()> {
             base_delay: Duration::from_millis(50),
         })
         .fallback(PublicMempool { done })
-        .rate_limit(5)
-        .circuit_breaker(3)
+        .rate_limit(const { NonZeroU32::new(5).unwrap() })
+        .circuit_breaker(const { NonZeroU32::new(3).unwrap() })
         .gated(Arc::clone(&kill_switch)),
     ));
 
@@ -253,7 +254,7 @@ async fn main() -> Result<()> {
 
     // ── Scene 3: the circuit breaker fails closed ──────────────────────────
     println!("\n── circuit breaker ──\n");
-    let breaker = DeadRpc.circuit_breaker(2);
+    let breaker = DeadRpc.circuit_breaker(const { NonZeroU32::new(2).unwrap() });
     let operator = breaker.handle();
     let mut breaker = breaker;
     for id in 200..203 {
@@ -266,7 +267,7 @@ async fn main() -> Result<()> {
 
     // ── Scene 4: the rate limit applies backpressure ───────────────────────
     println!("\n── rate limit ──\n");
-    let mut limited = PrintingRpc.rate_limit(2);
+    let mut limited = PrintingRpc.rate_limit(const { NonZeroU32::new(2).unwrap() });
     let start = Instant::now();
     for id in 300..304 {
         limited.execute(trade(id)).await?;

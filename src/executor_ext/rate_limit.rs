@@ -2,6 +2,7 @@ use crate::types::Executor;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -21,19 +22,12 @@ pub struct RateLimit<A> {
 
 impl<A> RateLimit<A> {
     /// Creates a new `RateLimit` capping `executor` at `per_second`
-    /// submissions per sliding second.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `per_second` is zero — a cap of zero could never submit.
-    pub fn new(executor: Box<dyn Executor<A>>, per_second: u32) -> Self {
-        assert!(
-            per_second > 0,
-            "rate limit must allow at least one action per second"
-        );
+    /// submissions per sliding second. A [`NonZeroU32`] makes a zero cap
+    /// (which could never submit) unrepresentable at the call site.
+    pub fn new(executor: Box<dyn Executor<A>>, per_second: NonZeroU32) -> Self {
         Self {
             executor,
-            per_second,
+            per_second: per_second.get(),
             sent: VecDeque::new(),
         }
     }
@@ -66,7 +60,12 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
+    use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
+
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
 
     /// Records every action it executes.
     struct RecordingExecutor {
@@ -94,7 +93,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn actions_under_the_cap_pass_without_waiting() {
         let (executor, received) = recording();
-        let mut limited = executor.rate_limit(3);
+        let mut limited = executor.rate_limit(nz(3));
         let start = Instant::now();
         for n in 0..3 {
             limited.execute(n).await.unwrap();
@@ -106,7 +105,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn the_action_over_the_cap_waits_out_the_window() {
         let (executor, received) = recording();
-        let mut limited = executor.rate_limit(2);
+        let mut limited = executor.rate_limit(nz(2));
         let start = Instant::now();
         for n in 0..3 {
             limited.execute(n).await.unwrap();
@@ -120,7 +119,7 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn the_window_slides_rather_than_resetting() {
         let (executor, _) = recording();
-        let mut limited = executor.rate_limit(1);
+        let mut limited = executor.rate_limit(nz(1));
         let start = Instant::now();
         for n in 0..3 {
             limited.execute(n).await.unwrap();
@@ -142,7 +141,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn failed_attempts_propagate_and_still_count_against_the_window() {
-        let mut limited = FailingExecutor.rate_limit(1);
+        let mut limited = FailingExecutor.rate_limit(nz(1));
         let start = Instant::now();
         assert!(limited.execute(0).await.is_err());
         assert!(limited.execute(1).await.is_err());
@@ -151,10 +150,6 @@ mod test {
         assert_eq!(start.elapsed(), Duration::from_secs(1));
     }
 
-    #[test]
-    #[should_panic(expected = "at least one action per second")]
-    fn a_zero_cap_is_rejected_at_construction() {
-        let (executor, _) = recording();
-        let _ = executor.rate_limit(0);
-    }
+    // A zero cap is unrepresentable: `rate_limit` takes a `NonZeroU32`, so the
+    // "could never submit" misconfiguration cannot be constructed at all.
 }

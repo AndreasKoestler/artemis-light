@@ -211,7 +211,9 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn an_expired_drop_does_not_count_against_the_circuit_breaker() {
         let (executor, attempts) = failing();
-        let breaker = executor.deadline().circuit_breaker(1);
+        let breaker = executor
+            .deadline()
+            .circuit_breaker(std::num::NonZeroU32::new(1).unwrap());
         let operator = breaker.handle();
         let mut breaker = breaker;
 

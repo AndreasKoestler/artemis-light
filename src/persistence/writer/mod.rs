@@ -15,7 +15,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use serde::Serialize;
 
-use crate::persistence::{Record, Row, Store};
+use crate::persistence::{Record, Row, Store, TableSchema};
 use crate::types::CollectorStream;
 
 mod block;
@@ -38,6 +38,13 @@ use window::ConfirmationWindow;
 struct GapFreeWriter<'a, S, E> {
     store: &'a S,
     record: Arc<Record<E>>,
+    /// The write schema, captured from the [`Record`] on the first successful
+    /// [`encode`](Self::encode). A declared schema is available immediately; an
+    /// inferred one is frozen by that first encode. Held here so [`flush`] never
+    /// has to assume the freeze happened — it writes only what was encoded.
+    ///
+    /// [`flush`]: Self::flush
+    schema: Option<TableSchema>,
     healthy: bool,
 }
 
@@ -46,6 +53,7 @@ impl<'a, S: Store, E: Serialize> GapFreeWriter<'a, S, E> {
         Self {
             store,
             record,
+            schema: None,
             healthy: true,
         }
     }
@@ -63,7 +71,16 @@ impl<'a, S: Store, E: Serialize> GapFreeWriter<'a, S, E> {
     /// has halted; the caller then discards its own buffer.
     fn encode(&mut self, event: &E) -> Option<Row> {
         match self.record.encode(event) {
-            Ok(row) => Some(row),
+            Ok(row) => {
+                // The encode just froze the inferred columns (declared ones
+                // were always present), so the write schema is available now.
+                // Capture it once; `flush` writes only blocks built from rows
+                // this method produced, so a row in hand means a schema in hand.
+                if self.schema.is_none() {
+                    self.schema = self.record.schema();
+                }
+                Some(row)
+            }
             Err(e) => {
                 self.fail(format_args!("failed to encode row: {e}"));
                 None
@@ -75,8 +92,13 @@ impl<'a, S: Store, E: Serialize> GapFreeWriter<'a, S, E> {
     /// writer goes unhealthy (the caller must stop advancing the stored height)
     /// and returns `false`; the event stream itself keeps flowing either way.
     async fn flush(&mut self, block: u64, rows: Vec<Row>) -> bool {
-        let schema = self.record.schema().expect("frozen by first encode");
-        match self.store.write_block(&schema, block, rows).await {
+        let Some(schema) = &self.schema else {
+            // No event has been encoded, so there is nothing to persist: the
+            // buffered rows `flush` writes are only ever produced by `encode`,
+            // which captures the schema. An empty block is a healthy no-op.
+            return true;
+        };
+        match self.store.write_block(schema, block, rows).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::error!("failed to persist block {block}; halting persistence: {e}");

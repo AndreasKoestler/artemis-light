@@ -171,9 +171,9 @@ impl<E> Record<E> {
                     .collect();
                 // A concurrent encode may have frozen first; either winner
                 // derived from the same event type, so the loser's set is a
-                // no-op and `get` is now always populated.
-                let _ = lock.set(columns);
-                Ok(lock.get().expect("frozen above").as_slice())
+                // no-op. `get_or_init` returns whichever set won, so the
+                // frozen columns are always available without unwrapping.
+                Ok(lock.get_or_init(|| columns).as_slice())
             }
         }
     }

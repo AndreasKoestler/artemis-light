@@ -66,6 +66,38 @@ fn price_1559(
     })
 }
 
+/// A validated fee multiplier per replacement, as a percentage. Constructed
+/// only through [`EscalationPercent::new`], which rejects anything below 110 —
+/// a node rejects a replacement that does not raise both fee fields by ~10%, so
+/// a smaller bump could never land. Carrying the bound in the type makes an
+/// invalid [`ReplacementPolicy`] unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub struct EscalationPercent(u64);
+
+impl EscalationPercent {
+    /// The smallest bump a node accepts as a replacement (~10% over the
+    /// original, rounded up).
+    pub const MIN: u64 = 110;
+
+    /// A fee multiplier of `percent`, or an error if it is below
+    /// [`MIN`](Self::MIN).
+    pub fn new(percent: u64) -> Result<Self> {
+        if percent < Self::MIN {
+            anyhow::bail!(
+                "escalation_percent must be >= {} to clear the node's minimum \
+                 replacement bump; got {percent}",
+                Self::MIN
+            );
+        }
+        Ok(Self(percent))
+    }
+
+    /// The percentage as a plain integer.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// When and how to replace a transaction that has not confirmed.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplacementPolicy {
@@ -73,8 +105,8 @@ pub struct ReplacementPolicy {
     pub confirmation_timeout: Duration,
     /// How many escalated resubmissions after the original (0 = watch only).
     pub max_replacements: u32,
-    /// Fee multiplier per replacement, as a percentage. Must be >= 110.
-    pub escalation_percent: u64,
+    /// Fee multiplier per replacement; see [`EscalationPercent`].
+    pub escalation_percent: EscalationPercent,
 }
 
 /// Escalate both fee fields for a replacement transaction by
@@ -119,7 +151,7 @@ struct ReplacementSchedule {
 impl ReplacementSchedule {
     fn new(policy: ReplacementPolicy, initial: Fees) -> Self {
         Self {
-            escalation_percent: policy.escalation_percent,
+            escalation_percent: policy.escalation_percent.get(),
             max_replacements: policy.max_replacements,
             fees: initial,
             issued: 0,
@@ -186,15 +218,9 @@ impl<M: Provider> MempoolExecutor<M> {
     /// `retry` resubmits on a send error, replacement resubmits a sent-but-
     /// unmined transaction.
     ///
-    /// Panics if `policy.escalation_percent < 110` — a node rejects a
-    /// replacement that does not raise both fee fields by ~10%.
+    /// The policy's [`EscalationPercent`] already guarantees each replacement
+    /// raises both fee fields enough to clear the node's minimum bump.
     pub fn with_replacement(mut self, policy: ReplacementPolicy) -> Self {
-        assert!(
-            policy.escalation_percent >= 110,
-            "escalation_percent must be >= 110 to clear the node's minimum \
-             replacement bump; got {}",
-            policy.escalation_percent
-        );
         self.replacement = Some(policy);
         self
     }
@@ -491,7 +517,7 @@ mod test {
         ReplacementPolicy {
             confirmation_timeout: Duration::from_millis(1),
             max_replacements,
-            escalation_percent,
+            escalation_percent: EscalationPercent::new(escalation_percent).unwrap(),
         }
     }
 

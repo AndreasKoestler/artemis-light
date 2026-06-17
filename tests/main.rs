@@ -309,7 +309,7 @@ async fn test_mempool_executor_prices_tx_from_gas_bid() {
 #[tokio::test]
 async fn replacement_speeds_up_a_stuck_transaction() {
     use alloy::providers::ext::AnvilApi;
-    use artemis_light::executors::ReplacementPolicy;
+    use artemis_light::executors::{EscalationPercent, ReplacementPolicy};
     use std::time::Duration;
 
     let (provider, anvil) = spawn_anvil_with_signer().await.unwrap();
@@ -323,7 +323,7 @@ async fn replacement_speeds_up_a_stuck_transaction() {
     let mut executor = MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
         confirmation_timeout: Duration::from_millis(300),
         max_replacements: 1,
-        escalation_percent: 125,
+        escalation_percent: EscalationPercent::new(125).unwrap(),
     });
 
     // Drive execute on a task: it will send, time out waiting for a mine,
