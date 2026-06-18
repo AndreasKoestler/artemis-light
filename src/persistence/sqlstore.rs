@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use sqlx::{ColumnIndex, Database, Decode, Encode, Executor, IntoArguments, Pool, Row as _, Type};
 
 use super::dialect::Dialect;
+use super::query;
 use super::schema::{Row, SqlType, SqlValue, TableSchema};
-use super::sql;
 use super::store::Store;
 
 /// A SQL-backed [`Store`] generic over the sqlx [`Database`] `DB` and its
@@ -114,16 +114,16 @@ where
     async fn write_block(&self, schema: &TableSchema, block: u64, rows: Vec<Row>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(&sql::create_progress_table(&self.dialect))
+        sqlx::query(&query::create_progress_table(&self.dialect))
             .execute(&mut *tx)
             .await?;
-        sqlx::query(&sql::create_event_table(schema, &self.dialect))
+        sqlx::query(&query::create_event_table(schema, &self.dialect))
             .execute(&mut *tx)
             .await?;
 
-        let insert = sql::insert_statement(schema, &self.dialect);
+        let insert = query::insert_statement(schema, &self.dialect);
         for row in &rows {
-            sql::check_row_shape(schema, row)?;
+            query::check_row_shape(schema, row)?;
             let mut args = <DB::Arguments<'_>>::default();
             bind_value::<DB>(&mut args, &SqlValue::Integer(block as i64))?;
             for value in &row.0 {
@@ -134,7 +134,7 @@ where
 
         // Advance the last processed block in the same transaction; the dialect's
         // monotonic max keeps the watermark from regressing.
-        let upsert = sql::watermark_upsert(&self.dialect);
+        let upsert = query::watermark_upsert(&self.dialect);
         let mut args = <DB::Arguments<'_>>::default();
         bind_value::<DB>(&mut args, &SqlValue::Text(schema.table.clone()))?;
         bind_value::<DB>(&mut args, &SqlValue::Integer(block as i64))?;
@@ -145,10 +145,10 @@ where
     }
 
     async fn last_block(&self, table: &str) -> Result<Option<u64>> {
-        let query = sql::last_block_query(&self.dialect);
+        let sql = query::last_block_query(&self.dialect);
         let mut args = <DB::Arguments<'_>>::default();
         bind_value::<DB>(&mut args, &SqlValue::Text(table.to_string()))?;
-        let row = match sqlx::query_with(&query, args)
+        let row = match sqlx::query_with(&sql, args)
             .fetch_optional(&self.pool)
             .await
         {
@@ -161,15 +161,15 @@ where
     }
 
     async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>> {
-        let query = sql::replay_query(schema, &self.dialect);
+        let sql = query::replay_query(schema, &self.dialect);
         let mut args = <DB::Arguments<'_>>::default();
         bind_value::<DB>(&mut args, &SqlValue::Integer(to as i64))?;
-        let rows = match sqlx::query_with(&query, args).fetch_all(&self.pool).await {
+        let rows = match sqlx::query_with(&sql, args).fetch_all(&self.pool).await {
             Ok(rows) => rows,
             // A missing table means nothing has been stored yet.
             Err(e) if self.dialect.is_undefined_table(&e) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        sql::collect_rows(&rows, schema, |r, idx, ty| decode_value::<DB>(r, idx, ty))
+        query::collect_rows(&rows, schema, |r, idx, ty| decode_value::<DB>(r, idx, ty))
     }
 }

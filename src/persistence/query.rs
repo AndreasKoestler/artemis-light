@@ -1,5 +1,9 @@
-//! Dialect-parameterised SQL shaping shared by the generic
-//! [`SqlStore`](super::SqlStore) and the read serving backends.
+//! The pure SQL-text composition layer: dialect-parameterised query *strings*
+//! shared by the generic [`SqlStore`](super::SqlStore) and the read serving
+//! backends. These are free functions of `(schema, &dyn Dialect)` with no pool,
+//! no `async`, and no sqlx trait bounds — so the generated SQL can be unit-tested
+//! directly (see this module's tests) without standing up a database or the
+//! generic store's bound wall.
 //!
 //! Every query whose shape is identical across backends lives here; the parts
 //! that genuinely differ are supplied by a [`Dialect`]: the placeholder syntax,

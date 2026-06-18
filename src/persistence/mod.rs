@@ -19,9 +19,9 @@ mod dialect;
 mod persisted;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod query;
 mod record;
 mod schema;
-mod sql;
 mod sqlite;
 mod sqlstore;
 mod store;
@@ -43,4 +43,4 @@ pub use store::*;
 // same dialect-aware SQL as the store, so identifier quoting, placeholders, and
 // the tie-breaker can never diverge between writer and reader.
 #[cfg(feature = "serving")]
-pub(crate) use sql::range_query;
+pub(crate) use query::range_query;

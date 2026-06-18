@@ -1,7 +1,7 @@
 //! The SQL-**Dialect** seam: the small, stateless set of SQL-text facts that
 //! differ between the SQLite and PostgreSQL backends. See `CONTEXT.md`
 //! ("Dialect"). One unit-struct adapter per backend; the query-shaping
-//! functions in [`sql`](super::sql), the generic write
+//! functions in [`query`](super::query), the generic write
 //! [`SqlStore`](super::SqlStore), and the read serving backends all consume the
 //! same `Dialect` so the two sides can never drift on a placeholder or
 //! tie-breaker.
