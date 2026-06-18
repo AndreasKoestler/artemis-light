@@ -37,45 +37,12 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
-    use std::sync::{Arc, Mutex};
-
-    /// Records every action it executes.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    fn recording() -> (RecordingExecutor, Arc<Mutex<Vec<u32>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        (
-            RecordingExecutor {
-                received: Arc::clone(&received),
-            },
-            received,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<u32> for RecordingExecutor {
-        async fn execute(&mut self, action: u32) -> Result<()> {
-            self.received.lock().unwrap().push(action);
-            Ok(())
-        }
-    }
-
-    /// An executor whose execute always fails.
-    struct FailingExecutor(&'static str);
-
-    #[async_trait]
-    impl Executor<u32> for FailingExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            anyhow::bail!(self.0)
-        }
-    }
+    use crate::executor_ext::test_support::{FailingExecutor, RecordingExecutor};
 
     #[tokio::test]
     async fn primary_success_never_reaches_the_fallback() {
-        let (primary, primary_received) = recording();
-        let (fallback, fallback_received) = recording();
+        let (primary, primary_received) = RecordingExecutor::<u32>::new();
+        let (fallback, fallback_received) = RecordingExecutor::<u32>::new();
         primary.fallback(fallback).execute(7).await.unwrap();
         assert_eq!(*primary_received.lock().unwrap(), vec![7]);
         assert!(fallback_received.lock().unwrap().is_empty());
@@ -83,8 +50,8 @@ mod test {
 
     #[tokio::test]
     async fn primary_failure_routes_the_action_to_the_fallback() {
-        let (fallback, fallback_received) = recording();
-        FailingExecutor("primary down")
+        let (fallback, fallback_received) = RecordingExecutor::<u32>::new();
+        FailingExecutor::<u32>::new("primary down")
             .fallback(fallback)
             .execute(7)
             .await
@@ -94,8 +61,8 @@ mod test {
 
     #[tokio::test]
     async fn both_failing_returns_the_fallback_error() {
-        let err = FailingExecutor("primary down")
-            .fallback(FailingExecutor("fallback down"))
+        let err = FailingExecutor::<u32>::new("primary down")
+            .fallback(FailingExecutor::<u32>::new("fallback down"))
             .execute(7)
             .await
             .expect_err("both executors fail");

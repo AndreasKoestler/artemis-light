@@ -75,6 +75,7 @@ where
 mod test {
     use super::*;
     use crate::strategy_ext::StrategyExt;
+    use crate::strategy_ext::test_support::FailingStrategy;
     use futures::{StreamExt, stream};
     use std::sync::{
         Arc,
@@ -197,20 +198,6 @@ mod test {
         let mut cooled = OddPairStrategy.cooldown(Duration::from_secs(60));
         assert_eq!(actions_for(&mut cooled, 1).await, vec![1, 2]);
         assert!(actions_for(&mut cooled, 3).await.is_empty());
-    }
-
-    /// A strategy whose every method fails.
-    struct FailingStrategy;
-
-    #[async_trait]
-    impl Strategy<u32, u32> for FailingStrategy {
-        async fn sync_state(&mut self) -> Result<()> {
-            anyhow::bail!("sync failed")
-        }
-
-        async fn process_event(&mut self, _event: u32) -> Result<ActionStream<'_, u32>> {
-            anyhow::bail!("process failed")
-        }
     }
 
     #[tokio::test(start_paused = true)]

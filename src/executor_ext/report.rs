@@ -62,73 +62,13 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::executor_ext::test_support::{FailingExecutor, FlakyExecutor, RecordingExecutor};
     use crate::executor_ext::{ExecutorExt, RetryPolicy};
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-    };
     use tokio::sync::broadcast;
-
-    /// Records every action it executes; always succeeds.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    fn recording() -> (RecordingExecutor, Arc<Mutex<Vec<u32>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        (
-            RecordingExecutor {
-                received: Arc::clone(&received),
-            },
-            received,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<u32> for RecordingExecutor {
-        async fn execute(&mut self, action: u32) -> Result<()> {
-            self.received.lock().unwrap().push(action);
-            Ok(())
-        }
-    }
-
-    /// Fails its first `failures` executions, then succeeds.
-    struct FlakyExecutor {
-        failures: u32,
-        attempts: Arc<AtomicU32>,
-    }
-
-    fn flaky(failures: u32) -> FlakyExecutor {
-        FlakyExecutor {
-            failures,
-            attempts: Arc::new(AtomicU32::new(0)),
-        }
-    }
-
-    #[async_trait]
-    impl Executor<u32> for FlakyExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt < self.failures {
-                anyhow::bail!("transient failure {attempt}")
-            }
-            Ok(())
-        }
-    }
-
-    /// Always fails with a fixed message.
-    struct FailingExecutor;
-
-    #[async_trait]
-    impl Executor<u32> for FailingExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            anyhow::bail!("submission rejected")
-        }
-    }
 
     #[tokio::test]
     async fn a_success_forwards_the_action_and_reports_ok() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let (tx, mut rx) = broadcast::channel(8);
         let mut reporting = executor.report(tx);
 
@@ -147,7 +87,7 @@ mod test {
     #[tokio::test]
     async fn a_failure_returns_the_inner_error_and_reports_it() {
         let (tx, mut rx) = broadcast::channel(8);
-        let mut reporting = FailingExecutor.report(tx);
+        let mut reporting = FailingExecutor::<u32>::new("submission rejected").report(tx);
 
         let err = reporting
             .execute(9)
@@ -164,7 +104,7 @@ mod test {
     async fn reporting_is_best_effort_with_no_receiver() {
         let (tx, rx) = broadcast::channel(8);
         drop(rx); // no live receiver
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let mut reporting = executor.report(tx);
 
         reporting
@@ -178,7 +118,7 @@ mod test {
     async fn outermost_report_under_retry_reports_one_final_ok() {
         let (tx, mut rx) = broadcast::channel(8);
         // One transient failure, absorbed by retry; report is outermost.
-        let mut stack = flaky(1)
+        let mut stack = FlakyExecutor::<u32>::new(1)
             .retry(RetryPolicy {
                 max_retries: 3,
                 base_delay: std::time::Duration::from_millis(0),
@@ -209,7 +149,7 @@ mod test {
         let mut events = collector.subscribe().await.unwrap();
 
         // Executor side.
-        let (executor, _received) = recording();
+        let (executor, _received) = RecordingExecutor::<u32>::new();
         let mut reporting = executor.report(tx);
         reporting.execute(123).await.unwrap();
 

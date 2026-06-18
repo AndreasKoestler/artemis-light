@@ -70,40 +70,9 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    };
+    use crate::executor_ext::test_support::FlakyExecutor;
+    use std::sync::atomic::Ordering;
     use tokio::time::Instant;
-
-    /// Fails its first `failures` executions, then succeeds, counting every
-    /// attempt.
-    struct FlakyExecutor {
-        failures: u32,
-        attempts: Arc<AtomicU32>,
-    }
-
-    #[async_trait]
-    impl Executor<u32> for FlakyExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt < self.failures {
-                anyhow::bail!("transient failure {attempt}")
-            }
-            Ok(())
-        }
-    }
-
-    fn flaky(failures: u32) -> (FlakyExecutor, Arc<AtomicU32>) {
-        let attempts = Arc::new(AtomicU32::new(0));
-        (
-            FlakyExecutor {
-                failures,
-                attempts: Arc::clone(&attempts),
-            },
-            attempts,
-        )
-    }
 
     fn policy(max_retries: u32) -> RetryPolicy {
         RetryPolicy {
@@ -114,7 +83,8 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn first_attempt_success_needs_no_retry_and_no_delay() {
-        let (executor, attempts) = flaky(0);
+        let executor = FlakyExecutor::<u32>::new(0);
+        let attempts = executor.attempts();
         let start = Instant::now();
         executor.retry(policy(3)).execute(7).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -123,14 +93,15 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn retries_transient_failures_until_success() {
-        let (executor, attempts) = flaky(2);
+        let executor = FlakyExecutor::<u32>::new(2);
+        let attempts = executor.attempts();
         executor.retry(policy(3)).execute(7).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
     async fn backoff_doubles_between_retries() {
-        let (executor, _) = flaky(2);
+        let executor = FlakyExecutor::<u32>::new(2);
         let start = Instant::now();
         executor.retry(policy(3)).execute(7).await.unwrap();
         // Two retries: 1s before the first, 2s before the second.
@@ -139,7 +110,8 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn exhausted_retries_return_the_last_error() {
-        let (executor, attempts) = flaky(u32::MAX);
+        let executor = FlakyExecutor::<u32>::new(u32::MAX);
+        let attempts = executor.attempts();
         let err = executor
             .retry(policy(2))
             .execute(7)
@@ -152,7 +124,8 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn zero_retries_is_a_passthrough() {
-        let (executor, attempts) = flaky(u32::MAX);
+        let executor = FlakyExecutor::<u32>::new(u32::MAX);
+        let attempts = executor.attempts();
         assert!(executor.retry(policy(0)).execute(7).await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }

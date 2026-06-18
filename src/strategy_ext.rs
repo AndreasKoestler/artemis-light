@@ -5,6 +5,9 @@ mod filter_actions;
 mod filter_map_event;
 mod map_action;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use cooldown::*;
 pub use filter_actions::*;
 pub use filter_map_event::*;
@@ -63,14 +66,12 @@ impl<T: Strategy<E, A> + 'static, E, A> StrategyExt<E, A> for T {}
 #[cfg(test)]
 mod test {
     use super::StrategyExt;
+    use super::test_support::{FailingStrategy, SyncProbe};
     use crate::types::{ActionStream, Strategy};
     use anyhow::Result;
     use async_trait::async_trait;
     use futures::{StreamExt, stream};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::atomic::Ordering;
 
     /// The umbrella event type a multi-source engine would broadcast.
     #[derive(Clone, Debug)]
@@ -93,39 +94,6 @@ mod test {
 
         async fn process_event(&mut self, event: u32) -> Result<ActionStream<'_, u32>> {
             Ok(Box::pin(stream::iter(vec![event * 10])))
-        }
-    }
-
-    /// Flags when `sync_state` reaches it, for proving delegation through
-    /// wrappers.
-    struct SyncProbe {
-        synced: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl Strategy<u32, u32> for SyncProbe {
-        async fn sync_state(&mut self) -> Result<()> {
-            self.synced.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn process_event(&mut self, _event: u32) -> Result<ActionStream<'_, u32>> {
-            Ok(Box::pin(stream::empty()))
-        }
-    }
-
-    /// A strategy whose every method fails, for proving errors pass through
-    /// wrappers unchanged.
-    struct FailingStrategy;
-
-    #[async_trait]
-    impl Strategy<u32, u32> for FailingStrategy {
-        async fn sync_state(&mut self) -> Result<()> {
-            anyhow::bail!("sync failed")
-        }
-
-        async fn process_event(&mut self, _event: u32) -> Result<ActionStream<'_, u32>> {
-            anyhow::bail!("process failed")
         }
     }
 
@@ -161,11 +129,8 @@ mod test {
 
     #[tokio::test]
     async fn filter_map_event_delegates_sync_state_to_the_inner_strategy() {
-        let synced = Arc::new(AtomicBool::new(false));
-        let mut strategy = SyncProbe {
-            synced: Arc::clone(&synced),
-        }
-        .filter_map_event(|e: Event| match e {
+        let (probe, synced) = SyncProbe::new();
+        let mut strategy = probe.filter_map_event(|e: Event| match e {
             Event::Num(n) => Some(n),
             _ => None,
         });
@@ -217,11 +182,8 @@ mod test {
 
     #[tokio::test]
     async fn map_action_delegates_sync_state_and_propagates_errors() {
-        let synced = Arc::new(AtomicBool::new(false));
-        let mut probe = SyncProbe {
-            synced: Arc::clone(&synced),
-        }
-        .map_action(Action::Submit);
+        let (sync_probe, synced) = SyncProbe::new();
+        let mut probe = sync_probe.map_action(Action::Submit);
         probe.sync_state().await.unwrap();
         assert!(synced.load(Ordering::SeqCst));
 

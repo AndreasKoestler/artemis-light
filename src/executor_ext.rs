@@ -9,6 +9,9 @@ mod rate_limit;
 mod report;
 mod retry;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use circuit_breaker::*;
 pub use deadline::*;
 pub use fallback::*;
@@ -121,11 +124,10 @@ impl<T: Executor<A> + 'static, A> ExecutorExt<A> for T {}
 
 #[cfg(test)]
 mod test {
+    use super::test_support::{FailingExecutor, FlakyExecutor, RecordingExecutor};
     use super::{ExecutorExt, RetryPolicy};
     use crate::types::Executor;
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     /// The umbrella action type a multi-executor engine would broadcast.
     #[derive(Clone, Debug)]
@@ -137,36 +139,10 @@ mod test {
         Log(String),
     }
 
-    /// Records every action it executes, for proving routing and skipping.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    #[async_trait]
-    impl Executor<u32> for RecordingExecutor {
-        async fn execute(&mut self, action: u32) -> Result<()> {
-            self.received.lock().unwrap().push(action);
-            Ok(())
-        }
-    }
-
-    /// An executor whose execute always fails, for proving error passthrough.
-    struct FailingExecutor;
-
-    #[async_trait]
-    impl Executor<u32> for FailingExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            anyhow::bail!("execute failed")
-        }
-    }
-
     #[tokio::test]
     async fn filter_map_action_routes_matching_and_skips_unmatched_actions() {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = RecordingExecutor {
-            received: Arc::clone(&received),
-        }
-        .filter_map_action(|a: Action| match a {
+        let (executor, received) = RecordingExecutor::<u32>::new();
+        let mut executor = executor.filter_map_action(|a: Action| match a {
             Action::Submit(n) => Some(n),
             _ => None,
         });
@@ -184,56 +160,36 @@ mod test {
         );
     }
 
-    /// Fails its first `failures` executions, then succeeds, counting every
-    /// attempt.
-    struct FlakyExecutor {
-        failures: u32,
-        attempts: Arc<Mutex<u32>>,
-    }
-
-    #[async_trait]
-    impl Executor<u32> for FlakyExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            let mut attempts = self.attempts.lock().unwrap();
-            *attempts += 1;
-            if *attempts <= self.failures {
-                anyhow::bail!("transient failure")
-            }
-            Ok(())
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn the_reliability_stack_composes_end_to_end() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let attempts = Arc::new(Mutex::new(0));
+        let executor = FlakyExecutor::<u32>::new(1);
+        let attempts = executor.attempts();
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stack = FlakyExecutor {
-            failures: 1,
-            attempts: Arc::clone(&attempts),
-        }
-        .retry(RetryPolicy::default())
-        .circuit_breaker(std::num::NonZeroU32::new(2).unwrap())
-        .gated(Arc::clone(&flag));
+        let mut stack = executor
+            .retry(RetryPolicy::default())
+            .circuit_breaker(std::num::NonZeroU32::new(2).unwrap())
+            .gated(Arc::clone(&flag));
 
         // Gated off: the action is dropped before retry or breaker see it.
         stack.execute(1).await.unwrap();
-        assert_eq!(*attempts.lock().unwrap(), 0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
 
         // Gated on: retry absorbs the one transient failure underneath the
         // closed breaker.
         flag.store(true, Ordering::SeqCst);
         stack.execute(2).await.unwrap();
-        assert_eq!(*attempts.lock().unwrap(), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn filter_map_action_propagates_inner_errors_unchanged() {
-        let mut executor = FailingExecutor.filter_map_action(|a: Action| match a {
-            Action::Submit(n) => Some(n),
-            _ => None,
-        });
+        let mut executor =
+            FailingExecutor::<u32>::new("execute failed").filter_map_action(|a: Action| match a {
+                Action::Submit(n) => Some(n),
+                _ => None,
+            });
         assert!(executor.execute(Action::Submit(1)).await.is_err());
         // A skipped action still succeeds even on a failing inner executor.
         assert!(executor.execute(Action::Log("skip".into())).await.is_ok());

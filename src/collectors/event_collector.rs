@@ -70,6 +70,22 @@ where
     async fn polling_stream(&self) -> Result<RawEventStream<'_, E>> {
         Ok(Box::pin(self.event.watch().await?.into_stream()))
     }
+
+    /// The decoded, reorg-filtered `(block, event)` stream behind both
+    /// `subscribe` and `subscribe_indexed`. The single site that drops decode
+    /// failures and reorg retractions (via [`indexed_event`]); the live
+    /// `subscribe` projects the block number away, persistence keeps it.
+    async fn indexed_stream(&self) -> Result<CollectorStream<'_, (u64, E)>> {
+        let stream = self.raw_stream().await?;
+        let stream = stream.filter_map(|el| match el {
+            Ok((event, log)) => indexed_event(event, &log),
+            Err(e) => {
+                tracing::warn!("Failed to decode event log: {}", e);
+                None
+            }
+        });
+        Ok(Box::pin(stream))
+    }
 }
 
 /// Implementation of the [Collector](Collector) trait for the [EventCollector](EventCollector).
@@ -80,14 +96,7 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
-        let stream = self.raw_stream().await?;
-        let stream = stream.filter_map(|el| match el {
-            Ok((e, log)) => indexed_event(e, &log).map(|(_, e)| e),
-            Err(e) => {
-                tracing::warn!("Failed to decode event log: {}", e);
-                None
-            }
-        });
+        let stream = self.indexed_stream().await?.map(|(_, event)| event);
         Ok(Box::pin(stream))
     }
 }
@@ -102,15 +111,7 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, E)>> {
-        let stream = self.raw_stream().await?;
-        let stream = stream.filter_map(|el| match el {
-            Ok((event, log)) => indexed_event(event, &log),
-            Err(e) => {
-                tracing::warn!("Failed to decode event log: {}", e);
-                None
-            }
-        });
-        Ok(Box::pin(stream))
+        self.indexed_stream().await
     }
 
     async fn query_range(&self, from: u64, to: u64) -> Result<CollectorStream<'_, (u64, E)>> {

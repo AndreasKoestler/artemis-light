@@ -45,34 +45,12 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
-    use std::sync::{Mutex, atomic::Ordering};
-
-    /// Records every action it executes.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    fn recording() -> (RecordingExecutor, Arc<Mutex<Vec<u32>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        (
-            RecordingExecutor {
-                received: Arc::clone(&received),
-            },
-            received,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<u32> for RecordingExecutor {
-        async fn execute(&mut self, action: u32) -> Result<()> {
-            self.received.lock().unwrap().push(action);
-            Ok(())
-        }
-    }
+    use crate::executor_ext::test_support::RecordingExecutor;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn a_live_gate_passes_actions_through() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let flag = Arc::new(AtomicBool::new(true));
         executor.gated(Arc::clone(&flag)).execute(7).await.unwrap();
         assert_eq!(*received.lock().unwrap(), vec![7]);
@@ -80,7 +58,7 @@ mod test {
 
     #[tokio::test]
     async fn a_closed_gate_drops_actions_with_ok() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let flag = Arc::new(AtomicBool::new(false));
         executor
             .gated(Arc::clone(&flag))
@@ -92,7 +70,7 @@ mod test {
 
     #[tokio::test]
     async fn flipping_the_flag_at_runtime_is_the_kill_switch() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let flag = Arc::new(AtomicBool::new(true));
         let mut gated = executor.gated(Arc::clone(&flag));
 
@@ -111,7 +89,7 @@ mod test {
 
     #[tokio::test]
     async fn dry_run_never_reaches_the_inner_executor() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let mut dry = executor.dry_run();
         dry.execute(7).await.unwrap();
         dry.execute(8).await.unwrap();
