@@ -6,10 +6,11 @@
 use sqlx::{Row, SqlitePool};
 
 // Shared with the writer so the serving layer can never diverge on the internal
-// table name or identifier quoting: `PROGRESS_TABLE` is the bookkeeping table
-// that must stay hidden from `/tables`, and `quote_ident` matches the writer's
-// quoting exactly.
-use crate::persistence::{PROGRESS_TABLE, quote_ident};
+// table name, identifier quoting, or undefined-table classification:
+// `PROGRESS_TABLE` is the bookkeeping table that must stay hidden from
+// `/tables`, `quote_ident` matches the writer's quoting exactly, and the
+// `Dialect`'s `is_undefined_table` is the single home for "nothing written yet".
+use crate::persistence::{Dialect, PROGRESS_TABLE, SqliteDialect, quote_ident};
 
 /// List the persisted event tables: every `sqlite_master` table except the
 /// internal progress table and SQLite's own `sqlite_%` tables, sorted ascending.
@@ -91,9 +92,7 @@ pub(crate) async fn table_watermarks(pool: &SqlitePool) -> anyhow::Result<Vec<(S
     .await
     {
         Ok(rows) => rows,
-        Err(sqlx::Error::Database(e)) if e.message().contains("no such table") => {
-            return Ok(Vec::new());
-        }
+        Err(e) if SqliteDialect.is_undefined_table(&e) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     Ok(rows

@@ -104,7 +104,7 @@ mod pg {
     use super::super::json;
     use super::super::rows::Bounds;
     use super::ServingBackend;
-    use crate::persistence::{BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, quote_ident};
+    use crate::persistence::{Dialect, PROGRESS_TABLE, PgDialect, range_query};
 
     /// A read-only PostgreSQL serving backend.
     pub(crate) struct PgBackend {
@@ -136,11 +136,6 @@ mod pg {
         pub(crate) fn pool(&self) -> &PgPool {
             &self.pool
         }
-    }
-
-    /// True when `err` is PostgreSQL's `undefined_table` (SQLSTATE `42P01`).
-    fn is_undefined_table(err: &sqlx::Error) -> bool {
-        matches!(err, sqlx::Error::Database(e) if e.code().as_deref() == Some("42P01"))
     }
 
     /// Normalise a PostgreSQL `information_schema` `data_type` to the same
@@ -223,12 +218,7 @@ mod pg {
             bounds: &Bounds,
         ) -> anyhow::Result<Vec<Map<String, Value>>> {
             let columns = self.table_columns(table).await?;
-            let block = quote_ident(BLOCK_NUMBER_COLUMN);
-            let sql = format!(
-                "SELECT * FROM {table} WHERE {block} BETWEEN $1 AND $2 \
-                 ORDER BY {block} ASC, ctid ASC LIMIT $3 OFFSET $4",
-                table = quote_ident(table),
-            );
+            let sql = range_query(table, &PgDialect);
             let rows = sqlx::query(&sql)
                 .bind(bounds.from_block as i64)
                 .bind(bounds.to_block as i64)
@@ -250,7 +240,7 @@ mod pg {
             {
                 Ok(rows) => rows,
                 // Nothing written yet: the progress table does not exist.
-                Err(e) if is_undefined_table(&e) => return Ok(Vec::new()),
+                Err(e) if PgDialect.is_undefined_table(&e) => return Ok(Vec::new()),
                 Err(e) => return Err(e.into()),
             };
             Ok(rows

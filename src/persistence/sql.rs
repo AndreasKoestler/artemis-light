@@ -1,15 +1,17 @@
-//! Dialect-independent SQL shaping shared by the SQLite and PostgreSQL stores.
+//! Dialect-parameterised SQL shaping shared by the generic
+//! [`SqlStore`](super::SqlStore) and the read serving backends.
 //!
-//! [`PostgresStore`](super::PostgresStore) mirrors
-//! [`SqliteStore`](super::SqliteStore) method-for-method; the differences are
-//! dialect-only (placeholder syntax, the monotonic-watermark function, missing
-//! -table classification). The pieces that carry *no* dialect difference —
-//! which columns an insert names, the replay projection, the row-shape guard,
-//! and the row→[`Row`] decode loop — live here so the two stores cannot drift
-//! apart on the parts they genuinely share (postgres-store.PARITY.1).
+//! Every query whose shape is identical across backends lives here; the parts
+//! that genuinely differ are supplied by a [`Dialect`]: the placeholder syntax,
+//! the intra-block tie-breaker, the column-type keywords, and the
+//! monotonic-watermark upsert. The two backends therefore cannot drift apart on
+//! the parts they share (postgres-store.PARITY.1). Per-backend value binding and
+//! cell decoding are *not* here — they ride sqlx's per-database types and live
+//! in [`SqlStore`](super::SqlStore).
 
 use anyhow::Result;
 
+use super::dialect::Dialect;
 use super::schema::{
     BLOCK_NUMBER_COLUMN, PROGRESS_TABLE, Row, SqlType, SqlValue, TableSchema, quote_ident,
 };
@@ -34,25 +36,107 @@ fn select_column_list(schema: &TableSchema) -> String {
         .join(", ")
 }
 
-/// The replay `SELECT`: every event column for blocks up to (and including) the
-/// `<= {placeholder}` bound, ordered by block then `order_key` for a stable,
-/// deterministic replay. The two dialect differences are passed in — the bound
-/// placeholder (`?` for SQLite, `$1` for PostgreSQL) and the intra-block tie
-/// breaker (`rowid` / `ctid`) — so the query shape itself lives in one place.
-pub(super) fn replay_query(schema: &TableSchema, placeholder: &str, order_key: &str) -> String {
+/// `CREATE TABLE IF NOT EXISTS` for the bookkeeping progress table. `last_block`
+/// takes the dialect's integer type (INTEGER / BIGINT).
+pub(super) fn create_progress_table(dialect: &dyn Dialect) -> String {
     format!(
-        "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= {placeholder} \
-         ORDER BY {BLOCK_NUMBER_COLUMN} ASC, {order_key} ASC",
-        select_column_list(schema),
-        quote_ident(&schema.table)
+        "CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} \
+         (table_name TEXT PRIMARY KEY, last_block {} NOT NULL)",
+        dialect.column_type(SqlType::Integer)
     )
 }
 
-/// The watermark lookup: the last processed block for `table`, or no row when
-/// nothing has been written. `placeholder` is the only dialect difference
-/// (`?` for SQLite, `$1` for PostgreSQL).
-pub(super) fn last_block_query(placeholder: &str) -> String {
-    format!("SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = {placeholder}")
+/// `CREATE TABLE IF NOT EXISTS` for an event table: an implicit `block_number`
+/// column plus one column per event field, each typed by the dialect.
+pub(super) fn create_event_table(schema: &TableSchema, dialect: &dyn Dialect) -> String {
+    let mut defs = vec![format!(
+        "{BLOCK_NUMBER_COLUMN} {} NOT NULL",
+        dialect.column_type(SqlType::Integer)
+    )];
+    for c in &schema.columns {
+        defs.push(format!(
+            "{} {}",
+            quote_ident(&c.name),
+            dialect.column_type(c.ty)
+        ));
+    }
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        quote_ident(&schema.table),
+        defs.join(", ")
+    )
+}
+
+/// The per-row `INSERT`, with one dialect placeholder per bound column in
+/// [`insert_column_names`] order.
+pub(super) fn insert_statement(schema: &TableSchema, dialect: &dyn Dialect) -> String {
+    let col_names = insert_column_names(schema);
+    let placeholders = (1..=col_names.len())
+        .map(|i| dialect.placeholder(i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_ident(&schema.table),
+        col_names.join(", "),
+        placeholders
+    )
+}
+
+/// The watermark upsert: advance `last_block` for a table, monotonically, in the
+/// same transaction as its rows. Placeholders bind `(table_name, last_block)`;
+/// the monotonic max expression is the dialect's.
+pub(super) fn watermark_upsert(dialect: &dyn Dialect) -> String {
+    format!(
+        "INSERT INTO {PROGRESS_TABLE} (table_name, last_block) VALUES ({}, {}) \
+         ON CONFLICT (table_name) DO UPDATE SET {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2),
+        dialect.monotonic_watermark_set()
+    )
+}
+
+/// The watermark lookup: the last processed block for a table, or no row when
+/// nothing has been written. Binds `(table_name)`.
+pub(super) fn last_block_query(dialect: &dyn Dialect) -> String {
+    format!(
+        "SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = {}",
+        dialect.placeholder(1)
+    )
+}
+
+/// The replay `SELECT`: every event column for blocks up to (and including) the
+/// `<= placeholder` bound, ordered by block then the dialect's tie-breaker for a
+/// stable, deterministic replay. Binds `(to_block)`.
+pub(super) fn replay_query(schema: &TableSchema, dialect: &dyn Dialect) -> String {
+    format!(
+        "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= {} \
+         ORDER BY {BLOCK_NUMBER_COLUMN} ASC, {} ASC",
+        select_column_list(schema),
+        quote_ident(&schema.table),
+        dialect.placeholder(1),
+        dialect.tiebreak()
+    )
+}
+
+/// The serving layer's paged, block-range query: all columns for `table` in the
+/// inclusive `[from, to]` block range, ascending, with the dialect's tie-breaker
+/// and `LIMIT`/`OFFSET`. Binds `(from_block, to_block, limit, offset)`. The
+/// read-side twin of [`replay_query`] — both depend only on the same two dialect
+/// facts (placeholder, tie-breaker).
+#[cfg(feature = "serving")]
+pub(crate) fn range_query(table: &str, dialect: &dyn Dialect) -> String {
+    let block = quote_ident(BLOCK_NUMBER_COLUMN);
+    format!(
+        "SELECT * FROM {} WHERE {block} BETWEEN {} AND {} \
+         ORDER BY {block} ASC, {} ASC LIMIT {} OFFSET {}",
+        quote_ident(table),
+        dialect.placeholder(1),
+        dialect.placeholder(2),
+        dialect.tiebreak(),
+        dialect.placeholder(3),
+        dialect.placeholder(4),
+    )
 }
 
 /// Reject a row whose value count does not match the schema before any bind.
@@ -89,4 +173,38 @@ pub(super) fn collect_rows<R>(
         out.push(Row(values));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::dialect::SqliteDialect;
+
+    fn schema() -> TableSchema {
+        TableSchema::new("transfer")
+            .col("from", SqlType::Text)
+            .col("amount", SqlType::Numeric)
+    }
+
+    #[test]
+    fn replay_query_uses_dialect_placeholder_and_tiebreak() {
+        let q = replay_query(&schema(), &SqliteDialect);
+        assert!(q.contains("<= ?"), "{q}");
+        assert!(q.ends_with("ASC, rowid ASC"), "{q}");
+    }
+
+    #[test]
+    fn insert_statement_emits_one_placeholder_per_column() {
+        // block_number + 2 event columns = 3 placeholders.
+        let q = insert_statement(&schema(), &SqliteDialect);
+        assert!(q.contains("VALUES (?, ?, ?)"), "{q}");
+    }
+
+    #[cfg(feature = "serving")]
+    #[test]
+    fn range_query_binds_four_positions_with_tiebreak() {
+        let q = range_query("transfer", &SqliteDialect);
+        assert!(q.contains("BETWEEN ? AND ?"), "{q}");
+        assert!(q.contains("rowid ASC LIMIT ? OFFSET ?"), "{q}");
+    }
 }
