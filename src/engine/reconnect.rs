@@ -12,6 +12,8 @@
 
 use std::time::Duration;
 
+use crate::backoff::Backoff;
+
 /// Configuration for a [`ReconnectPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconnectConfig {
@@ -94,11 +96,11 @@ impl ReconnectPolicy {
         }
     }
 
-    /// `base_delay * 2^failures`, saturating rather than overflowing for large
-    /// failure counts.
+    /// The shared exponential backoff curve at the current failure count.
+    /// `failures` is 1-based here (incremented before this is read), so the
+    /// first retry already waits `2 * base_delay`.
     fn backoff(&self) -> Duration {
-        let factor = 2u32.checked_pow(self.failures).unwrap_or(u32::MAX);
-        self.config.base_delay.saturating_mul(factor)
+        Backoff::new(self.config.base_delay).delay(self.failures)
     }
 }
 

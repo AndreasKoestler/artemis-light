@@ -1,3 +1,4 @@
+use crate::backoff::Backoff;
 use crate::types::Executor;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -55,11 +56,9 @@ where
             if retries >= self.policy.max_retries {
                 return Err(error);
             }
-            // `base_delay * 2^retries`, saturating rather than overflowing
-            // for large retry counts — the same curve as the reconnect
-            // policy's backoff.
-            let factor = 2u32.checked_pow(retries).unwrap_or(u32::MAX);
-            let delay = self.policy.base_delay.saturating_mul(factor);
+            // The shared exponential backoff curve. `retries` is 0-based here,
+            // so the first retry waits exactly one `base_delay`.
+            let delay = Backoff::new(self.policy.base_delay).delay(retries);
             tracing::warn!(?delay, retries, "execute failed; retrying: {error:#}");
             tokio::time::sleep(delay).await;
             retries += 1;
