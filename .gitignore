@@ -39,3 +39,6 @@ sonar-project.properties
 
 # Git worktrees for isolated feature work
 .worktrees/
+
+# Superpowers docs (local, not committed)
+docs/superpowers
