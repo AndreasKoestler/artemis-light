@@ -303,7 +303,7 @@ mod test {
     use super::*;
 
     fn fees(max_fee: u128, priority: u128) -> Fees {
-        Fees::new(max_fee, priority)
+        Fees::clamped(max_fee, priority)
     }
 
     fn policy(max_replacements: u32, escalation_percent: u64) -> ReplacementPolicy {
@@ -342,7 +342,7 @@ mod test {
     /// Whatever the fee path, the escalated fees never violate the EIP-1559
     /// invariant — the schedule delegates to
     /// [`escalate`](crate::executors::escalate), which builds through
-    /// [`Fees::new`](crate::executors::Fees::new).
+    /// [`Fees::clamped`](crate::executors::Fees::clamped).
     #[test]
     fn schedule_preserves_the_eip1559_invariant_across_replacements() {
         let mut schedule = ReplacementSchedule::new(policy(3, 130), fees(200, 200));

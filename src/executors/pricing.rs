@@ -12,9 +12,9 @@
 
 /// An EIP-1559 fee pair with the invariant `max_priority_fee_per_gas <=
 /// max_fee_per_gas` held *by construction*: the fields are private and the only
-/// constructor, [`Fees::new`], clamps the priority fee down to the max fee. A
-/// caller — whether initial [`price_1559`] or per-replacement [`escalate`] —
-/// cannot build a pair that breaks it.
+/// constructor, [`Fees::clamped`], names the clamp it performs, so neither
+/// initial [`price_1559`] nor per-replacement [`escalate`] can emit a pair that
+/// breaks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fees {
     max_fee_per_gas: u128,
@@ -22,9 +22,12 @@ pub struct Fees {
 }
 
 impl Fees {
-    /// A fee pair, clamping `max_priority_fee_per_gas` down to `max_fee_per_gas`
-    /// so the EIP-1559 invariant holds however the inputs were priced.
-    pub fn new(max_fee_per_gas: u128, max_priority_fee_per_gas: u128) -> Self {
+    /// A fee pair, clamping `max_priority_fee_per_gas` down to `max_fee_per_gas`.
+    /// The name is the point: a priority above the cap is an *expected* outcome
+    /// of pricing — e.g. a [`price_1559`] bid whose break-even max fee falls
+    /// below the bumped tip — and silently capping the tip is the correct
+    /// behaviour. [`escalate`]'s monotonic scaling never trips the clamp.
+    pub fn clamped(max_fee_per_gas: u128, max_priority_fee_per_gas: u128) -> Self {
         Self {
             max_fee_per_gas,
             max_priority_fee_per_gas: max_priority_fee_per_gas.min(max_fee_per_gas),
@@ -67,9 +70,9 @@ pub struct GasBidInfo {
 /// provider's suggestion scaled by `bump_percent` and `max_fee` is the base
 /// headroom plus that bumped priority. With a `bid`, `max_fee` is the
 /// opportunity's break-even (`total_profit / gas_usage`) taken at
-/// `bid_percentage`. Either way the result is built through [`Fees::new`], which
-/// preserves the `priority <= max_fee` invariant — the bid arm can price
-/// `max_fee` below the bumped priority.
+/// `bid_percentage`. Either way the result is built through [`Fees::clamped`]:
+/// the bid arm can legitimately price `max_fee` below the bumped priority, and
+/// capping the tip to the bid ceiling is the correct outcome there.
 pub fn price_1559(
     est: FeeEstimate,
     gas_usage: u64,
@@ -102,15 +105,16 @@ pub fn price_1559(
         None => (base_headroom + bumped_priority, bumped_priority),
     };
 
-    Ok(Fees::new(max_fee_per_gas, max_priority_fee_per_gas))
+    Ok(Fees::clamped(max_fee_per_gas, max_priority_fee_per_gas))
 }
 
 /// Escalate both fee fields for a replacement transaction by
 /// `escalation_percent`. With `escalation_percent >= 110` (enforced by
 /// [`EscalationPercent`](crate::executors::EscalationPercent) at construction)
-/// both fields rise by at least the node's ~10% minimum bump. Scaling is
-/// monotonic so the `priority <= max_fee` invariant survives, and the result is
-/// built through [`Fees::new`] regardless.
+/// both fields rise by at least the node's ~10% minimum bump. Scaling both
+/// fields by the same factor (and the shared saturation to `u128::MAX`) is
+/// monotonic, so an already-valid pair stays valid; the [`Fees::clamped`] build
+/// is therefore a no-op on the invariant and simply can't emit an invalid pair.
 pub fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
     let scale = |v: u128| {
         // Multiply-then-divide keeps the result exact for the realistic fee
@@ -121,7 +125,7 @@ pub fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
             None => u128::MAX,
         }
     };
-    Fees::new(
+    Fees::clamped(
         scale(fees.max_fee_per_gas),
         scale(fees.max_priority_fee_per_gas),
     )
@@ -139,15 +143,15 @@ mod test {
     }
 
     #[test]
-    fn new_clamps_priority_to_max_fee() {
-        let fees = Fees::new(50, 80);
+    fn clamped_clamps_priority_to_max_fee() {
+        let fees = Fees::clamped(50, 80);
         assert_eq!(fees.max_fee_per_gas(), 50);
         assert_eq!(fees.max_priority_fee_per_gas(), 50);
     }
 
     #[test]
-    fn new_leaves_a_valid_pair_untouched() {
-        let fees = Fees::new(100, 10);
+    fn clamped_leaves_a_valid_pair_untouched() {
+        let fees = Fees::clamped(100, 10);
         assert_eq!(fees.max_fee_per_gas(), 100);
         assert_eq!(fees.max_priority_fee_per_gas(), 10);
     }
@@ -224,7 +228,7 @@ mod test {
 
     #[test]
     fn escalate_raises_both_fields_by_the_percentage() {
-        let fees = Fees::new(200, 20);
+        let fees = Fees::clamped(200, 20);
         let bumped = escalate(fees, 125);
         assert_eq!(bumped.max_fee_per_gas(), 250);
         assert_eq!(bumped.max_priority_fee_per_gas(), 25);
@@ -232,7 +236,7 @@ mod test {
 
     #[test]
     fn escalate_at_the_minimum_raises_at_least_ten_percent() {
-        let fees = Fees::new(100, 10);
+        let fees = Fees::clamped(100, 10);
         let bumped = escalate(fees, 110);
         assert!(bumped.max_fee_per_gas() >= 110);
         assert!(bumped.max_priority_fee_per_gas() >= 11);
@@ -240,14 +244,14 @@ mod test {
 
     #[test]
     fn escalate_preserves_the_invariant() {
-        let fees = Fees::new(200, 200);
+        let fees = Fees::clamped(200, 200);
         let bumped = escalate(fees, 130);
         assert!(bumped.max_priority_fee_per_gas() <= bumped.max_fee_per_gas());
     }
 
     #[test]
     fn escalate_saturates_on_huge_fees() {
-        let fees = Fees::new(u128::MAX, u128::MAX);
+        let fees = Fees::clamped(u128::MAX, u128::MAX);
         let bumped = escalate(fees, 200);
         assert_eq!(bumped.max_fee_per_gas(), u128::MAX);
     }
