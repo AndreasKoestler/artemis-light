@@ -60,39 +60,16 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
+    use crate::executor_ext::test_support::{FailingExecutor, RecordingExecutor};
     use std::num::NonZeroU32;
-    use std::sync::{Arc, Mutex};
 
     fn nz(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
     }
 
-    /// Records every action it executes.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    fn recording() -> (RecordingExecutor, Arc<Mutex<Vec<u32>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        (
-            RecordingExecutor {
-                received: Arc::clone(&received),
-            },
-            received,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<u32> for RecordingExecutor {
-        async fn execute(&mut self, action: u32) -> Result<()> {
-            self.received.lock().unwrap().push(action);
-            Ok(())
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn actions_under_the_cap_pass_without_waiting() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let mut limited = executor.rate_limit(nz(3));
         let start = Instant::now();
         for n in 0..3 {
@@ -104,7 +81,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn the_action_over_the_cap_waits_out_the_window() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<u32>::new();
         let mut limited = executor.rate_limit(nz(2));
         let start = Instant::now();
         for n in 0..3 {
@@ -118,7 +95,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn the_window_slides_rather_than_resetting() {
-        let (executor, _) = recording();
+        let (executor, _) = RecordingExecutor::<u32>::new();
         let mut limited = executor.rate_limit(nz(1));
         let start = Instant::now();
         for n in 0..3 {
@@ -129,19 +106,9 @@ mod test {
         assert_eq!(start.elapsed(), Duration::from_secs(2));
     }
 
-    /// An executor whose execute always fails.
-    struct FailingExecutor;
-
-    #[async_trait]
-    impl Executor<u32> for FailingExecutor {
-        async fn execute(&mut self, _action: u32) -> Result<()> {
-            anyhow::bail!("execute failed")
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn failed_attempts_propagate_and_still_count_against_the_window() {
-        let mut limited = FailingExecutor.rate_limit(nz(1));
+        let mut limited = FailingExecutor::<u32>::new("execute failed").rate_limit(nz(1));
         let start = Instant::now();
         assert!(limited.execute(0).await.is_err());
         assert!(limited.execute(1).await.is_err());

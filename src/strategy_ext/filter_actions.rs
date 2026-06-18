@@ -49,11 +49,9 @@ where
 mod test {
     use super::*;
     use crate::strategy_ext::StrategyExt;
+    use crate::strategy_ext::test_support::{FailingStrategy, SyncProbe};
     use futures::{StreamExt, stream};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::atomic::Ordering;
 
     /// Emits its event and the two following numbers as actions.
     struct TripleStrategy;
@@ -93,46 +91,12 @@ mod test {
         assert!(actions.is_empty());
     }
 
-    /// Flags when `sync_state` reaches it.
-    struct SyncProbe {
-        synced: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl Strategy<u32, u32> for SyncProbe {
-        async fn sync_state(&mut self) -> Result<()> {
-            self.synced.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn process_event(&mut self, _event: u32) -> Result<ActionStream<'_, u32>> {
-            Ok(Box::pin(stream::empty()))
-        }
-    }
-
     #[tokio::test]
     async fn sync_state_is_delegated_to_the_inner_strategy() {
-        let synced = Arc::new(AtomicBool::new(false));
-        let mut strategy = SyncProbe {
-            synced: Arc::clone(&synced),
-        }
-        .filter_actions(|_: &u32| true);
+        let (probe, synced) = SyncProbe::new();
+        let mut strategy = probe.filter_actions(|_: &u32| true);
         strategy.sync_state().await.unwrap();
         assert!(synced.load(Ordering::SeqCst));
-    }
-
-    /// A strategy whose every method fails.
-    struct FailingStrategy;
-
-    #[async_trait]
-    impl Strategy<u32, u32> for FailingStrategy {
-        async fn sync_state(&mut self) -> Result<()> {
-            anyhow::bail!("sync failed")
-        }
-
-        async fn process_event(&mut self, _event: u32) -> Result<ActionStream<'_, u32>> {
-            anyhow::bail!("process failed")
-        }
     }
 
     #[tokio::test]

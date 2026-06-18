@@ -51,10 +51,9 @@ where
 mod test {
     use super::*;
     use crate::executor_ext::ExecutorExt;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-    };
+    use crate::executor_ext::test_support::{FailingExecutor, RecordingExecutor};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// An action stamped with the freshness window it was priced against.
@@ -87,62 +86,21 @@ mod test {
         }
     }
 
-    /// Records the id of every action it executes.
-    struct RecordingExecutor {
-        received: Arc<Mutex<Vec<u32>>>,
-    }
-
-    fn recording() -> (RecordingExecutor, Arc<Mutex<Vec<u32>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        (
-            RecordingExecutor {
-                received: Arc::clone(&received),
-            },
-            received,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<TimedAction> for RecordingExecutor {
-        async fn execute(&mut self, action: TimedAction) -> Result<()> {
-            self.received.lock().unwrap().push(action.id);
-            Ok(())
-        }
-    }
-
-    /// Fails every execution, counting attempts.
-    struct FailingExecutor {
-        attempts: Arc<AtomicU32>,
-    }
-
-    fn failing() -> (FailingExecutor, Arc<AtomicU32>) {
-        let attempts = Arc::new(AtomicU32::new(0));
-        (
-            FailingExecutor {
-                attempts: Arc::clone(&attempts),
-            },
-            attempts,
-        )
-    }
-
-    #[async_trait]
-    impl Executor<TimedAction> for FailingExecutor {
-        async fn execute(&mut self, _action: TimedAction) -> Result<()> {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("submission failed")
-        }
+    /// The ids a `RecordingExecutor<TimedAction>` saw, in execution order.
+    fn ids(received: &Arc<Mutex<Vec<TimedAction>>>) -> Vec<u32> {
+        received.lock().unwrap().iter().map(|a| a.id).collect()
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_live_action_passes_through() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<TimedAction>::new();
         executor.deadline().execute(live(7)).await.unwrap();
-        assert_eq!(*received.lock().unwrap(), vec![7]);
+        assert_eq!(ids(&received), vec![7]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_expired_action_is_dropped_with_ok() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<TimedAction>::new();
         executor
             .deadline()
             .execute(expired(7))
@@ -153,7 +111,7 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn an_action_expires_when_time_advances_past_its_deadline() {
-        let (executor, received) = recording();
+        let (executor, received) = RecordingExecutor::<TimedAction>::new();
         let mut deadline = executor.deadline();
         let action = TimedAction {
             id: 7,
@@ -165,7 +123,7 @@ mod test {
         deadline.execute(action).await.unwrap();
 
         assert_eq!(
-            *received.lock().unwrap(),
+            ids(&received),
             vec![7],
             "only the pre-expiry submission reaches the inner executor"
         );
@@ -173,7 +131,8 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn inner_errors_propagate_for_live_actions() {
-        let (executor, attempts) = failing();
+        let executor = FailingExecutor::<TimedAction>::new("submission failed");
+        let attempts = executor.attempts();
         let err = executor
             .deadline()
             .execute(live(7))
@@ -187,7 +146,8 @@ mod test {
     async fn an_action_expiring_mid_backoff_stops_the_retry_loop() {
         use crate::executor_ext::RetryPolicy;
 
-        let (executor, attempts) = failing();
+        let executor = FailingExecutor::<TimedAction>::new("submission failed");
+        let attempts = executor.attempts();
         let mut stack = executor.deadline().retry(RetryPolicy {
             max_retries: 3,
             base_delay: Duration::from_secs(1),
@@ -210,7 +170,8 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn an_expired_drop_does_not_count_against_the_circuit_breaker() {
-        let (executor, attempts) = failing();
+        let executor = FailingExecutor::<TimedAction>::new("submission failed");
+        let attempts = executor.attempts();
         let breaker = executor
             .deadline()
             .circuit_breaker(std::num::NonZeroU32::new(1).unwrap());
