@@ -17,9 +17,10 @@ use sqlx::SqlitePool;
 
 use super::error::ServingError;
 use super::json;
-// Shared with the writer: `quote_ident` matches the writer's identifier quoting,
-// and `BLOCK_NUMBER_COLUMN` is the implicit per-row block column the writer adds.
-use crate::persistence::{BLOCK_NUMBER_COLUMN, quote_ident};
+// Shared with the writer: `range_query` shapes the paged range query through the
+// same dialect-aware SQL the store uses, so identifier quoting, placeholders,
+// and the intra-block tie-breaker match the writer exactly.
+use crate::persistence::{SqliteDialect, range_query};
 
 /// Raw query parameters, parsed as strings so invalid values can be reported
 /// precisely as [`ServingError::InvalidQuery`] rather than via axum's default
@@ -92,12 +93,7 @@ pub(crate) async fn query_rows(
     // for every table the persistence layer creates. `list_tables` surfaces any
     // non-internal table in the file, so a foreign table created by other tooling
     // sharing the DB would fail here (no `block_number`), surfacing as a 500.
-    let block = quote_ident(BLOCK_NUMBER_COLUMN);
-    let sql = format!(
-        "SELECT * FROM {table} WHERE {block} BETWEEN ? AND ? \
-         ORDER BY {block} ASC, rowid ASC LIMIT ? OFFSET ?",
-        table = quote_ident(table),
-    );
+    let sql = range_query(table, &SqliteDialect);
     let rows = sqlx::query(&sql)
         .bind(bounds.from_block as i64)
         .bind(bounds.to_block as i64)

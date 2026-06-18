@@ -134,6 +134,35 @@ _Avoid_: live stream, subscription
 The number of blocks a block must be buried under before the Persisted Collector writes it (default 1). The Live Tail buffers the most recent Confirmation-Depth blocks; a reorg shallower than the depth is corrected in the buffer before any orphaned row is written, while a reorg deeper than it halts persistence and a restart re-syncs. Events are still delivered live and immediately — only the Store write lags.
 _Avoid_: finality, confirmations count, lag
 
+**Dialect**:
+The small, stateless set of SQL-text substitution facts that differ between the
+SQLite and PostgreSQL backends: the positional-placeholder syntax (`?` vs `$N`),
+the intra-block tie-breaker for a stable order (`rowid` vs `ctid`), the
+column-type keyword each `SqlType` maps to (the implicit `block_number` type
+falls out of this — INTEGER vs BIGINT), the monotonic-watermark upsert
+expression (`MAX` vs `GREATEST`), and the "nothing written yet" /
+undefined-table classification (driver message match vs SQLSTATE `42P01`). A
+trait with one adapter per backend (`SqliteDialect`, `PgDialect`); the
+query-shaping free functions, the write **Store** (generic over it,
+`SqlStore<DB, D>`), and the read serving backends (holding it as a value) all
+consume the same Dialect, so the two sides can never drift on a placeholder or
+tie-breaker. A Dialect substitutes tokens into an otherwise-shared query — it
+does not know how a backend enumerates its own tables (that is the **Catalog**).
+_Avoid_: driver, flavour, backend
+
+**Catalog**:
+How a backend enumerates *its own* schema. The persistence layer keeps no
+runtime table registry, so the serving layer reads each engine's native
+catalog: SQLite's `sqlite_master` + `PRAGMA table_info`, PostgreSQL's
+`information_schema`. These are structurally different queries — different
+result columns, different type-normalisation — so the Catalog is its own seam
+(one adapter per backend), separate from the token-level **Dialect**. The write
+**Store** has no Catalog concern: it creates tables, never lists them. A future
+`information_schema`-family backend (MySQL, …) would join PostgreSQL on the
+Catalog axis while still carrying its own Dialect, which is why the two seams
+are kept apart rather than merged into one per-backend type.
+_Avoid_: introspection, schema reader, information_schema (name the seam)
+
 ## Relationships
 
 - An **Engine** spawns one **Collector Driver** per **Collector**; each Driver owns one **Reconnect Policy** instance.
@@ -142,6 +171,7 @@ _Avoid_: finality, confirmations count, lag
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail. The Live Tail's write lags the live edge by the **Confirmation Depth**, so a reorg shallower than that depth is corrected in the buffer rather than halting persistence (a deeper reorg still halts).
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
+- A **Store** and the read-side serving backends share one **Dialect** (placeholder, tie-breaker, column type, monotonic-watermark upsert, undefined-table classification): the write side is generic over it (`SqlStore<DB, D>` owns the orchestration, the Dialect supplies the differing tokens), the read side holds it as a value. They do *not* share a **Catalog** — table enumeration stays per-backend because the catalogs are structurally different, and the write side has no catalog concern at all.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
 - The reliability wrappers (**Deadline**, **Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them; `deadline` belongs innermost, so every queueing and waiting layer above it has already elapsed by the time the expiry check runs.
