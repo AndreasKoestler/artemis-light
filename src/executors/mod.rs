@@ -5,4 +5,9 @@
 /// This executor submits transactions to the public mempool.
 mod mempool_executor;
 
+/// EIP-1559 fee pricing and replacement-fee escalation — the pure fee
+/// arithmetic the mempool executor and its replacement loop share.
+mod pricing;
+
 pub use mempool_executor::*;
+pub use pricing::*;

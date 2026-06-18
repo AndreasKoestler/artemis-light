@@ -45,6 +45,10 @@ pub mod executors;
 /// This module contains the core type definitions for Artemis.
 pub mod types;
 
+/// The exponential [backoff](backoff::Backoff) curve shared by the
+/// execution-side retry wrapper and the collector-side reconnect policy.
+pub mod backoff;
+
 /// This module contains persistence: a SQL [`Store`](persistence::Store) and a
 /// [`Persisted`](persistence::Persisted) collector wrapper that records events
 /// and replays them on subscribe.

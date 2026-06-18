@@ -5,66 +5,13 @@ use crate::types::Executor;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use super::pricing::{FeeEstimate, Fees, GasBidInfo, escalate, price_1559};
+
 use alloy::{
     network::TransactionBuilder, providers::Provider, rpc::types::eth::TransactionRequest,
 };
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// An EIP-1559 fee pair. Invariant: `max_priority_fee_per_gas <= max_fee_per_gas`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fees {
-    pub max_fee_per_gas: u128,
-    pub max_priority_fee_per_gas: u128,
-}
-
-/// A provider's EIP-1559 fee suggestion (the shape of
-/// `Provider::estimate_eip1559_fees`).
-#[derive(Debug, Clone, Copy)]
-pub struct FeeEstimate {
-    pub max_fee_per_gas: u128,
-    pub max_priority_fee_per_gas: u128,
-}
-
-/// Price a transaction's EIP-1559 fees. See the module/spec for the algorithm.
-fn price_1559(
-    est: FeeEstimate,
-    gas_usage: u64,
-    bump_percent: u64,
-    bid: Option<&GasBidInfo>,
-) -> anyhow::Result<Fees> {
-    let base_headroom = est
-        .max_fee_per_gas
-        .saturating_sub(est.max_priority_fee_per_gas);
-    let bumped_priority = est.max_priority_fee_per_gas * bump_percent as u128 / 100;
-
-    let (max_fee_per_gas, max_priority_fee_per_gas) = match bid {
-        Some(bid) => {
-            if bid.bid_percentage > 100 {
-                return Err(anyhow::anyhow!(
-                    "bid_percentage {} exceeds 100: the gas bid would cost more \
-                     than the opportunity's total profit",
-                    bid.bid_percentage
-                ));
-            }
-            if gas_usage == 0 {
-                return Err(anyhow::anyhow!(
-                    "Gas estimation returned 0, cannot calculate bid price"
-                ));
-            }
-            let breakeven = bid.total_profit / gas_usage as u128;
-            let max_fee = breakeven * bid.bid_percentage as u128 / 100;
-            // Preserve the EIP-1559 invariant: priority can't exceed max_fee.
-            (max_fee, bumped_priority.min(max_fee))
-        }
-        None => (base_headroom + bumped_priority, bumped_priority),
-    };
-
-    Ok(Fees {
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-    })
-}
 
 /// A validated fee multiplier per replacement, as a percentage. Constructed
 /// only through [`EscalationPercent::new`], which rejects anything below 110 —
@@ -109,26 +56,6 @@ pub struct ReplacementPolicy {
     pub escalation_percent: EscalationPercent,
 }
 
-/// Escalate both fee fields for a replacement transaction by
-/// `escalation_percent`. With `escalation_percent >= 110` (enforced at
-/// construction) both fields rise by at least the node's ~10% minimum bump,
-/// and the `priority <= max_fee` invariant is preserved.
-fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
-    let scale = |v: u128| {
-        // Multiply-then-divide keeps the result exact for the realistic fee
-        // range; if the intermediate product overflows, saturate to `u128::MAX`
-        // rather than wrapping or losing the `/100` precision on small fees.
-        match v.checked_mul(escalation_percent as u128) {
-            Some(product) => product / 100,
-            None => u128::MAX,
-        }
-    };
-    Fees {
-        max_fee_per_gas: scale(fees.max_fee_per_gas),
-        max_priority_fee_per_gas: scale(fees.max_priority_fee_per_gas),
-    }
-}
-
 /// The escalate-or-give-up half of the replacement loop, factored out of the
 /// I/O so the fee schedule and the give-up boundary are testable without a
 /// chain — the execution-side counterpart of the collector-side
@@ -161,7 +88,7 @@ impl ReplacementSchedule {
     /// After a submission failed to confirm, escalate to the next replacement's
     /// fees, or return `None` once `max_replacements` escalations have been
     /// issued — the signal to give up. The `priority <= max_fee` invariant is
-    /// preserved by [`escalate`].
+    /// preserved by the [`escalate`](crate::executors::escalate) fee math.
     fn escalate(&mut self) -> Option<Fees> {
         if self.issued >= self.max_replacements {
             return None;
@@ -286,8 +213,8 @@ impl<M: Provider> MempoolExecutor<M> {
                         replacement = schedule.issued(),
                         "transaction unconfirmed ({e:#}); replacing at escalated fee"
                     );
-                    tx.set_max_fee_per_gas(next.max_fee_per_gas);
-                    tx.set_max_priority_fee_per_gas(next.max_priority_fee_per_gas);
+                    tx.set_max_fee_per_gas(next.max_fee_per_gas());
+                    tx.set_max_priority_fee_per_gas(next.max_priority_fee_per_gas());
                     pending = tokio::time::timeout(
                         self.rpc_timeout,
                         self.client.send_transaction(tx.clone()),
@@ -299,18 +226,6 @@ impl<M: Provider> MempoolExecutor<M> {
             }
         }
     }
-}
-
-/// Information about the gas bid for a transaction.
-#[derive(Debug, Clone)]
-pub struct GasBidInfo {
-    /// Total profit expected from opportunity
-    pub total_profit: u128,
-
-    /// Percentage of bid profit to use for gas, at most 100: bidding the whole
-    /// profit (100) breaks even; anything above it makes the transaction
-    /// itself the loss, so the executor refuses such actions.
-    pub bid_percentage: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -369,10 +284,10 @@ where
         // filler doesn't estimate a second time (an extra RPC per action, and a
         // limit that could diverge from the one priced).
         action.tx.set_gas_limit(gas_usage);
-        action.tx.set_max_fee_per_gas(fees.max_fee_per_gas);
+        action.tx.set_max_fee_per_gas(fees.max_fee_per_gas());
         action
             .tx
-            .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+            .set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas());
 
         // Fire-and-forget unless a replacement policy is configured; the
         // confirmation-watch-and-escalate loop lives in `send_with_replacement`.
@@ -387,130 +302,8 @@ where
 mod test {
     use super::*;
 
-    fn est(max_fee: u128, priority: u128) -> FeeEstimate {
-        FeeEstimate {
-            max_fee_per_gas: max_fee,
-            max_priority_fee_per_gas: priority,
-        }
-    }
-
-    #[test]
-    fn no_bid_rides_priority_on_base_headroom() {
-        // headroom = 100 - 10 = 90; bump 100% leaves priority = 10.
-        let fees = price_1559(est(100, 10), 21_000, 100, None).unwrap();
-        assert_eq!(fees.max_priority_fee_per_gas, 10);
-        assert_eq!(fees.max_fee_per_gas, 90 + 10);
-    }
-
-    #[test]
-    fn no_bid_applies_the_priority_bump() {
-        // bump 150% on priority 10 -> 15; headroom 90 unchanged.
-        let fees = price_1559(est(100, 10), 21_000, 150, None).unwrap();
-        assert_eq!(fees.max_priority_fee_per_gas, 15);
-        assert_eq!(fees.max_fee_per_gas, 90 + 15);
-    }
-
-    #[test]
-    fn bid_caps_max_fee_at_the_breakeven_share() {
-        // total_profit 2_100_000, gas 21_000 -> breakeven 100/gas unit;
-        // bid 50% -> max_fee 50.
-        let bid = GasBidInfo {
-            total_profit: 2_100_000,
-            bid_percentage: 50,
-        };
-        let fees = price_1559(est(1_000, 10), 21_000, 100, Some(&bid)).unwrap();
-        assert_eq!(fees.max_fee_per_gas, 50);
-        // priority (bumped 10) fits under the cap.
-        assert_eq!(fees.max_priority_fee_per_gas, 10);
-    }
-
-    #[test]
-    fn a_low_bid_cap_clamps_priority_to_max_fee() {
-        // breakeven 100/unit, bid 5% -> max_fee 5; priority would be 10, clamps to 5.
-        let bid = GasBidInfo {
-            total_profit: 2_100_000,
-            bid_percentage: 5,
-        };
-        let fees = price_1559(est(1_000, 10), 21_000, 100, Some(&bid)).unwrap();
-        assert_eq!(fees.max_fee_per_gas, 5);
-        assert_eq!(fees.max_priority_fee_per_gas, 5);
-        assert!(fees.max_priority_fee_per_gas <= fees.max_fee_per_gas);
-    }
-
-    #[test]
-    fn over_100_percent_bid_is_rejected() {
-        let bid = GasBidInfo {
-            total_profit: 100,
-            bid_percentage: 101,
-        };
-        assert!(price_1559(est(100, 10), 21_000, 100, Some(&bid)).is_err());
-    }
-
-    #[test]
-    fn zero_gas_with_a_bid_is_rejected() {
-        let bid = GasBidInfo {
-            total_profit: 100,
-            bid_percentage: 50,
-        };
-        assert!(price_1559(est(100, 10), 0, 100, Some(&bid)).is_err());
-    }
-
-    #[test]
-    fn a_malformed_estimate_yields_zero_headroom_without_panic() {
-        // priority > max_fee: saturating headroom = 0; priority bump = 100.
-        // max_fee = headroom (0) + bumped priority (100) = 100.
-        let fees = price_1559(est(10, 100), 21_000, 100, None).unwrap();
-        assert_eq!(fees.max_fee_per_gas, 100);
-        assert_eq!(fees.max_priority_fee_per_gas, 100);
-    }
-
-    #[test]
-    fn escalate_raises_both_fields_by_the_percentage() {
-        let fees = Fees {
-            max_fee_per_gas: 200,
-            max_priority_fee_per_gas: 20,
-        };
-        let bumped = escalate(fees, 125);
-        assert_eq!(bumped.max_fee_per_gas, 250);
-        assert_eq!(bumped.max_priority_fee_per_gas, 25);
-    }
-
-    #[test]
-    fn escalate_at_the_minimum_raises_at_least_ten_percent() {
-        let fees = Fees {
-            max_fee_per_gas: 100,
-            max_priority_fee_per_gas: 10,
-        };
-        let bumped = escalate(fees, 110);
-        assert!(bumped.max_fee_per_gas >= 110);
-        assert!(bumped.max_priority_fee_per_gas >= 11);
-    }
-
-    #[test]
-    fn escalate_preserves_the_invariant() {
-        let fees = Fees {
-            max_fee_per_gas: 200,
-            max_priority_fee_per_gas: 200,
-        };
-        let bumped = escalate(fees, 130);
-        assert!(bumped.max_priority_fee_per_gas <= bumped.max_fee_per_gas);
-    }
-
-    #[test]
-    fn escalate_saturates_on_huge_fees() {
-        let fees = Fees {
-            max_fee_per_gas: u128::MAX,
-            max_priority_fee_per_gas: u128::MAX,
-        };
-        let bumped = escalate(fees, 200);
-        assert_eq!(bumped.max_fee_per_gas, u128::MAX);
-    }
-
     fn fees(max_fee: u128, priority: u128) -> Fees {
-        Fees {
-            max_fee_per_gas: max_fee,
-            max_priority_fee_per_gas: priority,
-        }
+        Fees::new(max_fee, priority)
     }
 
     fn policy(max_replacements: u32, escalation_percent: u64) -> ReplacementPolicy {
@@ -547,12 +340,14 @@ mod test {
     }
 
     /// Whatever the fee path, the escalated fees never violate the EIP-1559
-    /// invariant — the schedule delegates to [`escalate`], which preserves it.
+    /// invariant — the schedule delegates to
+    /// [`escalate`](crate::executors::escalate), which builds through
+    /// [`Fees::new`](crate::executors::Fees::new).
     #[test]
     fn schedule_preserves_the_eip1559_invariant_across_replacements() {
         let mut schedule = ReplacementSchedule::new(policy(3, 130), fees(200, 200));
         while let Some(f) = schedule.escalate() {
-            assert!(f.max_priority_fee_per_gas <= f.max_fee_per_gas);
+            assert!(f.max_priority_fee_per_gas() <= f.max_fee_per_gas());
         }
     }
 }

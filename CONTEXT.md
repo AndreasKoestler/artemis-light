@@ -45,6 +45,10 @@ _Avoid_: concat, append
 An Executor wrapper that re-submits a failed action with exponential backoff, per its **Retry Policy** (max retries + base delay), returning the last error once retries are exhausted. The execution-side counterpart of the **Reconnect Policy** — distinct from that policy's *Retry* decision, which concerns Collector streams.
 _Avoid_: resubmit loop, retry handler
 
+**Backoff**:
+The exponential curve `base_delay * 2^attempt` (saturating) that both the **Retry** wrapper and the **Reconnect Policy** wait out between attempts. Stateless — it owns no counter and no clock; each caller keeps its own attempt count (Retry's resets per action, the Reconnect Policy's resets on a delivered event) and asks the curve only for a given attempt's delay. The single home for the backoff curve the two sides used to duplicate.
+_Avoid_: delay, sleep, "exponential backoff" (name the module)
+
 **Fallback**:
 Tries a primary and re-routes to a secondary on failure. Two duals:
 - **Executor Fallback**: tries a primary Executor and re-submits the action to a secondary on a *submit* error — primary RPC → backup RPC, or private relay → public mempool. The primary's error is logged; only the fallback's verdict is returned.
@@ -156,4 +160,4 @@ _Avoid_: finality, confirmations count, lag
 
 - "retry" was used for both a single backoff-and-reconnect step and the whole give-up-or-keep-trying policy — resolved: a single step is a **Retry** decision; the state machine that emits those decisions is the **Reconnect Policy**.
 - A persistent stream-*creation* failure and a persistent stream-*end* are the same concept to the Reconnect Policy: both feed one counter and both can reach **Fatal**. The earlier code treated creation-failure as a quiet task exit — that asymmetry was an accidental gap, not a decision.
-- "Retry" now names two things: the Reconnect Policy's per-step *decision* on the Collector side, and the Executor wrapper on the execution side. Context disambiguates — streams reconnect, submissions retry — and both share the same backoff curve idiom.
+- "Retry" now names two things: the Reconnect Policy's per-step *decision* on the Collector side, and the Executor wrapper on the execution side. Context disambiguates — streams reconnect, submissions retry — and both wait out the same **Backoff** curve, now a single module rather than a duplicated idiom.
