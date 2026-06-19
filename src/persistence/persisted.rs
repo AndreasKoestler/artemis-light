@@ -43,9 +43,58 @@ pub trait PersistExt<E>: PersistableCollector<E> + Sized {
     fn with_persistence<S: Store>(self, store: S) -> Persisted<Self, S> {
         Persisted::new(self, store)
     }
+
+    /// The standard restart-resilient configuration in one call: persist into
+    /// `store`, begin the very first backfill at `start_block` (stored history
+    /// beyond it still wins; see [`Persisted::with_start_block`]), and buffer
+    /// `confirmation_depth` blocks before a row reaches the store (see
+    /// [`Persisted::with_confirmation_depth`]). Equivalent to chaining
+    /// [`with_persistence`](Self::with_persistence), `with_start_block`, and
+    /// `with_confirmation_depth`.
+    fn persisted<S: Store>(
+        self,
+        store: S,
+        start_block: u64,
+        confirmation_depth: NonZeroU64,
+    ) -> Persisted<Self, S> {
+        self.with_persistence(store)
+            .with_start_block(start_block)
+            .with_confirmation_depth(confirmation_depth)
+    }
 }
 
 impl<E, C: PersistableCollector<E> + Sized> PersistExt<E> for C {}
+
+/// Build a restart-resilient persisted [`EventCollector`] from an alloy contract
+/// event filter. Clones the provider into the filter, wraps it in an
+/// [`EventCollector`], and configures it via [`PersistExt::persisted`] so it
+/// replays stored history from `store` and backfills the `[start_block..tip]`
+/// gap before following the chain tip — buffering `confirmation_depth` blocks
+/// before a row is persisted.
+///
+/// This is the canonical way an indexer turns a single-address contract event
+/// filter into a persisted collector; without it each call site re-spells the
+/// `EventCollector::new(filter.with_cloned_provider()).persisted(..)` chain.
+///
+/// ```ignore
+/// let transfers = persisted_event_collector!(
+///     pool.Transfer_filter(), events_store.clone(), from_block, confirmation_depth,
+/// );
+/// ```
+///
+/// [`EventCollector`]: crate::collectors::EventCollector
+/// [`PersistExt::persisted`]: crate::persistence::PersistExt::persisted
+#[macro_export]
+macro_rules! persisted_event_collector {
+    ($filter:expr, $store:expr, $start_block:expr, $confirmation_depth:expr $(,)?) => {
+        $crate::persistence::PersistExt::persisted(
+            $crate::collectors::EventCollector::new($filter.with_cloned_provider()),
+            $store,
+            $start_block,
+            $confirmation_depth,
+        )
+    };
+}
 
 /// The default upper bound on blocks per backfill `query_range` call. Sized to
 /// fit within common provider `eth_getLogs` range caps.
