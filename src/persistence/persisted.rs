@@ -123,6 +123,11 @@ pub struct Persisted<C, S> {
     ///
     /// [`with_confirmation_depth`]: Persisted::with_confirmation_depth
     confirmation_depth: u64,
+    /// When set, cap the backfill at this block and skip the live tail entirely.
+    /// The stream ends naturally once backfill-to-`to_block` is exhausted. Used
+    /// in bounded/testing contexts where only historical data is needed (e.g. a
+    /// Tier-2 accounting cross-check that pins to a snapshot block).
+    to_block: Option<u64>,
     /// Whether stored history has already been replayed to a subscriber. The
     /// engine re-subscribes after a stream ends, and replaying the full archive
     /// on every reconnect would re-deliver the entire history to strategies —
@@ -141,8 +146,17 @@ impl<C, S> Persisted<C, S> {
             start_block: 0,
             backfill_chunk_size: DEFAULT_BACKFILL_CHUNK_SIZE,
             confirmation_depth: 1,
+            to_block: None,
             replayed: AtomicBool::new(false),
         }
+    }
+
+    /// Cap the backfill at `block` and skip the live tail. The stream ends
+    /// naturally once backfill-to-`block` is exhausted — no timeout needed.
+    /// Useful for bounded/testing contexts that pin to a snapshot block.
+    pub fn with_to_block(mut self, block: u64) -> Self {
+        self.to_block = Some(block);
+        self
     }
 
     /// Persist events under `schema` instead of the best-guess schema derived
@@ -231,10 +245,18 @@ where
     E: Serialize + DeserializeOwned + SolEvent + Send + Sync + 'static,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
-        // Subscribe to the live tip first so events between the tip query and
-        // the live subscription are buffered by the source rather than lost.
-        let live_source = self.collector.subscribe_indexed().await?;
+        // In bounded mode (to_block set), skip the live subscription entirely —
+        // the stream ends when backfill-to-to_block is exhausted.
+        let live_source = if self.to_block.is_none() {
+            // Subscribe to the live tip first so events between the tip query
+            // and the live subscription are buffered by the source.
+            Some(self.collector.subscribe_indexed().await?)
+        } else {
+            None
+        };
         let tip = self.collector.tip().await?;
+        // Cap the effective tip at to_block when in bounded mode.
+        let effective_tip = self.to_block.map(|b| b.min(tip)).unwrap_or(tip);
 
         // The Record fixes the table name and owns the event <-> row mapping
         // for the whole subscription; the override was already validated in
@@ -274,27 +296,25 @@ where
             Box::pin(futures::stream::empty()) as CollectorStream<'_, E>
         };
 
-        // 2. Backfill the RPC gap `[last+1 ..= tip]`, never reaching below the
-        //    configured start block. These are complete blocks, so the trailing
-        //    block is flushed too (`flush_final = true`). When the stored
+        // 2. Backfill the RPC gap `[last+1 ..= effective_tip]`, never reaching
+        //    below the configured start block. These are complete blocks, so the
+        //    trailing block is flushed too (`flush_final = true`). When the stored
         //    height has already reached the tip (a restart within one block
         //    interval, or a node whose tip lags the store) there is no gap, and
-        //    querying the inverted range `[tip+1 ..= tip]` would be rejected by
-        //    real providers — failing every resubscribe until the Reconnect
-        //    Policy escalates to Fatal. Skip the query instead.
+        //    querying the inverted range would be rejected — skip the query instead.
         //
         //    The gap is sliced into bounded chunks queried one at a time; a
         //    chunk that fails after the first cancels `poison`, which ends the
         //    live tail too (see below).
         let poison = CancellationToken::new();
         let backfill_from = last.map(|l| l + 1).unwrap_or(0).max(self.start_block);
-        let backfill_source: CollectorStream<'_, (u64, E)> = if backfill_from > tip {
+        let backfill_source: CollectorStream<'_, (u64, E)> = if backfill_from > effective_tip {
             Box::pin(futures::stream::empty())
         } else {
             chunked_query(
                 &self.collector,
                 backfill_from,
-                tip,
+                effective_tip,
                 self.backfill_chunk_size,
                 poison.clone(),
             )
@@ -303,41 +323,34 @@ where
         let backfill = persist_and_emit(backfill_source, &self.store, record.clone(), true);
 
         // 3. Live tail, strictly above the backfill cut so the two segments are
-        //    disjoint. A live subscription streams from "now", whose lower edge
-        //    is fuzzy around the head (it may re-deliver blocks `<= tip`), so we
-        //    enforce the `> tip` boundary rather than assume it. The live tail
-        //    persists through a `ConfirmationWindow` instead of `BlockWriter`:
-        //    a block is written only once it is `confirmation_depth` blocks deep
-        //    (default 1, which reproduces the single-block "flush on the next
-        //    block, leave the open block unflushed" behaviour exactly), so the
-        //    most recent depth blocks stay buffered and a reorg shallower than
-        //    the depth is corrected before any orphaned row is written. The
-        //    buffered window is left for a restart's backfill to re-fetch.
+        //    disjoint. Skipped entirely in bounded mode (to_block set) — the
+        //    stream ends naturally once backfill is exhausted. In unbounded mode,
+        //    the live tail persists through a `ConfirmationWindow` instead of
+        //    `BlockWriter`: a block is written only once it is `confirmation_depth`
+        //    blocks deep, so the most recent depth blocks stay buffered and a
+        //    shallow reorg is corrected before any orphaned row is written.
         //
-        //    The disjoint split assumes the backfill query reliably covers block
-        //    `tip`. If an RPC node's `eth_getLogs` lags behind its reported tip,
-        //    a log at exactly `tip` could be missing from the backfill yet
-        //    dropped here by the `> tip` filter — present in neither segment. A
-        //    fully robust fix needs per-log identity (block + log index) to
-        //    overlap the segments and de-duplicate; `(u64, E)` does not carry
-        //    that today, so it is deferred rather than reversing the deliberate
-        //    no-duplicate guarantee. See PR #18 / the boundary de-dup test.
         //    The live tail ends when `poison` is cancelled by a failed backfill
-        //    chunk. If it kept going instead, blocks above the tip would be
-        //    persisted while the failed chunk's blocks are missing — advancing
-        //    the stored height over a permanent gap. Ending the whole stream
-        //    hands the failure to the Reconnect Policy: the resubscribe
-        //    backfills again from the last stored block.
-        let live_source = Box::pin(
-            live_source
-                .filter(move |(block, _)| {
-                    let above_cut = *block > tip;
-                    async move { above_cut }
-                })
-                .take_until(poison.cancelled_owned()),
-        ) as CollectorStream<'_, (u64, E)>;
-        let live =
-            persist_and_emit_windowed(live_source, &self.store, record, self.confirmation_depth);
+        //    chunk. Ending the whole stream hands the failure to the Reconnect
+        //    Policy: the resubscribe backfills again from the last stored block.
+        let live: CollectorStream<'_, E> = match live_source {
+            None => Box::pin(futures::stream::empty()),
+            Some(src) => {
+                let live_filtered = Box::pin(
+                    src.filter(move |(block, _)| {
+                        let above_cut = *block > effective_tip;
+                        async move { above_cut }
+                    })
+                    .take_until(poison.cancelled_owned()),
+                ) as CollectorStream<'_, (u64, E)>;
+                persist_and_emit_windowed(
+                    live_filtered,
+                    &self.store,
+                    record,
+                    self.confirmation_depth,
+                )
+            }
+        };
 
         Ok(Segments {
             replay,
