@@ -61,6 +61,7 @@ pub(crate) async fn run<E>(
             Ok(s) => s,
             Err(e) => {
                 error!("collector stream creation failed: {e}");
+                // fall through to the creation-failure policy below.
                 match policy.on_creation_failed() {
                     Decision::Retry { after } => {
                         warn!("retrying stream creation in {after:?}");
@@ -77,6 +78,11 @@ pub(crate) async fn run<E>(
                 }
             }
         };
+
+        // The stream is established. How long it stays open before ending tells
+        // the policy whether the end is a healthy provider-side recycle (reset)
+        // or a flap that should march toward Fatal.
+        let stream_open = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -99,7 +105,7 @@ pub(crate) async fn run<E>(
         }
 
         // Stream ended (e.g. the WebSocket dropped).
-        match policy.on_stream_ended() {
+        match policy.on_stream_ended(stream_open.elapsed()) {
             Decision::Retry { after } => {
                 warn!("collector stream ended, retrying in {after:?}");
                 tokio::select! {
@@ -157,6 +163,9 @@ mod test {
         ReconnectConfig {
             max_failures,
             base_delay: Duration::from_millis(1),
+            // The test collectors below all end their streams immediately, so any
+            // positive threshold keeps those ends counting as failures.
+            healthy_uptime: Duration::from_secs(30),
         }
     }
 
@@ -275,11 +284,63 @@ mod test {
         let config = ReconnectConfig {
             max_failures: 3,
             base_delay: Duration::from_secs(1),
+            // EndingCollector ends at ~0s uptime, well under this, so every end
+            // counts toward Fatal and the backoff curve is exercised in full.
+            healthy_uptime: Duration::from_secs(30),
         };
 
         let start = tokio::time::Instant::now();
         run(Box::new(EndingCollector), config, tx, toks).await;
 
         assert_eq!(start.elapsed(), Duration::from_secs(6));
+    }
+
+    /// A quiet-but-healthy subscription: the stream stays open well past
+    /// `healthy_uptime`, delivers nothing, then is dropped — repeatedly, as a
+    /// load-balanced RPC endpoint recycling a long-lived connection. Each end is
+    /// a healthy recycle, so the counter resets every cycle and the collector
+    /// must reconnect forever without ever escalating to Fatal.
+    #[tokio::test(start_paused = true)]
+    async fn healthy_long_lived_drops_never_escalate() {
+        /// A collector whose stream stays open for `uptime` (delivering nothing)
+        /// then ends.
+        struct QuietThenDrop {
+            uptime: Duration,
+        }
+
+        #[async_trait]
+        impl Collector<u32> for QuietThenDrop {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
+                let uptime = self.uptime;
+                // Yield no items; sleep `uptime` of virtual time, then end.
+                Ok(Box::pin(futures::stream::unfold(
+                    (),
+                    move |()| async move {
+                        tokio::time::sleep(uptime).await;
+                        None::<(u32, ())>
+                    },
+                )))
+            }
+        }
+
+        let (tx, _rx) = broadcast::channel::<u32>(16);
+        let (toks, fatal, root) = tokens();
+        // Threshold of 2 would escalate after two flaps; the 60s uptime is past
+        // the 30s `healthy_uptime`, so it never does.
+        let collector = Box::new(QuietThenDrop {
+            uptime: Duration::from_secs(60),
+        });
+
+        let handle = tokio::spawn(run(collector, config(2), tx, toks));
+        // Let many reconnect cycles elapse (each ~60s open + ~1ms backoff).
+        tokio::time::sleep(Duration::from_secs(60 * 20)).await;
+        assert!(
+            !fatal.is_cancelled(),
+            "a healthy long-lived stream the provider keeps recycling must not escalate"
+        );
+        assert!(!root.is_cancelled());
+
+        root.cancel();
+        handle.await.unwrap();
     }
 }
