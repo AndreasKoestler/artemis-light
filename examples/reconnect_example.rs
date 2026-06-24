@@ -111,6 +111,9 @@ impl Observer<u64, u64> for CountToDone {
 const RECONNECT: ReconnectConfig = ReconnectConfig {
     max_failures: 3,
     base_delay: Duration::from_millis(100),
+    // The example's streams end immediately, so any positive threshold leaves
+    // every end counting toward the escalation it demonstrates.
+    healthy_uptime: Duration::from_secs(30),
 };
 
 #[tokio::main]

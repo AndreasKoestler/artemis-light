@@ -944,6 +944,7 @@ mod engine_tests {
         let mut engine = Engine::<u32, u32>::default().with_reconnect_config(ReconnectConfig {
             max_failures: 2,
             base_delay: Duration::from_millis(10),
+            healthy_uptime: Duration::from_secs(30),
         });
         engine.add_collector(Box::new(EndingCollector));
         engine.add_strategy(Box::new(EchoStrategy));
@@ -1166,6 +1167,7 @@ mod engine_tests {
         let mut engine = Engine::<u32, u32>::default().with_reconnect_config(ReconnectConfig {
             max_failures: 2,
             base_delay: Duration::from_millis(10),
+            healthy_uptime: Duration::from_secs(30),
         });
         engine.add_collector(Box::new(EndingCollector));
         engine.add_strategy(Box::new(SlowSyncStrategy));
