@@ -71,6 +71,10 @@ struct FakeCollector {
     /// 1-based index of a single `query_range` call to fail (0 = none) — used
     /// to simulate one bad chunk in the middle of a sliced backfill.
     query_range_fails_on_call: AtomicUsize,
+    /// When > 0, any `query_range` window wider than this many blocks is
+    /// rejected with a provider "response size / block range" error — used to
+    /// simulate Alchemy's "up to a 2,000 block range" / 10K-log result cap.
+    size_limit: AtomicUsize,
     /// Every `(from, to)` range passed to `query_range`, for asserting how the
     /// wrapper slices the backfill.
     queried: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
@@ -95,6 +99,10 @@ impl FakeCollector {
     }
     fn fail_query_range_on_call(self, n: usize) -> Self {
         self.query_range_fails_on_call.store(n, Ordering::SeqCst);
+        self
+    }
+    fn limit_range_size(self, blocks: usize) -> Self {
+        self.size_limit.store(blocks, Ordering::SeqCst);
         self
     }
     /// Handle onto the recorded `query_range` calls; stays usable after the
@@ -144,6 +152,13 @@ impl PersistableCollector<ValueSet> for FakeCollector {
             self.query_range_fails
                 .store(remaining - 1, Ordering::SeqCst);
             anyhow::bail!("simulated query_range failure");
+        }
+        let limit = self.size_limit.load(Ordering::SeqCst);
+        if limit > 0 && (to - from + 1) as usize > limit {
+            anyhow::bail!(
+                "error code -32602: Log response size exceeded. You can make eth_getLogs \
+                 requests with up to a 2,000 block range and no limit on the response size"
+            );
         }
         let events: Vec<_> = self
             .backfill
@@ -607,6 +622,44 @@ async fn backfill_is_sliced_into_bounded_chunks() {
     // The gap was queried in inclusive, block-aligned windows of 10.
     assert_eq!(*queried.lock().unwrap(), vec![(0, 9), (10, 19), (20, 25)]);
     // Backfilled blocks are complete, so the trailing one is flushed too.
+    assert_eq!(store.last_block("value_set").await.unwrap(), Some(25));
+}
+
+/// A window the provider rejects as too large (its response-size / block-range
+/// cap) must not fail the subscribe and march the collector to Fatal. The
+/// backfill bisects the window and retries each half until it fits, delivering
+/// every event. Regression for the Aave backfill outage: a 10k-block window of
+/// a high-volume event exceeded Alchemy's 10K-log response cap, so every
+/// `subscribe` failed creation and the reconnect policy escalated to Fatal
+/// (~17-min crash cycle).
+#[tokio::test]
+async fn backfill_splits_a_window_that_exceeds_the_response_size_limit() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    // One 26-block window [0..=25] (chunk size 100), but the provider rejects
+    // any window wider than 10 blocks — so it must be bisected to fit.
+    let collector = FakeCollector::default()
+        .tip(25)
+        .backfill(vec![(5, 1), (15, 2), (25, 3)])
+        .live(vec![(26, 4)])
+        .limit_range_size(10);
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_backfill_chunk_size(NonZeroU64::new(100).unwrap());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Every backfilled event still arrives, in block order, then the live tail.
+    assert_eq!(
+        events,
+        vec![
+            value_event(1),
+            value_event(2),
+            value_event(3),
+            value_event(4)
+        ]
+    );
+    // The whole gap was covered despite the split: trailing backfill flushed.
     assert_eq!(store.last_block("value_set").await.unwrap(), Some(25));
 }
 
