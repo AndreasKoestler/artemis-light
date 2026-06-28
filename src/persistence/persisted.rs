@@ -420,10 +420,13 @@ where
     }
 
     let first_to = window_end(from, to, chunk);
-    let mut first = collector.query_range(from, first_to).await?;
+    // Eager first window: a window that can't be queried at all fails the
+    // subscribe (feeding the Reconnect Policy). A provider response-size cap is
+    // *not* such a failure — `query_range_split` bisects and retries it.
+    let first = query_range_split(collector, from, first_to).await?;
 
     let stream = async_stream::stream! {
-        while let Some(item) = first.next().await {
+        for item in first {
             yield item;
         }
         let mut next_from = first_to.saturating_add(1);
@@ -431,9 +434,9 @@ where
         // already returned `to` and the loop is done.
         while next_from <= to {
             let next_to = window_end(next_from, to, chunk);
-            match collector.query_range(next_from, next_to).await {
-                Ok(mut window) => {
-                    while let Some(item) = window.next().await {
+            match query_range_split(collector, next_from, next_to).await {
+                Ok(window) => {
+                    for item in window {
                         yield item;
                     }
                 }
@@ -450,6 +453,66 @@ where
         }
     };
     Ok(Box::pin(stream))
+}
+
+/// Query the inclusive range `[from ..= to]`, **bisecting and retrying** when
+/// the provider rejects the window for exceeding its response-size / block-range
+/// cap (e.g. Alchemy answers a too-large `eth_getLogs` with "up to a 2,000 block
+/// range … 10K logs"). The `backfill_chunk_size` is only a starting hint: a
+/// fixed block window can still exceed a *log-count* cap for a high-volume
+/// event, which used to fail every `subscribe` and march the collector to Fatal.
+///
+/// Only a size/range cap triggers a split. A single-block window that still
+/// fails, or any other error (auth, revert, decode), propagates unchanged so a
+/// genuinely broken query still surfaces.
+fn query_range_split<'a, C, E>(
+    collector: &'a C,
+    from: u64,
+    to: u64,
+) -> futures::future::BoxFuture<'a, Result<Vec<(u64, E)>>>
+where
+    C: PersistableCollector<E> + ?Sized,
+    E: Send + 'a,
+{
+    Box::pin(async move {
+        match collector.query_range(from, to).await {
+            Ok(mut stream) => {
+                let mut events = Vec::new();
+                while let Some(item) = stream.next().await {
+                    events.push(item);
+                }
+                Ok(events)
+            }
+            Err(e) if from < to && is_response_size_error(&e) => {
+                let mid = from + (to - from) / 2;
+                tracing::warn!(
+                    from,
+                    mid,
+                    to,
+                    "splitting backfill window over provider response-size cap: {e}"
+                );
+                let mut lo = query_range_split(collector, from, mid).await?;
+                let hi = query_range_split(collector, mid + 1, to).await?;
+                lo.extend(hi);
+                Ok(lo)
+            }
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// Whether an `eth_getLogs` error is the provider signalling the window was too
+/// large (block-range or result-size cap) — the cue to bisect and retry —
+/// rather than a genuine fault (auth, revert, decode) which must propagate.
+fn is_response_size_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("block range")
+        || s.contains("response size")
+        || s.contains("max results")
+        || s.contains("too many results")
+        || s.contains("query returned more than")
+        || s.contains("-32602")
+        || s.contains("too big")
 }
 
 // A zero confirmation depth is nonsensical (a block can never be buried zero
