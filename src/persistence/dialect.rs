@@ -10,8 +10,6 @@
 //! know how a backend enumerates its own tables — that is the serving layer's
 //! Catalog concern, a separate seam (see ADR-0002).
 
-#[cfg(feature = "postgres")]
-use super::schema::PROGRESS_TABLE;
 use super::schema::SqlType;
 
 /// The SQL-text facts that differ between storage backends.
@@ -34,16 +32,36 @@ pub trait Dialect: Send + Sync {
     /// decimal dependency.
     fn column_type(&self, ty: SqlType) -> &'static str;
 
-    /// The `ON CONFLICT (table_name) DO UPDATE SET …` assignment that keeps the
-    /// watermark monotonic so it never regresses. SQLite uses `MAX(...)`;
-    /// PostgreSQL uses `GREATEST(...)` and must qualify the existing row with
-    /// the progress table name (`_artemis_progress`).
-    fn monotonic_watermark_set(&self) -> String;
+    /// The row-lock suffix appended to the in-transaction progress `SELECT` so
+    /// the read-advance-upsert of one table's watermark is serialised across
+    /// connections: `` (empty) on SQLite, which serialises writes at the
+    /// database level, and ` FOR UPDATE` on PostgreSQL, which needs an explicit
+    /// row lock for an injected multi-connection pool — [position-trait.ATOMIC.1].
+    ///
+    /// The default returns the empty string, so a third-party [`Dialect`] impl
+    /// keeps compiling and simply omits the lock (correct for any single-writer
+    /// backend).
+    fn progress_row_lock(&self) -> &'static str {
+        ""
+    }
 
     /// Whether `err` is the backend's "table does not exist yet" signal — the
     /// marker that nothing has ever been written for a table. SQLite matches the
     /// driver message; PostgreSQL matches SQLSTATE `42P01`.
     fn is_undefined_table(&self, err: &sqlx::Error) -> bool;
+
+    /// Whether `err` is the backend's "column does not exist" signal — the marker,
+    /// on the one-shot migration probe (`SELECT position …`), that this archive
+    /// predates the encoded `position` column and must be migrated
+    /// [position-trait.MIGRATE.1]. SQLite matches the driver message
+    /// (`no such column`); PostgreSQL matches SQLSTATE `42703`.
+    ///
+    /// The default returns `false`, so a third-party [`Dialect`] impl keeps
+    /// compiling; such a backend simply never triggers the lazy migration — it is
+    /// expected to have been created with the current (encoded-position) schema.
+    fn is_undefined_column(&self, _err: &sqlx::Error) -> bool {
+        false
+    }
 }
 
 /// The SQLite [`Dialect`] adapter.
@@ -62,12 +80,12 @@ impl Dialect for SqliteDialect {
         ty.sql()
     }
 
-    fn monotonic_watermark_set(&self) -> String {
-        "last_block = MAX(last_block, excluded.last_block)".to_string()
-    }
-
     fn is_undefined_table(&self, err: &sqlx::Error) -> bool {
         matches!(err, sqlx::Error::Database(e) if e.message().contains("no such table"))
+    }
+
+    fn is_undefined_column(&self, err: &sqlx::Error) -> bool {
+        matches!(err, sqlx::Error::Database(e) if e.message().contains("no such column"))
     }
 }
 
@@ -96,12 +114,19 @@ impl Dialect for PgDialect {
         }
     }
 
-    fn monotonic_watermark_set(&self) -> String {
-        format!("last_block = GREATEST({PROGRESS_TABLE}.last_block, excluded.last_block)")
+    fn progress_row_lock(&self) -> &'static str {
+        // Serialise the read-advance-upsert of one table's watermark across the
+        // connections of an injected multi-connection pool — the monotonic
+        // advance now lives in `Position::advance` in Rust, not in SQL.
+        " FOR UPDATE"
     }
 
     fn is_undefined_table(&self, err: &sqlx::Error) -> bool {
         matches!(err, sqlx::Error::Database(e) if e.code().as_deref() == Some("42P01"))
+    }
+
+    fn is_undefined_column(&self, err: &sqlx::Error) -> bool {
+        matches!(err, sqlx::Error::Database(e) if e.code().as_deref() == Some("42703"))
     }
 }
 
@@ -118,6 +143,8 @@ mod tests {
         // block_number type falls out of column_type(Integer).
         assert_eq!(d.column_type(SqlType::Integer), "INTEGER");
         assert_eq!(d.column_type(SqlType::Numeric), "NUMERIC");
+        // SQLite serialises writes at the database level, so no row-lock suffix.
+        assert_eq!(d.progress_row_lock(), "");
     }
 
     #[cfg(feature = "postgres")]
@@ -130,7 +157,7 @@ mod tests {
         assert_eq!(d.column_type(SqlType::Integer), "BIGINT");
         // Numeric stores as TEXT so replay round-trips identically to SQLite.
         assert_eq!(d.column_type(SqlType::Numeric), "TEXT");
-        assert!(d.monotonic_watermark_set().contains("GREATEST"));
-        assert!(d.monotonic_watermark_set().contains("_artemis_progress"));
+        // PostgreSQL needs an explicit row lock for an injected multi-connection pool.
+        assert_eq!(d.progress_row_lock(), " FOR UPDATE");
     }
 }

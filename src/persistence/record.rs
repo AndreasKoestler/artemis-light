@@ -57,25 +57,50 @@ impl<E: SolEvent> Record<E> {
     ///
     /// Without an override, the table name is derived from `E`'s Solidity
     /// signature and the columns are frozen from the first encoded event.
+    ///
+    /// This is the `E: SolEvent` entry point; it delegates to the SolEvent-free
+    /// [`declared`](Record::declared) / [`inferred`](Record::inferred)
+    /// constructors, which non-EVM event types call directly.
     pub fn new(override_: Option<TableSchema>) -> Result<Self> {
-        let (table, columns) = match override_ {
-            Some(schema) => {
-                // An override colliding with an implicit column would produce
-                // a `CREATE TABLE` with duplicate columns; surfacing it here
-                // makes the failure a clear construction error rather than an
-                // opaque SQL one.
-                if let Err(reason) = schema.ensure_no_reserved_names() {
-                    anyhow::bail!("invalid schema override: {reason}");
-                }
-                (schema.table, ColumnsSource::Declared(schema.columns))
-            }
-            None => (table_name::<E>(), ColumnsSource::Inferred(OnceLock::new())),
-        };
+        match override_ {
+            Some(schema) => Self::declared(schema),
+            None => Ok(Self::inferred(table_name::<E>())),
+        }
+    }
+}
+
+impl<E> Record<E> {
+    /// A `Record` writing to `schema`'s declared table with its declared
+    /// columns, **without** requiring `E: SolEvent` — the entry point for a
+    /// non-EVM event type that supplies its own schema.
+    ///
+    /// Errs when the schema names a reserved identifier (an implicit column the
+    /// persistence layer adds — `block_number`, `_payload` — or the store's
+    /// progress table). An override colliding with an implicit column would
+    /// otherwise produce a `CREATE TABLE` with duplicate columns; surfacing it
+    /// here makes the failure a clear construction error rather than an opaque
+    /// SQL one.
+    pub fn declared(schema: TableSchema) -> Result<Self> {
+        if let Err(reason) = schema.ensure_no_reserved_names() {
+            anyhow::bail!("invalid schema override: {reason}");
+        }
         Ok(Self {
-            table,
-            columns,
+            table: schema.table,
+            columns: ColumnsSource::Declared(schema.columns),
             _event: PhantomData,
         })
+    }
+
+    /// A `Record` whose table is `table` and whose event-field columns are
+    /// inferred from the first encoded event, **without** requiring
+    /// `E: SolEvent` — the entry point for a non-EVM event type persisted under
+    /// a caller-supplied table name.
+    pub fn inferred(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            columns: ColumnsSource::Inferred(OnceLock::new()),
+            _event: PhantomData,
+        }
     }
 }
 
@@ -181,7 +206,7 @@ impl<E> Record<E> {
 
 /// The best-guess table name for an event type, derived from its Solidity
 /// signature: `ValueSet(uint256)` -> `value_set`.
-fn table_name<E: SolEvent>() -> String {
+pub(crate) fn table_name<E: SolEvent>() -> String {
     let signature = E::SIGNATURE;
     let name = signature.split('(').next().unwrap_or(signature);
     to_snake_case(name)

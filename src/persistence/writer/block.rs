@@ -1,92 +1,141 @@
 //! [`BlockWriter`]: persists the finite backfill range, one transaction per
-//! complete block.
+//! complete position-group.
 
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use super::GapFreeWriter;
-use crate::persistence::{Record, Row, Store};
+use crate::persistence::{Position, Record, Reobservation, Row, Store};
 
-/// Buffers one block's rows at a time and writes each complete block to the
-/// store in a single transaction. A block is complete once a higher block
-/// number is observed; the trailing block is written only by [`finish`].
+/// Buffers one position-group's rows at a time and writes each complete group to
+/// the store in a single transaction. A group is complete once a higher sort key
+/// is observed; the trailing group is written only by [`finish`].
 ///
-/// A backwards block halts the writer: the open block's completeness can no
-/// longer be trusted, so flushing it would advance the stored height past the
-/// late block's rows and leave a permanent hole behind the gap-free watermark.
+/// A backwards position halts the writer: the open group's completeness can no
+/// longer be trusted, so flushing it would advance the stored watermark past the
+/// late position's rows and leave a permanent hole behind the gap-free watermark.
 /// (The live tail tolerates such re-emissions as shallow reorgs — that is
 /// [`ConfirmationWindow`](super::ConfirmationWindow)'s job, not this one's.)
 ///
 /// Once the shared [`GapFreeWriter`] goes unhealthy the writer does no per-event
-/// work at all — deriving and buffering rows for blocks that will never be
+/// work at all — deriving and buffering rows for positions that will never be
 /// written would grow the buffer without bound on a live tail. The event stream
 /// itself keeps flowing either way; a restart re-fetches everything after the
-/// last good block.
+/// last good position.
 ///
 /// [`finish`]: BlockWriter::finish
-pub(super) struct BlockWriter<'a, S, E> {
+pub(super) struct BlockWriter<'a, S, P, E> {
     core: GapFreeWriter<'a, S, E>,
     buffer: Vec<Row>,
-    current: Option<u64>,
+    /// The open group's position, folded across all same-sort-key events via
+    /// [`Position::advance`] (a union for a frontier; the same block for
+    /// `BlockPosition`).
+    current: Option<P>,
+    /// The finalized watermark: seeded from the stored position at subscribe and
+    /// advanced as groups flush. Consulted only on the dedupe path
+    /// ([`Reobservation::Dedupe`]); dead on the Halt (block) path.
+    watermark: Option<P>,
 }
 
-impl<'a, S: Store, E: Serialize> BlockWriter<'a, S, E> {
-    pub(super) fn new(store: &'a S, record: Arc<Record<E>>) -> Self {
+impl<'a, S, P, E> BlockWriter<'a, S, P, E>
+where
+    S: Store<P>,
+    P: Position,
+    E: Serialize,
+{
+    pub(super) fn new(store: &'a S, record: Arc<Record<E>>, seed: Option<P>) -> Self {
         Self {
             core: GapFreeWriter::new(store, record),
             buffer: Vec::new(),
             current: None,
+            watermark: seed,
         }
     }
 
-    /// Buffer one event's row, first flushing the previous block if `block`
-    /// has advanced past it. No-op once unhealthy.
-    pub(super) async fn record(&mut self, block: u64, event: &E) {
+    /// Buffer one event's row, first flushing the previous group if `position`
+    /// has advanced past it. Returns whether the event should be delivered
+    /// downstream: `false` only for a [`Reobservation::Dedupe`] position already
+    /// covered by the watermark (a suppressed re-observation), `true` otherwise.
+    /// No per-event work once unhealthy — but the event still flows (`true`),
+    /// because a halt freezes persistence, not the event stream.
+    pub(super) async fn record(&mut self, position: P, event: &E) -> bool {
         if !self.core.healthy() {
-            return;
+            return true;
+        }
+        // Dedupe (Reobservation::Dedupe only): an event already covered by the
+        // finalized watermark or the open group's fold is a re-observation
+        // across an overlapping backfill — encode no row, touch no buffer, and
+        // suppress it downstream. The Halt (block) path never dedupes, so its
+        // buffering and emission stay bit-identical [position-trait.DEDUP.1,
+        // position-trait.DEDUP.2].
+        if P::REOBSERVATION == Reobservation::Dedupe && self.covered(&position) {
+            return false;
         }
         let Some(row) = self.core.encode(event) else {
-            // The event can never be written, so its block — and everything
-            // after it — must not be either; drop the open block's buffer too.
+            // The event can never be written, so its position — and everything
+            // after it — must not be either; drop the open group's buffer too.
             self.buffer.clear();
-            return;
+            return true;
         };
-        if let Some(cur) = self.current {
-            // A backwards block means the open block's completeness can no
-            // longer be trusted: flushing it would advance the stored height
-            // past the late block's rows, leaving a permanent hole behind the
-            // gap-free watermark.
-            if block < cur {
+        if let Some(cur_key) = self.current.as_ref().map(Position::sort_key) {
+            let pos_key = position.sort_key();
+            // A backwards position means the open group's completeness can no
+            // longer be trusted: flushing it would advance the stored watermark
+            // past the late position's rows, leaving a permanent hole behind the
+            // gap-free watermark. (Unreachable on a Dedupe source: a strictly
+            // earlier position is always covered by the open group above.)
+            if pos_key < cur_key {
+                let cur = self.current.as_ref().expect("current is Some");
                 self.core.fail(format_args!(
-                    "block {block} arrived after block {cur} (reorg or \
+                    "position {position:?} arrived after {cur:?} (reorg or \
                      unordered source)"
                 ));
                 self.buffer.clear();
-                return;
+                return true;
             }
-            // The block advanced: the previous block is complete. A failed
-            // flush leaves this event's block unwritable without a gap, so stop
+            // The position advanced: the previous group is complete. A failed
+            // flush leaves this event's group unwritable without a gap, so stop
             // (the buffer was already taken, so nothing is left to drop).
-            if block > cur && !self.core.flush(cur, std::mem::take(&mut self.buffer)).await {
-                return;
+            if pos_key > cur_key {
+                let cur = self.current.take().expect("current is Some");
+                if !self
+                    .core
+                    .flush(cur.clone(), std::mem::take(&mut self.buffer))
+                    .await
+                {
+                    return true;
+                }
+                // Fold the just-flushed group into the finalized watermark so a
+                // later re-observation of a covered identity still dedupes.
+                self.watermark = Some(P::advance(self.watermark.take(), cur));
             }
         }
-        self.current = Some(block);
+        // Fold this event's position into the open group (a union at the same
+        // instant for a frontier; the same block for `BlockPosition`).
+        self.current = Some(P::advance(self.current.take(), position));
         self.buffer.push(row);
+        true
     }
 
-    /// Flush the trailing block. Only correct when the source delivered the
-    /// block completely (a finite backfill range, not a live tail).
+    /// Whether `pos` is already covered by the finalized watermark or the open
+    /// group's fold — the dedupe test for [`Reobservation::Dedupe`] positions.
+    fn covered(&self, pos: &P) -> bool {
+        self.watermark.as_ref().is_some_and(|w| w.contains(pos))
+            || self.current.as_ref().is_some_and(|c| c.contains(pos))
+    }
+
+    /// Flush the trailing group. Only correct when the source delivered the
+    /// group completely (a finite backfill range, not a live tail).
     pub(super) async fn finish(&mut self) {
         if self.core.healthy()
-            && let Some(cur) = self.current
+            && let Some(cur) = self.current.take()
         {
             self.core.flush(cur, std::mem::take(&mut self.buffer)).await;
         }
     }
 
-    /// Rows currently buffered for the open block.
+    /// Rows currently buffered for the open group.
     #[cfg(test)]
     fn buffered(&self) -> usize {
         self.buffer.len()
@@ -96,21 +145,22 @@ impl<'a, S: Store, E: Serialize> BlockWriter<'a, S, E> {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        BadPing, FailingStore, Ping, RecordingStore, bad_ping, ping, record,
+        BadPing, FailingStore, Ping, RecordingStore, TestFrontier, bad_ping, ping, record,
     };
     use super::*;
+    use crate::persistence::BlockPosition;
 
-    fn writer<S, E>(store: &S) -> BlockWriter<'_, S, E>
+    fn writer<S, E>(store: &S) -> BlockWriter<'_, S, BlockPosition, E>
     where
-        S: Store,
+        S: Store<BlockPosition>,
         E: alloy::sol_types::SolEvent + Serialize,
     {
-        BlockWriter::new(store, record())
+        BlockWriter::new(store, record(), None)
     }
 
     /// Once a write fails, persistence is halted for the rest of the stream —
     /// and a halted writer must stop doing per-event work entirely. Deriving
-    /// and buffering rows for blocks that will never be written would grow the
+    /// and buffering rows for positions that will never be written would grow the
     /// buffer without bound on a live tail: one transient write failure would
     /// become a slow-motion OOM.
     #[tokio::test]
@@ -119,18 +169,18 @@ mod tests {
         let mut writer = writer::<_, Ping>(&store);
 
         // Block 1 buffers normally.
-        writer.record(1, &ping(1)).await;
+        writer.record(BlockPosition(1), &ping(1)).await;
         assert_eq!(writer.buffered(), 1);
 
         // Block 2 arrives: block 1 is complete, its flush fails, and the
         // writer goes unhealthy. Block 2's row must not be buffered either —
         // its block can never be written without leaving a gap.
-        writer.record(2, &ping(2)).await;
+        writer.record(BlockPosition(2), &ping(2)).await;
         assert_eq!(writer.buffered(), 0, "failed flush must clear the buffer");
 
         // A long tail of further events must not accumulate anything.
         for block in 3..100 {
-            writer.record(block, &ping(block)).await;
+            writer.record(BlockPosition(block), &ping(block)).await;
         }
         assert_eq!(
             writer.buffered(),
@@ -139,33 +189,33 @@ mod tests {
         );
     }
 
-    /// A live stream can deliver a lower block after a higher one (a reorg
-    /// re-emission, or a misbehaving source). Flushing on *any* block change
-    /// would write the higher block — advancing `_artemis_progress` past the
-    /// lower block whose rows were never written, so a crash between the two
+    /// A live stream can deliver a lower position after a higher one (a reorg
+    /// re-emission, or a misbehaving source). Flushing on *any* position change
+    /// would write the higher group — advancing `_artemis_progress` past the
+    /// lower position whose rows were never written, so a crash between the two
     /// transactions leaves a permanent hole behind a "gap-free" watermark. A
-    /// backwards block must instead halt the writer before anything is
-    /// written: the open block's completeness can no longer be trusted.
+    /// backwards position must instead halt the writer before anything is
+    /// written: the open group's completeness can no longer be trusted.
     #[tokio::test]
     async fn writer_halts_on_non_monotone_blocks_without_writing() {
         let store = RecordingStore::default();
         let mut writer = writer::<_, Ping>(&store);
 
-        writer.record(5, &ping(1)).await;
-        writer.record(4, &ping(2)).await; // block went backwards
-        writer.record(5, &ping(3)).await; // the reorg's second half
+        writer.record(BlockPosition(5), &ping(1)).await;
+        writer.record(BlockPosition(4), &ping(2)).await; // position went backwards
+        writer.record(BlockPosition(5), &ping(3)).await; // the reorg's second half
         writer.finish().await;
 
         assert_eq!(
             store.written(),
             Vec::<u64>::new(),
-            "no block may be written once ordering is violated"
+            "no group may be written once ordering is violated"
         );
         assert_eq!(writer.buffered(), 0);
     }
 
     /// An event that cannot be encoded into a row must halt persistence, not
-    /// be skipped: progress would otherwise advance past its block, and replay
+    /// be skipped: progress would otherwise advance past its position, and replay
     /// would hand strategies exactly the "quietly truncated history" the read
     /// side refuses to produce (see `replay_stored`). Strategies that ran live
     /// saw the event; strategies after a restart must not silently lose it.
@@ -174,9 +224,9 @@ mod tests {
         let store = RecordingStore::default();
         let mut writer = writer::<_, BadPing>(&store);
 
-        writer.record(1, &bad_ping(1)).await;
-        writer.record(2, &bad_ping(0)).await; // zero serialises unencodably
-        writer.record(3, &bad_ping(3)).await; // would previously flush past block 2
+        writer.record(BlockPosition(1), &bad_ping(1)).await;
+        writer.record(BlockPosition(2), &bad_ping(0)).await; // zero serialises unencodably
+        writer.record(BlockPosition(3), &bad_ping(3)).await; // would previously flush past block 2
         writer.finish().await;
 
         assert_eq!(
@@ -185,5 +235,109 @@ mod tests {
             "nothing may be written once an event cannot be persisted"
         );
         assert_eq!(writer.buffered(), 0);
+    }
+
+    /// A frontier (Dedupe) `BlockWriter` over the recording store.
+    fn frontier_writer(
+        store: &RecordingStore<TestFrontier>,
+        seed: Option<TestFrontier>,
+    ) -> BlockWriter<'_, RecordingStore<TestFrontier>, TestFrontier, Ping> {
+        BlockWriter::new(store, record(), seed)
+    }
+
+    /// DEDUP.1/.2: a re-observed identity already covered by the open group's
+    /// fold is suppressed downstream (`record` returns false) and stored zero
+    /// additional times — exactly-once persisted effect over an at-least-once
+    /// re-read. Discriminating: without the dedupe skip, `total_rows` would be 2.
+    #[tokio::test]
+    async fn dedupe_skip_stores_one_row_and_suppresses_downstream() {
+        let store = RecordingStore::<TestFrontier>::default();
+        let mut writer = frontier_writer(&store, None);
+
+        // First sighting of 0xc1 at t=2000: delivered and buffered.
+        assert!(
+            writer.record(TestFrontier::at(2000, 0xc1), &ping(1)).await,
+            "first sighting is delivered"
+        );
+        // Re-observation of 0xc1 at the same instant: covered by the open
+        // group's fold -> suppressed, no second row.
+        assert!(
+            !writer.record(TestFrontier::at(2000, 0xc1), &ping(1)).await,
+            "the re-observation is suppressed downstream"
+        );
+        writer.finish().await;
+
+        assert_eq!(store.written(), vec![2000], "one group written");
+        assert_eq!(
+            store.total_rows(),
+            1,
+            "0xc1 stored exactly once despite the re-observation"
+        );
+    }
+
+    /// DEDUP.1/.2: the backfill watermark seeded from the stored position
+    /// dedupes an overlapping re-read while still storing a genuinely new
+    /// identity at the same instant — the real resume/overlap scenario.
+    #[tokio::test]
+    async fn seeded_watermark_dedupes_overlapping_reread() {
+        let store = RecordingStore::<TestFrontier>::default();
+        // A prior run stored up to (2000, {0xc1}).
+        let mut writer = frontier_writer(&store, Some(TestFrontier::at(2000, 0xc1)));
+
+        // Overlapping re-read of 0xc1: covered by the seed -> suppressed.
+        assert!(
+            !writer.record(TestFrontier::at(2000, 0xc1), &ping(1)).await,
+            "the overlapping re-read is deduped against the seed"
+        );
+        // A new identity at the same instant: not covered -> delivered.
+        assert!(writer.record(TestFrontier::at(2000, 0xc2), &ping(2)).await);
+        // A later instant: delivered, completing and flushing the 2000 group.
+        assert!(writer.record(TestFrontier::at(2500, 0xd1), &ping(3)).await);
+        writer.finish().await;
+
+        assert_eq!(
+            store.written(),
+            vec![2000, 2500],
+            "two groups written, none for the re-read"
+        );
+        assert_eq!(store.total_rows(), 2, "0xc1 never re-stored");
+        assert_eq!(
+            store.positions()[0],
+            TestFrontier::at(2000, 0xc2),
+            "the 2000 group carries only the new identity"
+        );
+    }
+
+    /// The open group folds (unions) every event sharing one sort key into a
+    /// single group whose position is the union of their identities.
+    /// Discriminating: an overwrite or first-wins fold would leave a singleton.
+    #[tokio::test]
+    async fn same_key_group_fold_unions_events() {
+        let store = RecordingStore::<TestFrontier>::default();
+        let mut writer = frontier_writer(&store, None);
+
+        assert!(writer.record(TestFrontier::at(1000, 1), &ping(1)).await);
+        assert!(writer.record(TestFrontier::at(1000, 2), &ping(2)).await);
+        writer.finish().await;
+
+        let positions = store.positions();
+        assert_eq!(
+            positions.len(),
+            1,
+            "same-instant events fold into one group"
+        );
+        assert_eq!(
+            positions[0],
+            TestFrontier {
+                time: 1000,
+                seen: [1, 2].into_iter().collect()
+            },
+            "the group's position is the union of both identities"
+        );
+        assert_eq!(
+            store.total_rows(),
+            2,
+            "both rows persisted in the one group"
+        );
     }
 }

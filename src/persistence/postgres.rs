@@ -1,8 +1,8 @@
 //! The PostgreSQL backend: a [`SqlStore`] over a PostgreSQL pool with the
 //! [`PgDialect`]. Only the connection setup is PostgreSQL-specific; the
-//! `write_block` / `last_block` / `replay` orchestration lives once in
+//! `write` / `stored_position` / `replay` orchestration lives once in
 //! [`SqlStore`](super::SqlStore), and the dialect-only differences ($N
-//! placeholders, `GREATEST` watermark, SQLSTATE `42P01`, `ctid` tie-breaker,
+//! placeholders, the progress row-lock suffix, SQLSTATE `42P01`, `ctid` tie-breaker,
 //! the column-type mapping) live in [`PgDialect`]. Compiled only under the
 //! `postgres` feature (postgres-store.FEATURE.1).
 

@@ -17,6 +17,7 @@
 
 mod dialect;
 mod persisted;
+mod position;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod query;
@@ -31,6 +32,7 @@ mod writer;
 pub use dialect::PgDialect;
 pub use dialect::{Dialect, SqliteDialect};
 pub use persisted::*;
+pub use position::*;
 #[cfg(feature = "postgres")]
 pub use postgres::*;
 pub use record::Record;

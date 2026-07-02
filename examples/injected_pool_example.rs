@@ -38,7 +38,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
-use artemis_light::persistence::{PersistExt, PostgresStore, Store};
+use artemis_light::persistence::{BlockPosition, PersistExt, PostgresStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
@@ -127,7 +127,11 @@ async fn main() -> Result<()> {
 
     // Each event landed in its own block. A block is flushed once a higher one is
     // seen, so the resume point has advanced past the earliest events.
-    match store.last_block("value_set").await? {
+    match store
+        .stored_position("value_set")
+        .await?
+        .map(|p: BlockPosition| p.0)
+    {
         Some(block) => println!("Highest persisted block: {block}"),
         None => println!("Highest persisted block: (none yet)"),
     }

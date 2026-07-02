@@ -33,7 +33,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure cache
         uses: Swatinem/rust-cache@v2
-      
+
       - name: Run fmt
         run: cargo fmt --all -- --check
       - name: Clippy default features (no serving/postgres — opt-in/OPTIN check)
@@ -61,9 +61,24 @@ jobs:
       - name: Run tests (all features, provisions PostgreSQL via Docker)
         run: cargo test --all-features
 
+      # Build every default-feature example so none can silently bit-rot
+      # (position-trait.EXAMPLE.5). Examples gated behind `required-features`
+      # (serving/postgres) are skipped here but covered by the `--all-features`
+      # clippy step above.
+      - name: Build examples
+        run: cargo build --examples
+
+      # The HyperCore ledger example's acceptance bar is a VERIFIED RUN, not
+      # merely compiling (position-trait.EXAMPLE.6): running it in CI enforces
+      # the four-line output + exit 0 on every push so it cannot rot
+      # (position-trait.EXAMPLE.7). Self-contained on in-memory SQLite — no
+      # network, no Docker, no external database.
+      - name: Run verified example (hypercore_ledger_example)
+        run: cargo run --example hypercore_ledger_example
+
       - name: Clean docs folder
         run: cargo clean --doc
 
       - name: Build docs
         run: cargo doc --no-deps
-      
+

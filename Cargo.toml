@@ -1,6 +1,6 @@
 [package]
 name = "artemis-light"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A framework for reliable, long-running on-chain automation: event-driven agents built on Alloy and Tokio. A fork of Paradigm's Artemis."
 license = "Apache-2.0"
@@ -90,6 +90,13 @@ path = "examples/reconnect_example.rs"
 [[example]]
 name = "persistence_example"
 path = "examples/persistence_example.rs"
+
+[[example]]
+name = "hypercore_ledger_example"
+path = "examples/hypercore_ledger_example.rs"
+## No required-features: self-contained on the default in-memory SQLite store, so
+## `cargo build --examples`, clippy `--all-targets`, and the CI verified run all
+## cover it with no extra flags (position-trait.EXAMPLE.5).
 
 [[example]]
 name = "confirmation_depth_example"

@@ -19,7 +19,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
-use artemis_light::persistence::{PersistExt, SqliteStore, Store};
+use artemis_light::persistence::{BlockPosition, PersistExt, SqliteStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 
@@ -79,7 +79,10 @@ async fn main() -> Result<()> {
     // is seen, so 10 and 20 are persisted while 30's block is still "open".
     println!(
         "\nHighest persisted block: {:?}",
-        store.last_block("value_set").await?
+        store
+            .stored_position("value_set")
+            .await?
+            .map(|p: BlockPosition| p.0)
     );
 
     // ---- "Restart": a fresh wrapper over the same store. ----

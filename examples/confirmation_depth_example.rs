@@ -36,7 +36,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
-use artemis_light::persistence::{PersistExt, SqliteStore, Store};
+use artemis_light::persistence::{BlockPosition, PersistExt, SqliteStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 
@@ -107,7 +107,10 @@ async fn main() -> Result<()> {
     println!(
         "\nConfirmation depth {CONFIRMATION_DEPTH}: highest persisted block is {:?} \
          — only events 10 and 20 are finalized; 30, 40, 50 are still buffered.",
-        store.last_block("value_set").await?
+        store
+            .stored_position("value_set")
+            .await?
+            .map(|p: BlockPosition| p.0)
     );
 
     // ---- "Restart": a fresh wrapper over the same store recovers everything. ----

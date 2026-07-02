@@ -1,6 +1,6 @@
 //! The SQLite backend: a [`SqlStore`] over an SQLite pool with the
 //! [`SqliteDialect`]. Only the connection tuning is SQLite-specific; the
-//! `write_block` / `last_block` / `replay` orchestration lives once in
+//! `write` / `stored_position` / `replay` orchestration lives once in
 //! [`SqlStore`](super::SqlStore).
 
 use std::str::FromStr;

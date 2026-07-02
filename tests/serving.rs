@@ -9,7 +9,9 @@
 use std::net::SocketAddr;
 
 use artemis_light::ServingLayer;
-use artemis_light::persistence::{Row, SqlType, SqlValue, SqliteStore, Store, TableSchema};
+use artemis_light::persistence::{
+    BlockPosition, Row, SqlType, SqlValue, SqliteStore, Store, TableSchema,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
@@ -48,9 +50,9 @@ async fn seed_two_tables(path: &str) {
         .col("value", SqlType::Integer)
         .col("_payload", SqlType::Text);
     store
-        .write_block(
+        .write(
             &value_set,
-            100,
+            BlockPosition(100),
             vec![Row(vec![
                 SqlValue::Integer(7),
                 SqlValue::Text("{\"value\":\"7\"}".to_string()),
@@ -62,9 +64,9 @@ async fn seed_two_tables(path: &str) {
         .col("amount", SqlType::Integer)
         .col("_payload", SqlType::Text);
     store
-        .write_block(
+        .write(
             &transfer,
-            50,
+            BlockPosition(50),
             vec![Row(vec![
                 SqlValue::Integer(3),
                 SqlValue::Text("{\"amount\":\"3\"}".to_string()),
@@ -85,9 +87,9 @@ async fn seed_value_set_blocks(path: &str, rows: &[(u64, i64)]) {
         .col("_payload", SqlType::Text);
     for (block, value) in rows {
         store
-            .write_block(
+            .write(
                 &schema,
-                *block,
+                BlockPosition(*block),
                 vec![Row(vec![
                     SqlValue::Integer(*value),
                     SqlValue::Text(format!("{{\"value\":\"{value}\"}}")),
@@ -428,9 +430,9 @@ async fn reads_stay_consistent_during_concurrent_writes() {
             .col("_payload", SqlType::Text);
         for b in 2..=50u64 {
             store
-                .write_block(
+                .write(
                     &schema,
-                    b,
+                    BlockPosition(b),
                     vec![Row(vec![
                         SqlValue::Integer(b as i64),
                         SqlValue::Text(format!("{{\"value\":\"{b}\"}}")),
@@ -497,7 +499,10 @@ async fn reads_do_not_mutate_the_database() {
     let store = SqliteStore::connect(&format!("sqlite:{url}"))
         .await
         .unwrap();
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(101));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(101))
+    );
 }
 
 #[tokio::test]

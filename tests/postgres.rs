@@ -11,8 +11,8 @@ use alloy::primitives::U256;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::persistence::{
-    PersistExt, PersistableCollector, PostgresStore, Record, Row, SqlType, SqlValue, SqliteStore,
-    Store, TableSchema,
+    BlockPosition, PersistExt, PersistableCollector, PostgresStore, Record, Row, SqlType, SqlValue,
+    SqliteStore, Store, TableSchema,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -56,29 +56,31 @@ impl FakeCollector {
 
 #[async_trait]
 impl PersistableCollector<ValueSet> for FakeCollector {
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, ValueSet)>> {
+    type Pos = BlockPosition;
+
+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
         let events: Vec<_> = self
             .live
             .iter()
-            .map(|&(b, v)| (b, value_event(v)))
+            .map(|&(b, v)| (BlockPosition(b), value_event(v)))
             .collect();
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
     async fn query_range(
         &self,
-        from: u64,
-        to: u64,
-    ) -> Result<CollectorStream<'_, (u64, ValueSet)>> {
-        if from > to {
-            anyhow::bail!("inverted range: from {from} > to {to}");
+        from: BlockPosition,
+        to: BlockPosition,
+    ) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
+        if from.0 > to.0 {
+            anyhow::bail!("inverted range: from {} > to {}", from.0, to.0);
         }
         // These tests leave no RPC gap, so no backfill events are produced.
         Ok(Box::pin(futures::stream::iter(Vec::new())))
     }
 
-    async fn tip(&self) -> Result<u64> {
-        Ok(self.tip)
+    async fn tip(&self) -> Result<BlockPosition> {
+        Ok(BlockPosition(self.tip))
     }
 }
 
@@ -88,7 +90,10 @@ async fn seed(store: &Arc<PostgresStore>, block: u64, value: u64) {
     let record = Record::<ValueSet>::new(None).unwrap();
     let row = record.encode(&value_event(value)).unwrap();
     let schema = record.schema().unwrap();
-    store.write_block(&schema, block, vec![row]).await.unwrap();
+    store
+        .write(&schema, BlockPosition(block), vec![row])
+        .await
+        .unwrap();
 }
 
 /// One-column text schema mirroring the SQLite store tests' `value_set` table.
@@ -121,9 +126,9 @@ async fn postgres_store_write_then_replay_round_trips() {
     let schema = value_set_schema();
 
     store
-        .write_block(
+        .write(
             &schema,
-            7,
+            BlockPosition(7),
             vec![
                 Row(vec![SqlValue::Text("0x2a".into())]),
                 Row(vec![SqlValue::Text("0x2b".into())]),
@@ -132,7 +137,7 @@ async fn postgres_store_write_then_replay_round_trips() {
         .await
         .unwrap();
 
-    let rows = store.replay(&schema, 100).await.unwrap();
+    let rows = store.replay(&schema, BlockPosition(100)).await.unwrap();
     assert_eq!(
         rows,
         vec![
@@ -142,8 +147,8 @@ async fn postgres_store_write_then_replay_round_trips() {
     );
 }
 
-/// `last_block` reports the highest written block, and `None` before any write
-/// (postgres-store.PGSTORE.5).
+/// `stored_position` reports the highest written block, and `None` before any
+/// write (postgres-store.PGSTORE.5).
 #[tokio::test]
 async fn postgres_store_last_block_returns_written_height() {
     let (_container, url) = start_postgres().await;
@@ -151,19 +156,36 @@ async fn postgres_store_last_block_returns_written_height() {
     let schema = value_set_schema();
 
     // Nothing stored yet: the progress table does not exist (SQLSTATE 42P01).
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), None);
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        None::<BlockPosition>
+    );
 
     store
-        .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("a".into())])])
+        .write(
+            &schema,
+            BlockPosition(5),
+            vec![Row(vec![SqlValue::Text("a".into())])],
+        )
         .await
         .unwrap();
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(5))
+    );
 
     store
-        .write_block(&schema, 9, vec![Row(vec![SqlValue::Text("b".into())])])
+        .write(
+            &schema,
+            BlockPosition(9),
+            vec![Row(vec![SqlValue::Text("b".into())])],
+        )
         .await
         .unwrap();
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(9));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(9))
+    );
 }
 
 /// Connecting to an unreachable server returns an error rather than a
@@ -190,16 +212,20 @@ async fn write_block_shape_mismatch_rolls_back() {
 
     // Block 5 is written cleanly.
     store
-        .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("ok".into())])])
+        .write(
+            &schema,
+            BlockPosition(5),
+            vec![Row(vec![SqlValue::Text("ok".into())])],
+        )
         .await
         .unwrap();
 
     // Block 9's second row has too few values for the schema, so the shape
     // guard bails partway through the batch.
     let result = store
-        .write_block(
+        .write(
             &schema,
-            9,
+            BlockPosition(9),
             vec![
                 Row(vec![SqlValue::Text("good".into())]),
                 Row(vec![]), // missing the `value` column
@@ -211,10 +237,13 @@ async fn write_block_shape_mismatch_rolls_back() {
     // Block 9 rolled back entirely: only block 5's row survives and the
     // watermark still points at block 5 (gap-free prefix preserved).
     assert_eq!(
-        store.replay(&schema, 100).await.unwrap(),
+        store.replay(&schema, BlockPosition(100)).await.unwrap(),
         vec![Row(vec![SqlValue::Text("ok".into())])]
     );
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(5))
+    );
 }
 
 /// `replay` on a table that has never been written returns an empty vec, not an
@@ -226,14 +255,14 @@ async fn replay_missing_table_returns_empty() {
     let store = PostgresStore::connect(&url).await.unwrap();
     let schema = value_set_schema();
 
-    let rows = store.replay(&schema, 100).await.unwrap();
+    let rows = store.replay(&schema, BlockPosition(100)).await.unwrap();
     assert!(
         rows.is_empty(),
         "replay of a never-written table must be empty"
     );
 }
 
-/// `last_block` on a table that has never been written returns `None` — the
+/// `stored_position` on a table that has never been written returns `None` — the
 /// progress table does not yet exist (42P01) (postgres-store.PGSTORE.5;
 /// ReadEmptyOrMissingTable).
 #[tokio::test]
@@ -241,7 +270,10 @@ async fn last_block_missing_table_returns_none() {
     let (_container, url) = start_postgres().await;
     let store = PostgresStore::connect(&url).await.unwrap();
 
-    assert_eq!(store.last_block("never_written").await.unwrap(), None);
+    assert_eq!(
+        store.stored_position("never_written").await.unwrap(),
+        None::<BlockPosition>
+    );
 }
 
 /// A block number at the top of the supported range (`i64::MAX`) round-trips
@@ -255,17 +287,20 @@ async fn block_number_near_i64_max_round_trips() {
     let height = i64::MAX as u64; // top of the supported block-height range
 
     store
-        .write_block(
+        .write(
             &schema,
-            height,
+            BlockPosition(height),
             vec![Row(vec![SqlValue::Text("edge".into())])],
         )
         .await
         .unwrap();
 
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(height));
     assert_eq!(
-        store.replay(&schema, height).await.unwrap(),
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(height))
+    );
+    assert_eq!(
+        store.replay(&schema, BlockPosition(height)).await.unwrap(),
         vec![Row(vec![SqlValue::Text("edge".into())])]
     );
 }
@@ -307,20 +342,31 @@ async fn postgres_restart_replays_prior_events() {
     {
         let store = PostgresStore::connect(&url).await.unwrap();
         store
-            .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("a".into())])])
+            .write(
+                &schema,
+                BlockPosition(5),
+                vec![Row(vec![SqlValue::Text("a".into())])],
+            )
             .await
             .unwrap();
         store
-            .write_block(&schema, 9, vec![Row(vec![SqlValue::Text("b".into())])])
+            .write(
+                &schema,
+                BlockPosition(9),
+                vec![Row(vec![SqlValue::Text("b".into())])],
+            )
             .await
             .unwrap();
     }
 
     // Second "process": a new store on the same database sees the prior state.
     let restarted = PostgresStore::connect(&url).await.unwrap();
-    assert_eq!(restarted.last_block(&schema.table).await.unwrap(), Some(9));
     assert_eq!(
-        restarted.replay(&schema, 100).await.unwrap(),
+        restarted.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(9))
+    );
+    assert_eq!(
+        restarted.replay(&schema, BlockPosition(100)).await.unwrap(),
         vec![
             Row(vec![SqlValue::Text("a".into())]),
             Row(vec![SqlValue::Text("b".into())]),
@@ -361,17 +407,17 @@ async fn sqlite_postgres_replay_parity() {
 
     for store_writes in [&pg as &dyn Store, &sqlite as &dyn Store] {
         store_writes
-            .write_block(&schema, 1, block1.clone())
+            .write(&schema, BlockPosition(1), block1.clone())
             .await
             .unwrap();
         store_writes
-            .write_block(&schema, 2, block2.clone())
+            .write(&schema, BlockPosition(2), block2.clone())
             .await
             .unwrap();
     }
 
-    let pg_rows = pg.replay(&schema, 100).await.unwrap();
-    let sqlite_rows = sqlite.replay(&schema, 100).await.unwrap();
+    let pg_rows = pg.replay(&schema, BlockPosition(100)).await.unwrap();
+    let sqlite_rows = sqlite.replay(&schema, BlockPosition(100)).await.unwrap();
 
     assert_eq!(
         pg_rows, sqlite_rows,
@@ -384,13 +430,13 @@ async fn sqlite_postgres_replay_parity() {
 
 /// A store built from a caller-supplied pool via `with_pool` behaves byte-for-byte
 /// identically to one built from a URL via `connect`: identical blocks written
-/// through each yield identical replay rows and identical `last_block`
+/// through each yield identical replay rows and identical `stored_position`
 /// (inject-pool.STORE.1, inject-pool.STORE.4, inject-pool.PARITY.1). The injected
 /// pool is multi-connection (`max_connections(5)`) to exercise the no-cap contract
 /// (inject-pool.STORE.5); the empty-state reads before any write confirm the
 /// missing-table classification is unchanged on the injected path. External
-/// behaviour is asserted through the public `Store` API only (replay + last_block),
-/// never `write_block`'s SQL internals.
+/// behaviour is asserted through the public `Store` API only (replay + stored_position),
+/// never `write`'s SQL internals.
 #[tokio::test]
 async fn with_pool_store_matches_connect_store_parity() {
     // One container backs both stores; two distinct event tables keep their
@@ -413,17 +459,29 @@ async fn with_pool_store_matches_connect_store_parity() {
     let pool_store = PostgresStore::with_pool(pool);
     let pool_schema = TableSchema::new("events_pool").col("value", SqlType::Text);
 
-    // Empty state before any write: `last_block` is `None` and `replay` is empty on
-    // both paths (missing-table classification via SQLSTATE 42P01, unchanged).
-    assert_eq!(url_store.last_block(&url_schema.table).await.unwrap(), None);
+    // Empty state before any write: `stored_position` is `None` and `replay` is empty
+    // on both paths (missing-table classification via SQLSTATE 42P01, unchanged).
     assert_eq!(
-        pool_store.last_block(&pool_schema.table).await.unwrap(),
-        None
+        url_store.stored_position(&url_schema.table).await.unwrap(),
+        None::<BlockPosition>
     );
-    assert!(url_store.replay(&url_schema, 100).await.unwrap().is_empty());
+    assert_eq!(
+        pool_store
+            .stored_position(&pool_schema.table)
+            .await
+            .unwrap(),
+        None::<BlockPosition>
+    );
+    assert!(
+        url_store
+            .replay(&url_schema, BlockPosition(100))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         pool_store
-            .replay(&pool_schema, 100)
+            .replay(&pool_schema, BlockPosition(100))
             .await
             .unwrap()
             .is_empty()
@@ -437,14 +495,26 @@ async fn with_pool_store_matches_connect_store_parity() {
     let block2 = vec![Row(vec![SqlValue::Text("0x2c".into())])];
 
     for (store, schema) in [(&url_store, &url_schema), (&pool_store, &pool_schema)] {
-        store.write_block(schema, 5, block1.clone()).await.unwrap();
-        store.write_block(schema, 9, block2.clone()).await.unwrap();
+        store
+            .write(schema, BlockPosition(5), block1.clone())
+            .await
+            .unwrap();
+        store
+            .write(schema, BlockPosition(9), block2.clone())
+            .await
+            .unwrap();
     }
 
     // Parity through the public `Store` API only: equal replay row-vectors and
-    // equal `last_block` per table (inject-pool.PARITY.1, inject-pool.STORE.4).
-    let url_rows = url_store.replay(&url_schema, 100).await.unwrap();
-    let pool_rows = pool_store.replay(&pool_schema, 100).await.unwrap();
+    // equal `stored_position` per table (inject-pool.PARITY.1, inject-pool.STORE.4).
+    let url_rows = url_store
+        .replay(&url_schema, BlockPosition(100))
+        .await
+        .unwrap();
+    let pool_rows = pool_store
+        .replay(&pool_schema, BlockPosition(100))
+        .await
+        .unwrap();
     assert_eq!(
         url_rows, pool_rows,
         "connect(url) and with_pool(pool) must replay identical rows"
@@ -454,13 +524,17 @@ async fn with_pool_store_matches_connect_store_parity() {
     let expected: Vec<Row> = block1.into_iter().chain(block2).collect();
     assert_eq!(url_rows, expected);
 
-    let url_last = url_store.last_block(&url_schema.table).await.unwrap();
-    let pool_last = pool_store.last_block(&pool_schema.table).await.unwrap();
+    let url_last: Option<BlockPosition> =
+        url_store.stored_position(&url_schema.table).await.unwrap();
+    let pool_last: Option<BlockPosition> = pool_store
+        .stored_position(&pool_schema.table)
+        .await
+        .unwrap();
     assert_eq!(
         url_last, pool_last,
-        "connect(url) and with_pool(pool) must report identical last_block"
+        "connect(url) and with_pool(pool) must report identical stored_position"
     );
-    assert_eq!(url_last, Some(9));
+    assert_eq!(url_last, Some(BlockPosition(9)));
 }
 
 /// The injected-pool path defers connectivity errors to first store use, mirroring
@@ -498,9 +572,9 @@ async fn with_pool_defers_connectivity_errors_to_first_use() {
 
     // The connectivity error surfaces here, at the first store operation — not at
     // construction. A connection failure is not the missing-table SQLSTATE (42P01),
-    // so `last_block` propagates it as `Err` rather than misclassifying it as
+    // so `stored_position` propagates it as `Err` rather than misclassifying it as
     // `Ok(None)` (inject-pool.ERRORS.1).
-    let first_use = store.last_block("t").await;
+    let first_use: Result<Option<BlockPosition>> = store.stored_position("t").await;
     assert!(
         first_use.is_err(),
         "first store use over an unreachable injected pool must surface the connectivity error"
@@ -510,7 +584,7 @@ async fn with_pool_defers_connectivity_errors_to_first_use() {
     // the server, so no table was created and nothing was written. A second read
     // fails the same way — the store fabricated no success and holds no partial or
     // half-initialised state (inject-pool.ERRORS.1).
-    let follow_up = store.replay(&value_set_schema(), 100).await;
+    let follow_up = store.replay(&value_set_schema(), BlockPosition(100)).await;
     assert!(
         follow_up.is_err(),
         "a read over the same unreachable pool must also error, never fabricate state"
@@ -521,7 +595,7 @@ async fn with_pool_defers_connectivity_errors_to_first_use() {
 /// open and usable — the store borrows the pool and never calls `.close()` on it
 /// (inject-pool.OWNERSHIP.1). The caller keeps its own handle (a `PgPool` clone is
 /// a handle to the same shared pool); the store gets another clone, actively uses
-/// it (a `write_block` acquires and returns a connection), and is then dropped. A
+/// it (a `write` acquires and returns a connection), and is then dropped. A
 /// `SELECT 1` on the caller's retained handle must still succeed, proving the
 /// store's drop glue released only its own handle and never closed the pool. The
 /// pool's lifecycle stays the caller's — released here by process/scope exit, never
@@ -546,7 +620,11 @@ async fn with_pool_store_leaves_injected_pool_open_on_drop() {
         let store = PostgresStore::with_pool(pool.clone());
         let schema = value_set_schema();
         store
-            .write_block(&schema, 1, vec![Row(vec![SqlValue::Text("x".into())])])
+            .write(
+                &schema,
+                BlockPosition(1),
+                vec![Row(vec![SqlValue::Text("x".into())])],
+            )
             .await
             .unwrap();
         drop(store); // the store's PgPool clone is dropped by compiler drop glue only.
@@ -566,13 +644,13 @@ async fn with_pool_store_leaves_injected_pool_open_on_drop() {
 
 /// Restart-resume over the same injected pool: persisting several blocks through a
 /// `with_pool` store, dropping it, then rebuilding a NEW store from the SAME pool
-/// yields a `replay` returning the full stored history and a `last_block` reporting
-/// the highest committed block (inject-pool.PARITY.2). The store is a stateless
-/// wrapper — the history lives in the database reached through the borrowed pool —
-/// so a fresh store handle over the same pool sees everything the first one wrote.
-/// External behaviour only: `replay` output and `last_block` through the public
-/// `Store` API, never SQL internals; the `ContainerAsync` guard is held for the
-/// test's duration.
+/// yields a `replay` returning the full stored history and a `stored_position`
+/// reporting the highest committed block (inject-pool.PARITY.2). The store is a
+/// stateless wrapper — the history lives in the database reached through the
+/// borrowed pool — so a fresh store handle over the same pool sees everything the
+/// first one wrote. External behaviour only: `replay` output and `stored_position`
+/// through the public `Store` API, never SQL internals; the `ContainerAsync`
+/// guard is held for the test's duration.
 #[tokio::test]
 async fn with_pool_store_resumes_replay_from_same_pool() {
     let (_container, url) = start_postgres().await;
@@ -589,15 +667,27 @@ async fn with_pool_store_resumes_replay_from_same_pool() {
     {
         let store = PostgresStore::with_pool(pool.clone());
         store
-            .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("a".into())])])
+            .write(
+                &schema,
+                BlockPosition(5),
+                vec![Row(vec![SqlValue::Text("a".into())])],
+            )
             .await
             .unwrap();
         store
-            .write_block(&schema, 9, vec![Row(vec![SqlValue::Text("b".into())])])
+            .write(
+                &schema,
+                BlockPosition(9),
+                vec![Row(vec![SqlValue::Text("b".into())])],
+            )
             .await
             .unwrap();
         store
-            .write_block(&schema, 13, vec![Row(vec![SqlValue::Text("c".into())])])
+            .write(
+                &schema,
+                BlockPosition(13),
+                vec![Row(vec![SqlValue::Text("c".into())])],
+            )
             .await
             .unwrap();
         drop(store); // every handle to the first store is gone before we rebuild.
@@ -607,7 +697,7 @@ async fn with_pool_store_resumes_replay_from_same_pool() {
     // history and the highest committed watermark (inject-pool.PARITY.2).
     let resumed = PostgresStore::with_pool(pool.clone());
     assert_eq!(
-        resumed.replay(&schema, 100).await.unwrap(),
+        resumed.replay(&schema, BlockPosition(100)).await.unwrap(),
         vec![
             Row(vec![SqlValue::Text("a".into())]),
             Row(vec![SqlValue::Text("b".into())]),
@@ -616,8 +706,8 @@ async fn with_pool_store_resumes_replay_from_same_pool() {
         "a store rebuilt from the same pool must replay the full stored history in ascending block order"
     );
     assert_eq!(
-        resumed.last_block(&schema.table).await.unwrap(),
-        Some(13),
+        resumed.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(13)),
         "the rebuilt store must report the highest committed block as the resume point"
     );
 }
@@ -657,9 +747,9 @@ mod serving_parity {
             .col("count", SqlType::Integer)
             .col("amount", SqlType::Numeric);
         store
-            .write_block(
+            .write(
                 &schema,
-                1,
+                BlockPosition(1),
                 vec![Row(vec![
                     SqlValue::Text("alpha".into()),
                     SqlValue::Integer(10),
@@ -669,9 +759,9 @@ mod serving_parity {
             .await
             .unwrap();
         store
-            .write_block(
+            .write(
                 &schema,
-                2,
+                BlockPosition(2),
                 vec![Row(vec![
                     SqlValue::Text("beta".into()),
                     SqlValue::Integer(20),
@@ -744,9 +834,9 @@ mod serving_parity {
         // A table whose `_payload` column holds a non-JSON string.
         let schema = TableSchema::new("raw_evt").col("_payload", SqlType::Text);
         store
-            .write_block(
+            .write(
                 &schema,
-                1,
+                BlockPosition(1),
                 vec![Row(vec![SqlValue::Text("not valid json".into())])],
             )
             .await
@@ -821,4 +911,85 @@ mod serving_parity {
             );
         }
     }
+}
+
+/// Phase 3 migration parity [position-trait.MIGRATE.1/.2]: on PostgreSQL, an
+/// archive written under the OLD two-column schema (`table_name`, `last_block`
+/// BIGINT) resumes to the SAME `BlockPosition` before the first write (via the
+/// read-side `last_block` fallback) and is migrated in-transaction on the first
+/// write (ADD COLUMN + CAST backfill), after which the encoded `position` column
+/// decodes to the same block — mirroring the SQLite migration test.
+#[tokio::test]
+async fn pg_pre_migration_archive_migrates_on_first_write() {
+    let (_container, url) = start_postgres().await;
+
+    // Fabricate a pre-change two-column archive with a stored `last_block = 42`.
+    {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE _artemis_progress \
+             (table_name TEXT PRIMARY KEY, last_block BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _artemis_progress (table_name, last_block) VALUES ('value_set', 42)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let store = PostgresStore::connect(&url).await.unwrap();
+    let schema = value_set_schema();
+
+    // BEFORE the first write: the `position` column does not exist (SQLSTATE
+    // 42703), so stored_position falls back to decoding `last_block`.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(42)),
+        "a pre-migration Postgres archive must resume at the same block before its first write"
+    );
+
+    // The first write migrates in-transaction and re-observes block 42.
+    store
+        .write(
+            &schema,
+            BlockPosition(42),
+            vec![Row(vec![SqlValue::Text("x".into())])],
+        )
+        .await
+        .unwrap();
+
+    // AFTER the first write: the migrated `position` column decodes to the same
+    // BlockPosition.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(42)),
+        "the migrated Postgres position column must decode to the same block"
+    );
+
+    // Inspect the archive directly: the `position` column now exists and holds
+    // CAST(last_block AS TEXT) for the previously integer-only row.
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (encoded,): (String,) =
+        sqlx::query_as("SELECT position FROM _artemis_progress WHERE table_name = 'value_set'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(
+        encoded, "42",
+        "the Postgres migration must store CAST(last_block AS TEXT) in the position column"
+    );
 }
