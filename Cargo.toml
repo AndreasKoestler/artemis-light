@@ -108,3 +108,12 @@ name = "serving_example"
 path = "examples/serving_example.rs"
 ## Builds only under the opt-in `serving` feature (the example uses `ServingLayer`).
 required-features = ["serving"]
+
+[[example]]
+name = "injected_pool_example"
+path = "examples/injected_pool_example.rs"
+## Builds only under the opt-in `postgres` feature (the example uses
+## `PostgresStore::with_pool`); wiring it as a required-features target keeps
+## `cargo build --examples`, clippy `--all-targets`, and CI `--all-features`
+## compiling it so it cannot silently bit-rot (inject-pool.EXAMPLE.2).
+required-features = ["postgres"]

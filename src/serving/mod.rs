@@ -34,12 +34,27 @@ const DEFAULT_PAGE_LIMIT: u64 = 100;
 /// Default upper bound a requested `limit` is clamped to.
 const DEFAULT_MAX_LIMIT: u64 = 1000;
 
+/// Where a [`ServingLayer`] reads from. Kept private so the URL-less injected
+/// state (a Postgres pool with no URL) is unrepresentable through the public
+/// API; `build_backend` matches on it to pick a backend. (Inferred — the design
+/// names `BackendSource` as the modelling choice; this private-field refactor
+/// replaces the former `database_url: String` field and is allowed.)
+enum BackendSource {
+    /// A database URL the layer opens its own read-only pool from, selected by
+    /// scheme (`postgres://` / `postgresql://` / `sqlite:` / bare path).
+    Url(String),
+    /// A caller-owned Postgres pool the layer borrows as-is and never closes or
+    /// reconfigures (inject-pool.SERVING.1, inject-pool.OWNERSHIP.2).
+    #[cfg(feature = "postgres")]
+    InjectedPg(sqlx::PgPool),
+}
+
 /// Builder and entry point for the read-only HTTP serving layer.
 ///
 /// Construct with [`ServingLayer::new`], optionally tune with the `with_*`
 /// setters, then run with [`ServingLayer::serve`].
 pub struct ServingLayer {
-    database_url: String,
+    source: BackendSource,
     addr: SocketAddr,
     max_connections: u32,
     default_limit: u64,
@@ -51,13 +66,53 @@ impl ServingLayer {
     /// passed to [`SqliteStore::connect`](crate::persistence::SqliteStore)),
     /// bound to `addr`.
     pub fn new(database_url: impl Into<String>, addr: SocketAddr) -> Self {
+        Self::with_source(BackendSource::Url(database_url.into()), addr)
+    }
+
+    /// Shared field initialiser: bind `source` to `addr` with the default
+    /// connection/limit knobs, so [`new`](Self::new) and `from_pg_pool` start
+    /// from identical defaults. The `max_connections` default sizes the
+    /// read-only pool the URL path opens; it is ignored on the injected path,
+    /// where the caller already sized the pool.
+    fn with_source(source: BackendSource, addr: SocketAddr) -> Self {
         Self {
-            database_url: database_url.into(),
+            source,
             addr,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             default_limit: DEFAULT_PAGE_LIMIT,
             max_limit: DEFAULT_MAX_LIMIT,
         }
+    }
+
+    /// Build a serving layer that reads through a caller-supplied
+    /// [`sqlx::PgPool`], bound to `addr` — the serving twin of
+    /// [`PostgresStore::with_pool`](crate::persistence::PostgresStore). It
+    /// serves the same rows and watermarks as a URL-constructed Postgres backend
+    /// over the same data, using the same default limits as [`new`](Self::new)
+    /// (inject-pool.SERVING.1). Compiled only under the `postgres` feature.
+    ///
+    /// # Pool ownership
+    ///
+    /// The pool is *borrowed*: the layer reads through it but never closes it
+    /// and never reconfigures it. Unlike the URL path — which installs `SET
+    /// default_transaction_read_only = on` on every pooled connection via an
+    /// `after_connect` hook — this constructor installs **no** session setting,
+    /// no `after_connect` hook, and no pool-option mutation, because doing so
+    /// would reconfigure sessions the caller's own writers share
+    /// (inject-pool.OWNERSHIP.2). The backend's SQL is SELECT-only by
+    /// construction, so hard read-only *enforcement* on an injected pool is the
+    /// caller's choice, not something the layer imposes.
+    ///
+    /// # Builder setters
+    ///
+    /// [`with_default_limit`](Self::with_default_limit) and
+    /// [`with_max_limit`](Self::with_max_limit) apply unchanged on this path.
+    /// [`with_max_connections`](Self::with_max_connections) is accepted but
+    /// **ignored** here: the injected pool is already sized by the caller, and
+    /// the layer neither inspects nor caps its connection count.
+    #[cfg(feature = "postgres")]
+    pub fn from_pg_pool(pool: sqlx::PgPool, addr: SocketAddr) -> Self {
+        Self::with_source(BackendSource::InjectedPg(pool), addr)
     }
 
     /// Set the read-only connection-pool size (default 4).
@@ -92,31 +147,50 @@ impl ServingLayer {
         Ok(routes::router(state))
     }
 
-    /// Select and open the read-only storage backend from the database URL
-    /// scheme (postgres-store.SERVE.2): `sqlite:` (or a bare path) opens a
-    /// SQLite backend. An unrecognised scheme is an error rather than a panic
-    /// (postgres-store.SERVE.4-adjacent UnknownSchemeOrFeatureOff). The
-    /// `postgres://` scheme is wired to a PostgreSQL backend in a later phase.
+    /// Build the read-only storage backend from the layer's `BackendSource`.
+    ///
+    /// An injected Postgres pool (from `from_pg_pool`) is wrapped as-is via
+    /// `PgBackend::with_pool` — no `after_connect` hook, no session `SET`, no
+    /// pool-option mutation: the borrowed pool is never reconfigured
+    /// (inject-pool.OWNERSHIP.2). A URL source selects a backend by scheme
+    /// (postgres-store.SERVE.2): `postgres://` / `postgresql://` opens a
+    /// PostgreSQL backend (under the `postgres` feature), `sqlite:` (or a bare
+    /// path) opens a SQLite backend. An unrecognised scheme is an error rather
+    /// than a panic (postgres-store.SERVE.4-adjacent UnknownSchemeOrFeatureOff).
     async fn build_backend(&self) -> anyhow::Result<Arc<dyn ServingBackend>> {
-        let url = self.database_url.as_str();
-        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        match &self.source {
+            // Injected-pool path: wrap the caller's pool as-is. No connect
+            // round-trip and no reconfiguration of the borrowed pool
+            // (inject-pool.SERVING.1, inject-pool.OWNERSHIP.2, OQ-2).
             #[cfg(feature = "postgres")]
-            {
-                let backend = backend::PgBackend::connect(url, self.max_connections)
-                    .await
-                    .context("cannot start serving layer")?;
-                return Ok(Arc::new(backend));
+            BackendSource::InjectedPg(pool) => {
+                Ok(Arc::new(backend::PgBackend::with_pool(pool.clone())))
             }
-            #[cfg(not(feature = "postgres"))]
-            anyhow::bail!("PostgreSQL serving requires the `postgres` feature to be enabled");
+            // URL path: select and open a backend by scheme (unchanged).
+            BackendSource::Url(database_url) => {
+                let url = database_url.as_str();
+                if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                    #[cfg(feature = "postgres")]
+                    {
+                        let backend = backend::PgBackend::connect(url, self.max_connections)
+                            .await
+                            .context("cannot start serving layer")?;
+                        return Ok(Arc::new(backend));
+                    }
+                    #[cfg(not(feature = "postgres"))]
+                    anyhow::bail!(
+                        "PostgreSQL serving requires the `postgres` feature to be enabled"
+                    );
+                }
+                if url.starts_with("sqlite:") || !url.contains("://") {
+                    let pool = pool::open_read_only_pool(url, self.max_connections)
+                        .await
+                        .context("cannot start serving layer")?;
+                    return Ok(Arc::new(SqliteBackend::new(pool)));
+                }
+                anyhow::bail!("unsupported database URL scheme: {url}")
+            }
         }
-        if url.starts_with("sqlite:") || !url.contains("://") {
-            let pool = pool::open_read_only_pool(url, self.max_connections)
-                .await
-                .context("cannot start serving layer")?;
-            return Ok(Arc::new(SqliteBackend::new(pool)));
-        }
-        anyhow::bail!("unsupported database URL scheme: {url}")
     }
 
     /// Serve the read-only HTTP API on the configured address until `shutdown`

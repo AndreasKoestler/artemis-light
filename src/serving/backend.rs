@@ -132,6 +132,18 @@ mod pg {
             Ok(Self { pool })
         }
 
+        /// Wrap a caller-supplied pool as a read-only serving backend, the
+        /// serving twin of
+        /// [`PostgresStore::with_pool`](crate::persistence::PostgresStore).
+        /// Unlike [`connect`](Self::connect), this installs **no**
+        /// `after_connect` hook (no `SET default_transaction_read_only = on`)
+        /// and does no connect round-trip: the borrowed pool is used as-is and
+        /// never reconfigured (inject-pool.SERVING.1, inject-pool.OWNERSHIP.2).
+        /// Stays `pub(crate)` — not public API (§3 Option A).
+        pub(crate) fn with_pool(pool: PgPool) -> Self {
+            Self { pool }
+        }
+
         #[cfg(test)]
         pub(crate) fn pool(&self) -> &PgPool {
             &self.pool

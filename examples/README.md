@@ -19,6 +19,7 @@ Suggested reading order:
 | [`confirmation_depth_example`](confirmation_depth_example.rs) | Lagging the store behind the live edge with `.with_confirmation_depth(n)` so a shallow reorg is absorbed before any row is written; events still arrive live | Anvil |
 | [`onchain_example`](onchain_example.rs) | An end-to-end on-chain pipeline: `BlockCollector` → strategy → `MempoolExecutor` submitting real transactions | Anvil |
 | [`serving_example`](serving_example.rs) | Indexing events into a file-backed SQLite store, standing up the read-only `ServingLayer` over it, and navigating the HTTP/JSON API (health, status, tables, schema, paged rows) with a tiny client | Anvil |
+| [`injected_pool_example`](injected_pool_example.rs) | Bring-your-own PostgreSQL pool: building a `PostgresStore` from a caller-owned `sqlx::PgPool` with `with_pool`, persisting events, rebuilding a second store from the **same** pool to replay history, then proving the injected pool is still open after every store handle is dropped | Anvil + Postgres |
 
 Run any of them with:
 
@@ -34,3 +35,60 @@ The Anvil-backed examples spawn their own local chain; they only need
 ```sh
 cargo run --example serving_example --features serving
 ```
+
+`injected_pool_example` needs the opt-in `postgres` feature and a real
+PostgreSQL database — it reads its connection string from `DATABASE_URL` and
+never provisions a database itself. The quickest local Postgres is one line of
+Docker:
+
+```sh
+docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+```
+
+Then, with `anvil` on `$PATH`, point `DATABASE_URL` at it and run:
+
+```sh
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo run --example injected_pool_example --features postgres
+```
+
+Run without `DATABASE_URL` set and the example exits `1` with:
+
+```
+Error: DATABASE_URL must be set to a PostgreSQL URL, e.g. postgres://postgres:postgres@localhost:5432/postgres
+```
+
+The example drops its own `value_set` and `_artemis_progress` tables at startup
+(over the caller's pool) so re-runs are deterministic; point it only at a demo
+database.
+
+**Verified run.** This example has been executed end-to-end against a real
+PostgreSQL (not merely compiled). Environment: macOS, `postgres:16` in Docker
+via the one-liner above, Foundry `anvil` on `$PATH`, crate built with
+`--features postgres`, on 2026-07-01. With `DATABASE_URL` of the shape
+`postgres://postgres:postgres@localhost:<port>/postgres` pointing at the
+container, `cargo run --example injected_pool_example --features postgres` exited
+`0` and printed exactly:
+
+```
+First run — persisting 3 events through the injected pool:
+  [live] ValueSet(10)
+  [live] ValueSet(20)
+  [live] ValueSet(30)
+Highest persisted block: 3
+Restart — a new store over the same injected pool recovers history:
+  [recovered] ValueSet(10)
+  [recovered] ValueSet(20)
+  [recovered] ValueSet(30)
+Store dropped — injected pool still usable: SELECT 1 succeeded
+Done!
+```
+
+The stored resume point advances (`Highest persisted block: 3`), the second
+store recovers all three events from the **same** pool, and the injected pool
+still answers `SELECT 1` after every store handle is dropped. At rest the
+database holds two `value_set` rows (blocks 2 and 3, values 10 and 20) plus the
+`_artemis_progress` watermark `value_set → 3`; the third event occupies the
+still-open latest block and is recovered on the restart leg by chain backfill
+(the pipeline flushes a block only once a higher block is observed). A second
+run reproduces byte-identical output thanks to the startup table reset.

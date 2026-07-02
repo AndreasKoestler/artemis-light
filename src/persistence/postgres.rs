@@ -37,6 +37,56 @@ impl PostgresStore {
             .await?;
         Ok(SqlStore::new(pool, PgDialect))
     }
+
+    /// Build a store over a caller-supplied `sqlx::PgPool`, wrapping it with the
+    /// [`PgDialect`] via the shared [`SqlStore::new`](super::SqlStore) seam — the
+    /// same seam [`connect`](Self::connect) uses, so both construction paths drive
+    /// the identical `write_block` / `last_block` / `replay` orchestration
+    /// (inject-pool.STORE.1, inject-pool.STORE.4). Compiled only under the
+    /// `postgres` feature (inject-pool.SCOPE.1).
+    ///
+    /// This is a plain synchronous constructor: it performs no connect
+    /// round-trip, no I/O, and no DDL, and accepts a pool of any connection count
+    /// without capping or overriding it (inject-pool.STORE.2, inject-pool.STORE.5).
+    ///
+    /// # Pool ownership
+    ///
+    /// The pool is *borrowed*: the store holds a handle to it but never closes it
+    /// and never reconfigures it (no `after_connect` hook, no session `SET`, no
+    /// pool-option mutation). Dropping the store leaves the caller's pool open and
+    /// usable; the pool's lifecycle stays the caller's
+    /// (inject-pool.OWNERSHIP.1, inject-pool.OWNERSHIP.2).
+    ///
+    /// # Single writer / gap-free prefix
+    ///
+    /// Injecting a multi-connection pool does not by itself weaken the
+    /// gap-free-prefix durability guarantee: the persistence pipeline drives one
+    /// writer per stream, awaiting each `write_block` commit before the next, so a
+    /// single stream's writes are never reordered regardless of pool size. This
+    /// holds provided the caller does not point two persisting collectors at the
+    /// same table on the same pool — serializing writes across collectors is the
+    /// caller's responsibility, not enforced by this constructor
+    /// (inject-pool.WRITER.1).
+    ///
+    /// # Tables created
+    ///
+    /// artemis-light lazily creates `_artemis_progress` (the per-table watermark
+    /// bookkeeping table) plus one table per event type on the first `write_block`.
+    /// These are created unqualified, landing in the pool's default `search_path`.
+    /// If that default is not `public`, persistence still works, but the serving
+    /// layer's introspection queries (which look under `table_schema = 'public'`)
+    /// will not see them (inject-pool.SCHEMA_DOCS.1).
+    ///
+    /// # Deferred error surfacing
+    ///
+    /// Because construction does no I/O, connectivity and permission errors do not
+    /// surface here. A pool pointing at an unreachable or misconfigured server
+    /// still constructs a store successfully; the error appears at the first store
+    /// operation instead — mirroring how [`connect`](Self::connect) surfaces the
+    /// same failures at connect time (inject-pool.ERRORS.1).
+    pub fn with_pool(pool: sqlx::PgPool) -> Self {
+        SqlStore::new(pool, PgDialect)
+    }
 }
 
 #[cfg(test)]

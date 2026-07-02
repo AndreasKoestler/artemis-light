@@ -5,6 +5,7 @@
 #![cfg(feature = "postgres")]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::U256;
 use alloy::sol;
@@ -16,6 +17,7 @@ use artemis_light::persistence::{
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
 use futures::StreamExt;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -380,6 +382,246 @@ async fn sqlite_postgres_replay_parity() {
     assert_eq!(pg_rows, expected);
 }
 
+/// A store built from a caller-supplied pool via `with_pool` behaves byte-for-byte
+/// identically to one built from a URL via `connect`: identical blocks written
+/// through each yield identical replay rows and identical `last_block`
+/// (inject-pool.STORE.1, inject-pool.STORE.4, inject-pool.PARITY.1). The injected
+/// pool is multi-connection (`max_connections(5)`) to exercise the no-cap contract
+/// (inject-pool.STORE.5); the empty-state reads before any write confirm the
+/// missing-table classification is unchanged on the injected path. External
+/// behaviour is asserted through the public `Store` API only (replay + last_block),
+/// never `write_block`'s SQL internals.
+#[tokio::test]
+async fn with_pool_store_matches_connect_store_parity() {
+    // One container backs both stores; two distinct event tables keep their
+    // watermarks independent (the shared `_artemis_progress` keys by table name),
+    // so the stores do not interfere. The guard is held for the test's duration.
+    let (_container, url) = start_postgres().await;
+
+    // URL path: the existing single-connection `connect` constructor.
+    let url_store = PostgresStore::connect(&url).await.unwrap();
+    let url_schema = TableSchema::new("events_url").col("value", SqlType::Text);
+
+    // Injected path: a caller-owned multi-connection pool handed to `with_pool`.
+    // `max_connections(5)` exercises the no-cap contract — the constructor neither
+    // inspects nor overrides the count (inject-pool.STORE.5).
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .unwrap();
+    let pool_store = PostgresStore::with_pool(pool);
+    let pool_schema = TableSchema::new("events_pool").col("value", SqlType::Text);
+
+    // Empty state before any write: `last_block` is `None` and `replay` is empty on
+    // both paths (missing-table classification via SQLSTATE 42P01, unchanged).
+    assert_eq!(url_store.last_block(&url_schema.table).await.unwrap(), None);
+    assert_eq!(
+        pool_store.last_block(&pool_schema.table).await.unwrap(),
+        None
+    );
+    assert!(url_store.replay(&url_schema, 100).await.unwrap().is_empty());
+    assert!(
+        pool_store
+            .replay(&pool_schema, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Identical blocks written through each store into its own event table.
+    let block1 = vec![
+        Row(vec![SqlValue::Text("0x2a".into())]),
+        Row(vec![SqlValue::Text("0x2b".into())]),
+    ];
+    let block2 = vec![Row(vec![SqlValue::Text("0x2c".into())])];
+
+    for (store, schema) in [(&url_store, &url_schema), (&pool_store, &pool_schema)] {
+        store.write_block(schema, 5, block1.clone()).await.unwrap();
+        store.write_block(schema, 9, block2.clone()).await.unwrap();
+    }
+
+    // Parity through the public `Store` API only: equal replay row-vectors and
+    // equal `last_block` per table (inject-pool.PARITY.1, inject-pool.STORE.4).
+    let url_rows = url_store.replay(&url_schema, 100).await.unwrap();
+    let pool_rows = pool_store.replay(&pool_schema, 100).await.unwrap();
+    assert_eq!(
+        url_rows, pool_rows,
+        "connect(url) and with_pool(pool) must replay identical rows"
+    );
+
+    // And both match the originally written blocks in ascending order.
+    let expected: Vec<Row> = block1.into_iter().chain(block2).collect();
+    assert_eq!(url_rows, expected);
+
+    let url_last = url_store.last_block(&url_schema.table).await.unwrap();
+    let pool_last = pool_store.last_block(&pool_schema.table).await.unwrap();
+    assert_eq!(
+        url_last, pool_last,
+        "connect(url) and with_pool(pool) must report identical last_block"
+    );
+    assert_eq!(url_last, Some(9));
+}
+
+/// The injected-pool path defers connectivity errors to first store use, mirroring
+/// how the eager `connect` path (see `postgres_connect_invalid_url_errors` above)
+/// surfaces them at connect time. Over a *lazily-connected* pool pointing at an
+/// unreachable server (port 1, nothing listening), `with_pool` constructs a store
+/// synchronously and infallibly — no connect round-trip, no I/O at construction
+/// (inject-pool.STORE.2) — and the connectivity error surfaces only when the first
+/// store operation actually touches the pool (inject-pool.ERRORS.1). Because
+/// construction is effect-free, that failed first use leaves no partial state to
+/// clean up: the store never reached the server, so nothing was written.
+///
+/// No Docker / container is needed — the pool is lazy and never reaches a server.
+#[tokio::test]
+async fn with_pool_defers_connectivity_errors_to_first_use() {
+    // Connect options targeting port 1 — the same unreachable target the eager
+    // `connect` prior art uses — so the URL path's errors-at-connect and the
+    // injected path's errors-at-first-use are pinned against the same failure.
+    let opts: PgConnectOptions = "postgres://postgres:postgres@127.0.0.1:1/postgres"
+        .parse()
+        .expect("parse connect options");
+
+    // `connect_lazy_with` opens no connection now (returns `Pool`, not a future),
+    // so no I/O happens at pool construction. A short acquire timeout bounds the
+    // first-use failure: a connection-refused error is retried with backoff until
+    // this deadline, then surfaces as `PoolTimedOut`.
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy_with(opts);
+
+    // Construction is synchronous and infallible: `with_pool` returns `Self`
+    // (no `.await`, no `Result`), so merely reaching this binding proves it did no
+    // connect round-trip and no I/O (inject-pool.STORE.2).
+    let store = PostgresStore::with_pool(pool);
+
+    // The connectivity error surfaces here, at the first store operation — not at
+    // construction. A connection failure is not the missing-table SQLSTATE (42P01),
+    // so `last_block` propagates it as `Err` rather than misclassifying it as
+    // `Ok(None)` (inject-pool.ERRORS.1).
+    let first_use = store.last_block("t").await;
+    assert!(
+        first_use.is_err(),
+        "first store use over an unreachable injected pool must surface the connectivity error"
+    );
+
+    // Effect-free construction leaves nothing to clean up: the store never reached
+    // the server, so no table was created and nothing was written. A second read
+    // fails the same way — the store fabricated no success and holds no partial or
+    // half-initialised state (inject-pool.ERRORS.1).
+    let follow_up = store.replay(&value_set_schema(), 100).await;
+    assert!(
+        follow_up.is_err(),
+        "a read over the same unreachable pool must also error, never fabricate state"
+    );
+}
+
+/// Dropping every handle to a `with_pool` store leaves the caller's injected pool
+/// open and usable — the store borrows the pool and never calls `.close()` on it
+/// (inject-pool.OWNERSHIP.1). The caller keeps its own handle (a `PgPool` clone is
+/// a handle to the same shared pool); the store gets another clone, actively uses
+/// it (a `write_block` acquires and returns a connection), and is then dropped. A
+/// `SELECT 1` on the caller's retained handle must still succeed, proving the
+/// store's drop glue released only its own handle and never closed the pool. The
+/// pool's lifecycle stays the caller's — released here by process/scope exit, never
+/// by artemis-light. External behaviour only: a query succeeding on the pool, no
+/// SQL internals asserted; the `ContainerAsync` guard is held for the test's
+/// duration.
+#[tokio::test]
+async fn with_pool_store_leaves_injected_pool_open_on_drop() {
+    let (_container, url) = start_postgres().await;
+
+    // Caller-owned pool; the store receives a clone — a handle to the SAME pool.
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    // Construct a store over the injected pool and actually use it (so the
+    // "still usable after drop" claim is non-vacuous: the store acquired and
+    // returned a connection from the borrowed pool), then drop every store handle.
+    {
+        let store = PostgresStore::with_pool(pool.clone());
+        let schema = value_set_schema();
+        store
+            .write_block(&schema, 1, vec![Row(vec![SqlValue::Text("x".into())])])
+            .await
+            .unwrap();
+        drop(store); // the store's PgPool clone is dropped by compiler drop glue only.
+    }
+
+    // The caller's retained handle still answers queries: the store never closed
+    // the borrowed pool (inject-pool.OWNERSHIP.1).
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("injected pool must remain open and usable after the store is dropped");
+    assert_eq!(
+        one, 1,
+        "SELECT 1 on the still-open injected pool must return 1"
+    );
+}
+
+/// Restart-resume over the same injected pool: persisting several blocks through a
+/// `with_pool` store, dropping it, then rebuilding a NEW store from the SAME pool
+/// yields a `replay` returning the full stored history and a `last_block` reporting
+/// the highest committed block (inject-pool.PARITY.2). The store is a stateless
+/// wrapper — the history lives in the database reached through the borrowed pool —
+/// so a fresh store handle over the same pool sees everything the first one wrote.
+/// External behaviour only: `replay` output and `last_block` through the public
+/// `Store` API, never SQL internals; the `ContainerAsync` guard is held for the
+/// test's duration.
+#[tokio::test]
+async fn with_pool_store_resumes_replay_from_same_pool() {
+    let (_container, url) = start_postgres().await;
+
+    // Caller-owned pool; each store gets a clone (a handle to the same pool).
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .unwrap();
+    let schema = value_set_schema();
+
+    // First store: persist several blocks in ascending order, then drop it.
+    {
+        let store = PostgresStore::with_pool(pool.clone());
+        store
+            .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("a".into())])])
+            .await
+            .unwrap();
+        store
+            .write_block(&schema, 9, vec![Row(vec![SqlValue::Text("b".into())])])
+            .await
+            .unwrap();
+        store
+            .write_block(&schema, 13, vec![Row(vec![SqlValue::Text("c".into())])])
+            .await
+            .unwrap();
+        drop(store); // every handle to the first store is gone before we rebuild.
+    }
+
+    // Rebuild a fresh store from the SAME injected pool: it resumes the full
+    // history and the highest committed watermark (inject-pool.PARITY.2).
+    let resumed = PostgresStore::with_pool(pool.clone());
+    assert_eq!(
+        resumed.replay(&schema, 100).await.unwrap(),
+        vec![
+            Row(vec![SqlValue::Text("a".into())]),
+            Row(vec![SqlValue::Text("b".into())]),
+            Row(vec![SqlValue::Text("c".into())]),
+        ],
+        "a store rebuilt from the same pool must replay the full stored history in ascending block order"
+    );
+    assert_eq!(
+        resumed.last_block(&schema.table).await.unwrap(),
+        Some(13),
+        "the rebuilt store must report the highest committed block as the resume point"
+    );
+}
+
 /// Serving-layer parity tests: an archive served over PostgreSQL must produce
 /// the same routes and JSON as the same archive served over SQLite
 /// (postgres-store.SERVE.1/.2/.3), and the serving connection must reject writes
@@ -520,5 +762,63 @@ mod serving_parity {
             Value::String("not valid json".into()),
             "a non-JSON _payload must fall back to the raw string"
         );
+    }
+
+    /// The Postgres serving backend built from a caller-supplied pool via
+    /// `ServingLayer::from_pg_pool` serves byte-identical route JSON — rows and
+    /// watermarks — to a URL-constructed backend over the same data
+    /// (inject-pool.SERVING.1). One container backs both layers: the archive is
+    /// seeded once over a separate writable connection, then read through a
+    /// URL-opened read-only pool (URL backend) and through a caller-injected
+    /// pool (injected backend). The injected pool is handed over as a plain
+    /// writable pool and is deliberately *not* reconfigured — no
+    /// `SET default_transaction_read_only`, no session guard — because serving
+    /// is SELECT-only by construction (inject-pool.OWNERSHIP.2, OQ-2); its route
+    /// output must still match the URL backend's exactly. The `ContainerAsync`
+    /// guard is held for the test's duration.
+    #[tokio::test]
+    async fn pg_serving_from_injected_pool_matches_url_backend() {
+        let (_container, url) = start_postgres().await;
+
+        // Seed the archive once over a separate writable connection, through the
+        // public `Store` API (the same fixture as the SQLite-parity test).
+        let writer = PostgresStore::connect(&url).await.unwrap();
+        seed_serving(&writer).await;
+
+        // URL backend: the layer opens its own read-only pool from the URL.
+        let url_router = ServingLayer::new(url.clone(), any_addr())
+            .into_router()
+            .await
+            .unwrap();
+
+        // Injected backend: a caller-owned multi-connection pool handed to
+        // `from_pg_pool`, borrowed and used as-is (no read-only session guard
+        // installed on it).
+        let injected_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .unwrap();
+        let injected_router = ServingLayer::from_pg_pool(injected_pool, any_addr())
+            .into_router()
+            .await
+            .unwrap();
+
+        // Identical JSON across every route, including the /rows payload and the
+        // /status watermarks — /health also matches (both databases reachable).
+        for uri in [
+            "/health",
+            "/tables",
+            "/tables/evt/schema",
+            "/tables/evt/rows",
+            "/status",
+        ] {
+            let url_json = get_json(&url_router, uri).await;
+            let injected_json = get_json(&injected_router, uri).await;
+            assert_eq!(
+                url_json, injected_json,
+                "route {uri} must match between the URL and injected-pool backends"
+            );
+        }
     }
 }
