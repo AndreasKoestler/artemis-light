@@ -67,8 +67,7 @@ where
         // finalized watermark or the open group's fold is a re-observation
         // across an overlapping backfill — encode no row, touch no buffer, and
         // suppress it downstream. The Halt (block) path never dedupes, so its
-        // buffering and emission stay bit-identical [position-trait.DEDUP.1,
-        // position-trait.DEDUP.2].
+        // buffering and emission stay bit-identical.
         if P::REOBSERVATION == Reobservation::Dedupe && self.covered(&position) {
             return false;
         }
@@ -83,8 +82,10 @@ where
             // A backwards position means the open group's completeness can no
             // longer be trusted: flushing it would advance the stored watermark
             // past the late position's rows, leaving a permanent hole behind the
-            // gap-free watermark. (Unreachable on a Dedupe source: a strictly
-            // earlier position is always covered by the open group above.)
+            // gap-free watermark. On a Dedupe source this is an out-of-order
+            // genuinely-new event (a covered re-observation was suppressed
+            // above): the single-group writer cannot reorder, so it halts too —
+            // the watermark stays put and a restart's backfill re-fetches it.
             if pos_key < cur_key {
                 let cur = self.current.as_ref().expect("current is Some");
                 self.core.fail(format_args!(
@@ -120,9 +121,26 @@ where
 
     /// Whether `pos` is already covered by the finalized watermark or the open
     /// group's fold — the dedupe test for [`Reobservation::Dedupe`] positions.
+    ///
+    /// The open-group check is scoped to the group's own sort key, as in
+    /// [`ConfirmationWindow`](super::ConfirmationWindow): a frontier's
+    /// `contains` is true for ANY strictly-earlier instant, and `query_range`
+    /// promises no sort-key ordering, so an unscoped check would report an
+    /// out-of-order genuinely-new event as a re-observation and silently lose
+    /// it. Only the watermark — actually-stored history — covers earlier keys;
+    /// an uncovered event below the open group falls through to the
+    /// backwards-position halt.
     fn covered(&self, pos: &P) -> bool {
         self.watermark.as_ref().is_some_and(|w| w.contains(pos))
-            || self.current.as_ref().is_some_and(|c| c.contains(pos))
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|c| c.sort_key() == pos.sort_key() && c.contains(pos))
+    }
+
+    /// Whether the writer may still persist (see [`GapFreeWriter::healthy`]).
+    pub(super) fn healthy(&self) -> bool {
+        self.core.healthy()
     }
 
     /// Flush the trailing group. Only correct when the source delivered the
@@ -305,6 +323,35 @@ mod tests {
             store.positions()[0],
             TestFrontier::at(2000, 0xc2),
             "the 2000 group carries only the new identity"
+        );
+    }
+
+    /// `query_range` promises no sort-key ordering, and a frontier's `contains`
+    /// is true for ANY strictly-earlier instant — so an out-of-order,
+    /// genuinely-new event during backfill must not be swallowed by the open
+    /// group's coverage. The covered test is scoped to the open group's own
+    /// sort key; below it, the single-group writer cannot reorder, so it halts
+    /// (nothing flushes past the unwritten event, and the unadvanced watermark
+    /// lets a restart re-fetch it) while the event still flows downstream.
+    #[tokio::test]
+    async fn out_of_order_new_event_is_not_silently_suppressed() {
+        let store = RecordingStore::<TestFrontier>::default();
+        let mut writer = frontier_writer(&store, None);
+
+        assert!(writer.record(TestFrontier::at(2000, 0xc1), &ping(1)).await);
+        // Genuinely new, merely out of order: it was never stored and is not in
+        // the open group's slot, so it must not be suppressed as a
+        // re-observation.
+        assert!(
+            writer.record(TestFrontier::at(1500, 0xb1), &ping(2)).await,
+            "an uncovered out-of-order event must not be suppressed"
+        );
+        writer.finish().await;
+
+        assert_eq!(
+            store.written(),
+            Vec::<u64>::new(),
+            "no group may flush past the unordered event's unwritten position"
         );
     }
 

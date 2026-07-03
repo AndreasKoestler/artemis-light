@@ -8,11 +8,21 @@ use tokio::time::Instant;
 
 /// `RateLimit` is a wrapper around an [`Executor`] that caps submissions to
 /// `per_second` per sliding one-second window, to respect provider limits.
-/// An action over the cap is not dropped — `execute` waits until the oldest
-/// submission leaves the window, applying backpressure to the action channel.
+/// An action over the cap is not dropped by this wrapper — `execute` waits
+/// until the oldest submission leaves the window. The wait shields only the
+/// action already in hand: the engine's action channel is a lossy broadcast,
+/// so actions queued behind the stalled executor task can still be dropped if
+/// the ring wraps — size the engine's `action_channel_capacity` for the
+/// backlog a sustained over-cap burst produces.
 ///
 /// Every attempt counts against the window, including failed ones: a failed
-/// submission still spent provider quota.
+/// submission still spent provider quota. That accounting assumes each real
+/// submission passes through this wrapper: composed *outside* a `Retry`, the
+/// retry loop re-submits on its inner executor, so up to `1 + max_retries`
+/// submissions consume one window slot — exactly during failure bursts. To
+/// count every attempt, compose the limit inside the retry:
+/// `executor.rate_limit(n).retry(p)`; retries then wait out the window like
+/// any other submission.
 pub struct RateLimit<A> {
     executor: Box<dyn Executor<A>>,
     per_second: u32,

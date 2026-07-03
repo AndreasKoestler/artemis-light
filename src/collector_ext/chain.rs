@@ -50,7 +50,8 @@ pub struct ChainAll<E> {
 /// same contract as [`Chain`]: eager subscribe (later sources buffer at their
 /// source while earlier segments drain), any failure fails the whole
 /// subscribe, and the sources share one lifecycle (one Collector Driver, one
-/// Reconnect Policy).
+/// Reconnect Policy). An empty set fails subscribe outright, like
+/// [`fallback_all`](super::fallback_all).
 pub fn chain_all<E>(sources: Vec<Box<dyn Collector<E>>>) -> ChainAll<E> {
     ChainAll { sources }
 }
@@ -58,6 +59,11 @@ pub fn chain_all<E>(sources: Vec<Box<dyn Collector<E>>>) -> ChainAll<E> {
 #[async_trait]
 impl<E: Send + Sync + 'static> Collector<E> for ChainAll<E> {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
+        // An empty composite would yield an instantly-ended stream, which the
+        // reconnect driver treats as a lost stream — fail loudly instead.
+        if self.sources.is_empty() {
+            anyhow::bail!("chain_all has no sources; nothing to subscribe to");
+        }
         let mut streams = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
             streams.push(source.subscribe().await?);
@@ -65,5 +71,24 @@ impl<E: Send + Sync + 'static> Collector<E> for ChainAll<E> {
         // The sources are already subscribed, so flattening their streams in
         // order is sequential delivery, not lazy subscription.
         Ok(Box::pin(futures::stream::iter(streams).flatten()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty composite would yield an instantly-ended stream, which the
+    /// reconnect driver treats as a lost stream — reconnect-looping to Fatal
+    /// instead of naming the misconfiguration. Fail subscribe instead, like
+    /// [`fallback_all`](super::super::fallback_all).
+    #[tokio::test]
+    async fn chain_all_with_no_sources_fails_subscribe() {
+        let sources: Vec<Box<dyn Collector<i32>>> = vec![];
+        let err = match chain_all(sources).subscribe().await {
+            Ok(_) => panic!("an empty chain_all must fail subscribe, not yield an ended stream"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no sources"), "got: {err:#}");
     }
 }

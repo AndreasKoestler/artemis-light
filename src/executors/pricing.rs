@@ -66,6 +66,19 @@ pub struct GasBidInfo {
     pub bid_percentage: u64,
 }
 
+/// Scale `v` by `percent` (100 = as-is). Multiply-then-divide keeps the result
+/// exact for the realistic fee range; if the intermediate product overflows,
+/// saturate to `u128::MAX` rather than wrapping or losing the `/100` precision
+/// on small fees. The one home for the fee-scaling arithmetic, so
+/// [`price_1559`]'s bump and share and [`escalate`]'s replacement bump cannot
+/// drift on the overflow policy.
+fn scale_percent(v: u128, percent: u64) -> u128 {
+    match v.checked_mul(percent as u128) {
+        Some(product) => product / 100,
+        None => u128::MAX,
+    }
+}
+
 /// Price a transaction's EIP-1559 fees. Without a `bid`, the priority fee is the
 /// provider's suggestion scaled by `bump_percent` and `max_fee` is the base
 /// headroom plus that bumped priority. With a `bid`, `max_fee` is the
@@ -82,7 +95,7 @@ pub fn price_1559(
     let base_headroom = est
         .max_fee_per_gas
         .saturating_sub(est.max_priority_fee_per_gas);
-    let bumped_priority = est.max_priority_fee_per_gas * bump_percent as u128 / 100;
+    let bumped_priority = scale_percent(est.max_priority_fee_per_gas, bump_percent);
 
     let (max_fee_per_gas, max_priority_fee_per_gas) = match bid {
         Some(bid) => {
@@ -99,10 +112,13 @@ pub fn price_1559(
                 ));
             }
             let breakeven = bid.total_profit / gas_usage as u128;
-            let max_fee = breakeven * bid.bid_percentage as u128 / 100;
+            let max_fee = scale_percent(breakeven, bid.bid_percentage);
             (max_fee, bumped_priority)
         }
-        None => (base_headroom + bumped_priority, bumped_priority),
+        None => (
+            base_headroom.saturating_add(bumped_priority),
+            bumped_priority,
+        ),
     };
 
     Ok(Fees::clamped(max_fee_per_gas, max_priority_fee_per_gas))
@@ -116,18 +132,9 @@ pub fn price_1559(
 /// monotonic, so an already-valid pair stays valid; the [`Fees::clamped`] build
 /// is therefore a no-op on the invariant and simply can't emit an invalid pair.
 pub fn escalate(fees: Fees, escalation_percent: u64) -> Fees {
-    let scale = |v: u128| {
-        // Multiply-then-divide keeps the result exact for the realistic fee
-        // range; if the intermediate product overflows, saturate to `u128::MAX`
-        // rather than wrapping or losing the `/100` precision on small fees.
-        match v.checked_mul(escalation_percent as u128) {
-            Some(product) => product / 100,
-            None => u128::MAX,
-        }
-    };
     Fees::clamped(
-        scale(fees.max_fee_per_gas),
-        scale(fees.max_priority_fee_per_gas),
+        scale_percent(fees.max_fee_per_gas, escalation_percent),
+        scale_percent(fees.max_priority_fee_per_gas, escalation_percent),
     )
 }
 
@@ -224,6 +231,34 @@ mod test {
         let fees = price_1559(est(10, 100), 21_000, 100, None).unwrap();
         assert_eq!(fees.max_fee_per_gas(), 100);
         assert_eq!(fees.max_priority_fee_per_gas(), 100);
+    }
+
+    #[test]
+    fn no_bid_saturates_max_fee_instead_of_overflowing() {
+        // headroom = MAX - 10, bumped priority = 20: their sum overflows —
+        // saturate to `u128::MAX` like `escalate` does, rather than wrapping.
+        let fees = price_1559(est(u128::MAX, 10), 21_000, 200, None).unwrap();
+        assert_eq!(fees.max_fee_per_gas(), u128::MAX);
+        assert_eq!(fees.max_priority_fee_per_gas(), 20);
+    }
+
+    #[test]
+    fn no_bid_saturates_a_priority_bump_that_overflows() {
+        // priority * 150 overflows the intermediate product: saturate, don't wrap.
+        let fees = price_1559(est(u128::MAX, u128::MAX), 21_000, 150, None).unwrap();
+        assert_eq!(fees.max_priority_fee_per_gas(), u128::MAX);
+        assert_eq!(fees.max_fee_per_gas(), u128::MAX);
+    }
+
+    #[test]
+    fn bid_saturates_a_breakeven_share_that_overflows() {
+        // breakeven = MAX/1; * 50 overflows the intermediate product.
+        let bid = GasBidInfo {
+            total_profit: u128::MAX,
+            bid_percentage: 50,
+        };
+        let fees = price_1559(est(100, 10), 1, 100, Some(&bid)).unwrap();
+        assert_eq!(fees.max_fee_per_gas(), u128::MAX);
     }
 
     #[test]

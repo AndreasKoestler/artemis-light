@@ -4,11 +4,10 @@
 //! It models a HyperCore-shaped `userNonFundingLedgerUpdates` feed — entries of
 //! the form `{ time, hash, delta }` — and drives the full durable-persistence
 //! flow end to end on an **in-memory SQLite** store with an **in-process scripted
-//! feed**: no network, no external database, no live L1 connection
-//! [position-trait.EXAMPLE.4].
+//! feed**: no network, no external database, no live L1 connection.
 //!
 //! The scripted feed deliberately exercises the two things a bare block number
-//! cannot express [position-trait.EXAMPLE.2]:
+//! cannot express:
 //!
 //! - **Same-millisecond events** — `(1000, "0xa1")` and `(1000, "0xa2")` share
 //!   one instant, so the frontier's per-instant seen-set (not a scalar) is what
@@ -17,11 +16,10 @@
 //!   store re-serves `(2000, "0xc1")` (already stored) alongside a genuinely new
 //!   same-instant sibling `(2000, "0xc2")` and a later `(2500, "0xd1")`, so the
 //!   writer's dedupe path turns at-least-once delivery into exactly-once stored
-//!   effect [position-trait.EXAMPLE.3].
+//!   effect.
 //!
-//! A verified run producing the four fixed stdout lines and exiting `0` is the
-//! acceptance bar; compiling is explicitly not sufficient
-//! [position-trait.EXAMPLE.6]. Any failed assertion panics with a non-zero exit.
+//! A successful run prints four fixed stdout lines and exits `0`; any failed
+//! assertion panics with a non-zero exit.
 //!
 //! Note the frontier does **not** solve completeness or finality: a late event
 //! arriving below the frontier boundary instant is deliberately skipped, and
@@ -51,10 +49,9 @@ use serde::{Deserialize, Serialize};
 const TABLE: &str = "ledger_updates";
 
 /// One entry of the simulated feed, mirroring HyperCore's
-/// `userNonFundingLedgerUpdates` shape: `{ time, hash, delta }`
-/// [position-trait.EXAMPLE.1]. A plain serde type — deliberately *not* a
-/// `SolEvent` — so it can only be persisted through the SolEvent-free
-/// `with_persistence_named` entry point.
+/// `userNonFundingLedgerUpdates` shape: `{ time, hash, delta }`. A plain serde
+/// type — deliberately *not* a `SolEvent` — so it can only be persisted through
+/// the SolEvent-free `with_persistence_named` entry point.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct LedgerUpdate {
     /// The event instant in milliseconds — the frontier's sort key.
@@ -75,10 +72,10 @@ struct SpotTransferDelta {
     destination: String,
 }
 
-/// A scripted, in-process ledger feed keyed by a [`TimeFrontier`]
-/// [position-trait.EXAMPLE.2]. It holds a list of `(time_ms, hash)` entries and
-/// serves them through the [`PersistableCollector`] contract; there is no
-/// network and no external service behind it.
+/// A scripted, in-process ledger feed keyed by a [`TimeFrontier`]. It holds a
+/// list of `(time_ms, hash)` entries and serves them through the
+/// [`PersistableCollector`] contract; there is no network and no external
+/// service behind it.
 struct SimulatedLedgerFeed {
     /// The scripted entries, sorted non-decreasing by instant so the stream
     /// contract (`sort_key` order == stream order) holds.
@@ -172,8 +169,7 @@ fn render_seen(seen: &BTreeSet<String>) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     // An in-memory SQLite store behind an `Arc`, kept alive across the simulated
-    // restart so the second wrapper opens the same database
-    // [position-trait.EXAMPLE.4].
+    // restart so the second wrapper opens the same database.
     let store = Arc::new(SqliteStore::connect("sqlite::memory:").await?);
     // A `&dyn Store<TimeFrontier>` for the direct read-backs below (the store is
     // generic over the position type; this fixes it to the frontier).
@@ -202,7 +198,7 @@ async fn main() -> Result<()> {
 
     // The stored resume frontier round-trips through the store's encode/decode:
     // it is (2000, {0xc1}) — a strictly later instant dropped the stale
-    // 1000/1500 identities [position-trait.EXAMPLE.3-1].
+    // 1000/1500 identities.
     let resume = store_pos
         .stored_position(TABLE)
         .await?
@@ -256,7 +252,7 @@ async fn main() -> Result<()> {
         .collect();
     assert!(
         same_millisecond.contains("0xa1") && same_millisecond.contains("0xa2"),
-        "both same-millisecond events are retained on replay [position-trait.EXAMPLE.3-1]"
+        "both same-millisecond events are retained on replay"
     );
     println!(
         "same-millisecond events retained: {}",
@@ -269,8 +265,7 @@ async fn main() -> Result<()> {
     );
 
     // Store-level proof: the ledger_updates table holds exactly 6 rows with 0xc1
-    // stored once, and the advanced frontier is (2500, {0xd1})
-    // [position-trait.EXAMPLE.3-2].
+    // stored once, and the advanced frontier is (2500, {0xd1}).
     let payload_schema = TableSchema::new(TABLE).col(PAYLOAD_COLUMN, SqlType::Text);
     let rows = store_pos
         .replay(
@@ -305,7 +300,7 @@ async fn main() -> Result<()> {
             time_ms: 2500,
             seen: std::iter::once("0xd1".to_string()).collect(),
         },
-        "the advanced frontier is (2500, {{0xd1}}) [position-trait.EXAMPLE.3-2]"
+        "the advanced frontier is (2500, {{0xd1}})"
     );
 
     println!("hypercore_ledger_example: OK");

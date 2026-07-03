@@ -138,9 +138,17 @@ where
     /// each collector, strategy, and executor. It will then orchestrate the
     /// data flow between them.
     ///
-    /// Collectors are started **before** strategies sync so that live events
-    /// buffer in the broadcast channel while historical sync runs. This
-    /// eliminates the gap between HTTP replay and WS subscription.
+    /// Strategies sync and spawn **before** any collector task starts, so
+    /// every strategy is already draining the event channel when the first
+    /// event is broadcast — including a Persisted collector's replay, which
+    /// runs only on its first subscribe and would otherwise overflow the
+    /// bounded ring while a strategy was still syncing. The ring is still
+    /// bounded (`event_channel_capacity`): a strategy that processes slower
+    /// than collectors produce for a full ring's worth of events lags and
+    /// skips (warn-logged in the channel adapter). A `sync_state` that reads
+    /// external state observes it strictly before collectors subscribe; a
+    /// Persisted collector's backfill covers that gap, a plain live collector
+    /// starts at its subscription and delivers nothing from before it.
     ///
     /// Returns an [`EngineHandle`] carrying the shutdown token, the running
     /// tasks, and a one-shot that fires if a collector becomes unrecoverable.
@@ -175,25 +183,28 @@ where
             &token,
         );
 
-        // Subscribe every strategy's broadcast receiver *before* spawning any
-        // collector. A tokio broadcast channel only retains messages for
-        // receivers that already exist; a receiver created lazily in the sync
-        // loop below would miss every event broadcast before its turn came up —
-        // a deterministic loss for all but the first strategy, since each
-        // strategy syncs (and collectors emit) before the next strategy's
-        // receiver exists. Creating them all up front means events broadcast
-        // during any strategy's sync are buffered for every strategy.
+        // Subscribe every strategy's broadcast receiver up front. A tokio
+        // broadcast channel only retains messages for receivers that already
+        // exist, so each receiver is pinned to the start of the stream here —
+        // before anything could broadcast — rather than to its turn in the
+        // sync loop below.
         let strategies: Vec<_> = self
             .strategies
             .into_iter()
             .map(|strategy| (strategy, event_sender.subscribe()))
             .collect();
 
-        // Spawn collectors so WS subscriptions are active during strategy sync.
-        // Each collector is handed to a [Collector Driver](driver) that owns its
-        // full lifecycle — subscribe, pump events, and on a lost or failed
-        // stream consult the per-collector `ReconnectPolicy` to retry-after-
-        // backoff or escalate to `Fatal`.
+        // Sync each strategy and spawn its task before any collector exists,
+        // so every strategy is draining by the time the first event is
+        // broadcast. A cancellation during sync or a strategy's own sync error
+        // surfaces as `Err`.
+        sync_and_spawn_strategies(&mut set, strategies, &action_sender, &token).await?;
+
+        // Collectors spawn last: nothing they emit — replay, backfill, or live
+        // tail — precedes a draining consumer. Each collector is handed to a
+        // [Collector Driver](driver) that owns its full lifecycle — subscribe,
+        // pump events, and on a lost or failed stream consult the per-collector
+        // `ReconnectPolicy` to retry-after-backoff or escalate to `Fatal`.
         spawn_collectors(
             &mut set,
             self.collectors,
@@ -202,14 +213,6 @@ where
             &token,
             &fatal,
         );
-
-        // Sync each strategy (its receiver already exists, so events emitted
-        // during sync are buffered for it) and spawn its task. A collector that
-        // escalates to `Fatal` mid-sync cancels the root token; that is returned
-        // as `Ok`, so the handle below still carries the observable `fatal` and
-        // the caller follows the documented exit path. A caller-initiated
-        // cancellation or a strategy's own sync error surfaces as `Err`.
-        sync_and_spawn_strategies(&mut set, strategies, &action_sender, &token, &fatal).await?;
 
         Ok(EngineHandle {
             token,
@@ -335,24 +338,20 @@ fn spawn_collectors<E>(
 }
 
 /// A strategy paired with the event receiver subscribed for it up front — see
-/// the subscribe-before-collectors ordering in [`Engine::run`].
+/// the subscribe-then-sync-then-collectors ordering in [`Engine::run`].
 type StrategyWithReceiver<E, A> = (Box<dyn Strategy<E, A>>, broadcast::Receiver<E>);
 
-/// Syncs each strategy in turn, then spawns its [`strategy_task`]. The
-/// receivers were subscribed before any collector emitted, so events produced
-/// during sync are buffered.
+/// Syncs each strategy in turn, then spawns its [`strategy_task`]. Runs before
+/// any collector is spawned, so no event can be broadcast while a strategy is
+/// still syncing.
 ///
-/// Returns `Err` on a strategy's own `sync_state` failure or a caller-initiated
-/// cancellation during sync. A *fatal* cancellation (a collector escalated
-/// while syncing) returns `Ok`: it is not an error, and stopping here leaves the
-/// remaining strategies unspawned while `run` still returns the handle carrying
-/// the observable `fatal`.
+/// Returns `Err` on a strategy's own `sync_state` failure or a cancellation
+/// during sync.
 async fn sync_and_spawn_strategies<E, A>(
     set: &mut JoinSet<()>,
     strategies: Vec<StrategyWithReceiver<E, A>>,
     action_sender: &Sender<A>,
     token: &CancellationToken,
-    fatal: &CancellationToken,
 ) -> anyhow::Result<()>
 where
     E: Clone + Send + 'static,
@@ -362,9 +361,6 @@ where
         info!("syncing strategy state...");
         tokio::select! {
             _ = token.cancelled() => {
-                if fatal.is_cancelled() {
-                    return Ok(());
-                }
                 return Err(anyhow::anyhow!("engine cancelled during strategy sync"));
             }
             result = strategy.sync_state() => {

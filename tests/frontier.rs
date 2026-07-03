@@ -2,11 +2,10 @@
 //! [`examples/hypercore_ledger_example.rs`].
 //!
 //! The example is the human-readable proof (four fixed stdout lines); this suite
-//! is the machine-checked proof of the same flow so it cannot bit-rot
-//! [position-trait.EXAMPLE.7]. It drives a custom [`TimeFrontier`] position — not
-//! a block number — through the generic persistence stack to show a
-//! time-ordered source gets the same resume / backfill / gap-free guarantees an
-//! EVM source already has [position-trait.POSITION.1]:
+//! is the machine-checked proof of the same flow so it cannot bit-rot. It drives
+//! a custom [`TimeFrontier`] position — not a block number — through the generic
+//! persistence stack to show a time-ordered source gets the same resume /
+//! backfill / gap-free guarantees an EVM source already has:
 //!
 //! 1. **Persist** four events, two of which share one millisecond
 //!    (`(1000,0xa1)` / `(1000,0xa2)`) — a bare scalar cannot keep both.
@@ -17,7 +16,7 @@
 //!    sibling `0xc2` and a later `0xd1`.
 //! 4. **Assert** the resume point round-trips, there is no gap, and the
 //!    re-observed `0xc1` dedupes to a single stored row: at-least-once delivery
-//!    in, exactly-once persisted effect [position-trait.DEDUP.1].
+//!    in, exactly-once persisted effect.
 //!
 //! Runs entirely on an **in-memory SQLite store** with an in-process scripted
 //! feed: no Docker, no external database, no network — so it runs unattended in
@@ -257,8 +256,7 @@ async fn persist_restart_overlap() -> Result<Outcome> {
 /// The headline end-to-end: persist, restart from the stored frontier, run the
 /// overlapping backfill, and assert every guarantee at once — resume round-trip,
 /// same-millisecond retention, and exactly-once dedupe across two store-backed
-/// wrappers [position-trait.EXAMPLE.7, position-trait.DEDUP.1,
-/// position-trait.POSITION.1].
+/// wrappers.
 #[tokio::test]
 async fn frontier_persist_restart_overlap_dedupe_across_two_stores() {
     let outcome = persist_restart_overlap().await.unwrap();
@@ -315,8 +313,7 @@ async fn frontier_persist_restart_overlap_dedupe_across_two_stores() {
 }
 
 /// The resume point persisted in run 1 decodes byte-for-byte on the restart, and
-/// the overlapping backfill leaves no gap in the axis
-/// [position-trait.EXAMPLE.7].
+/// the overlapping backfill leaves no gap in the axis.
 #[tokio::test]
 async fn frontier_resume_point_round_trips_with_no_gap() {
     let outcome = persist_restart_overlap().await.unwrap();
@@ -351,7 +348,7 @@ async fn frontier_resume_point_round_trips_with_no_gap() {
 }
 
 /// The core dedupe promise in isolation: after an overlapping re-read the store
-/// holds exactly one row for the re-observed identity [position-trait.DEDUP.1].
+/// holds exactly one row for the re-observed identity.
 #[tokio::test]
 async fn re_observed_frontier_event_has_exactly_one_row() {
     let outcome = persist_restart_overlap().await.unwrap();

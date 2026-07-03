@@ -28,7 +28,7 @@ pub enum Reobservation {
 ///
 /// Implement `Position` for a custom ordering key to gain the same resume,
 /// backfill, and gap-free persistence guarantees that block-based sources
-/// already have — [position-trait.POSITION.1].
+/// already have.
 ///
 /// # Trait laws
 ///
@@ -36,9 +36,9 @@ pub enum Reobservation {
 /// unit-tested against them:
 ///
 /// - **Round-trip**: `decode(&p.encode()) == p` — a position survives a restart
-///   through its persisted column value — [position-trait.POSITION.2].
+///   through its persisted column value.
 /// - **Monotone advance**: `advance(prev, next).sort_key() >= prev.sort_key()`
-///   for any `prev` — the watermark never regresses — [position-trait.POSITION.3].
+///   for any `prev` — the watermark never regresses.
 /// - **Contains implies identity**: if `w.contains(&pos)` then
 ///   `advance(Some(w), pos) == w` — re-folding a covered position is a no-op.
 /// - **Sort-key order is stream order**: `sort_key` projects the position onto
@@ -46,6 +46,14 @@ pub enum Reobservation {
 /// - **Late events are skipped**: an event whose position is below the current
 ///   frontier boundary is deliberately skipped; completeness and finality remain
 ///   the consumer's responsibility.
+/// - **The collector's tip is a coverage boundary**: the tip a
+///   [`PersistableCollector`](super::PersistableCollector) reports must already
+///   be fully readable via `query_range` — new events may only appear above it;
+///   a later live delivery at or below it is treated as a re-observation
+///   (overlap or reorg), never as new coverage. A source whose recent range is
+///   still settling must report a lagged tip. This is the collector-side law
+///   the replay/backfill/live split leans on; see
+///   [`PersistableCollector::tip`](super::PersistableCollector::tip).
 pub trait Position: Clone + std::fmt::Debug + Send + Sync + 'static {
     /// The re-observation policy for this position type — [`Reobservation::Halt`]
     /// for non-overlapping sources (blocks), [`Reobservation::Dedupe`] for
@@ -84,8 +92,8 @@ pub trait Position: Clone + std::fmt::Debug + Send + Sync + 'static {
 /// The built-in default position: an EVM block number.
 ///
 /// `BlockPosition` keeps the common block case a one-liner and the EVM path
-/// unchanged — [position-trait.BLOCK.1]. Its `advance` is `max`, its encoding is
-/// the decimal integer, and its re-observation policy is [`Reobservation::Halt`].
+/// unchanged. Its `advance` is `max`, its encoding is the decimal integer, and
+/// its re-observation policy is [`Reobservation::Halt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockPosition(pub u64);
 
@@ -113,9 +121,6 @@ impl Position for BlockPosition {
     }
 
     fn advance(prev: Option<Self>, next: Self) -> Self {
-        // The watermark is the greater of the previously-stored block and the
-        // newly-processed one — [position-trait.BLOCK.2]. Before anything is
-        // stored (`prev == None`) the next block is the watermark.
         match prev {
             Some(prev) => BlockPosition(prev.0.max(next.0)),
             None => next,
@@ -132,7 +137,7 @@ impl Position for BlockPosition {
 
     fn encode(&self) -> String {
         // Decimal integer text so the progress migration can CAST(last_block AS
-        // TEXT) — [position-trait.BLOCK.3].
+        // TEXT).
         self.0.to_string()
     }
 
@@ -144,7 +149,7 @@ impl Position for BlockPosition {
     }
 }
 
-/// The reference `(time, hash-set)` frontier position — [position-trait.FRONTIER.1].
+/// The reference `(time, hash-set)` frontier position.
 ///
 /// `TimeFrontier` is the framework-shipped worked example of the hardest common
 /// non-block case: a source ordered by a millisecond timestamp where several
@@ -156,8 +161,8 @@ impl Position for BlockPosition {
 /// # Frontier laws
 ///
 /// - **Advance moves time forward and unions at the max instant** — a strictly
-///   later `next` wins and *drops the stale seen-set*, an equal instant unions the
-///   two seen-sets, and an earlier `next` is a no-op — [position-trait.FRONTIER.2].
+///   later `next` wins and *drops the stale seen-set*, an equal instant unions
+///   the two seen-sets, and an earlier `next` is a no-op.
 ///   Because a later instant discards the previous seen-set, the encoded set is
 ///   **bounded by per-instant event volume, not by history** — advancing past an
 ///   instant garbage-collects every identity below the new boundary.
@@ -168,8 +173,7 @@ impl Position for BlockPosition {
 ///   instant *itself* (not `+ 1`), so a restart re-reads the boundary instant and
 ///   the writer dedupes the re-observed identities against `seen`.
 /// - **Round-trip**: `encode` / `decode` go through `serde_json`, so a populated
-///   seen-set survives a restart — `decode(&p.encode()) == p`
-///   — [position-trait.POSITION.2].
+///   seen-set survives a restart — `decode(&p.encode()) == p`.
 ///
 /// # Non-goals
 ///
@@ -205,8 +209,8 @@ impl Position for TimeFrontier {
 
     fn advance(prev: Option<Self>, next: Self) -> Self {
         // Fold the newly-flushed frontier into the stored watermark — the max
-        // instant wins and the seen-set unions only within that instant, so stale
-        // identities below the boundary are dropped — [position-trait.FRONTIER.2].
+        // instant wins and the seen-set unions only within that instant, so
+        // stale identities below the boundary are dropped.
         let Some(prev) = prev else {
             return next;
         };
@@ -256,7 +260,7 @@ impl Position for TimeFrontier {
 mod tests {
     use super::*;
 
-    // [position-trait.BLOCK.2] advance returns the greater of prev and next.
+    // advance returns the greater of prev and next.
     #[test]
     fn advance_is_max() {
         // prev > next: max must keep prev (rules out a "take next" model).
@@ -271,7 +275,7 @@ mod tests {
         );
     }
 
-    // [position-trait.BLOCK.2] advance(None, next) == next.
+    // advance(None, next) == next.
     #[test]
     fn advance_from_none_returns_next() {
         assert_eq!(
@@ -280,8 +284,7 @@ mod tests {
         );
     }
 
-    // [position-trait.BLOCK.3] / [position-trait.POSITION.2] decode∘encode == id,
-    // and encode is the decimal string.
+    // decode∘encode == id, and encode is the decimal string.
     #[test]
     fn encode_decode_round_trips() {
         let position = BlockPosition(12345);
@@ -330,8 +333,8 @@ mod tests {
         }
     }
 
-    // [position-trait.FRONTIER.2] A strictly later instant wins and drops the
-    // stale seen-set. Discriminating: a "union across all history" model would
+    // A strictly later instant wins and drops the stale seen-set.
+    // Discriminating: a "union across all history" model would
     // keep 0xa1/0xa2, and a "keep prev" model would keep instant 1000 — both
     // ruled out by asserting exactly (2000, {0xc1}).
     #[test]
@@ -346,7 +349,7 @@ mod tests {
         assert!(!advanced.seen.contains("0xa2"));
     }
 
-    // [position-trait.FRONTIER.2] An equal instant unions the seen-sets.
+    // An equal instant unions the seen-sets.
     // Discriminating: "later/next wins dropping seen" would give {0xa2} and
     // "keep prev" would give {0xa1}; the union asserts both survive.
     #[test]
@@ -356,7 +359,7 @@ mod tests {
         assert_eq!(advanced, frontier(1000, &["0xa1", "0xa2"]));
     }
 
-    // [position-trait.FRONTIER.2] An earlier instant is a no-op (monotone).
+    // An earlier instant is a no-op (monotone).
     // Discriminating: a "next wins" model would regress the watermark to
     // (1000, {0xa1}); the assertion pins it at the earlier prev value.
     #[test]
@@ -377,8 +380,8 @@ mod tests {
         );
     }
 
-    // [position-trait.POSITION.2] decode∘encode == id for a rich, multi-element
-    // seen-set. This is the round-trip that MalformedStoredPosition relies on at
+    // decode∘encode == id for a rich, multi-element seen-set. This is the
+    // round-trip that MalformedStoredPosition relies on at
     // subscribe; a lossy encoding of the set would fail this.
     #[test]
     fn frontier_round_trips_multi_element_seen_set() {

@@ -15,6 +15,19 @@ use crate::persistence::{Position, Record, Reobservation, Row, Store};
 struct Pending<P> {
     position: P,
     rows: Vec<Row>,
+    /// Rows this group held when the live tail first re-emitted its position
+    /// (Halt path only) — the still-unconfirmed backfill copy. A live row equal
+    /// to one of these is the same event re-delivered across the backfill/live
+    /// boundary: it is kept as the group's canonical content but suppressed
+    /// downstream (the backfill already delivered it); a row matching nothing
+    /// here is genuinely new (a reorg's changed event) and flows through.
+    expected: Vec<Row>,
+    /// Whether this group was buffered from the backfill tail (see
+    /// [`ConfirmationWindow::record_seeded`]) and has not yet been touched by a
+    /// live re-emission. A seeded group flushes as-is when it matures; the
+    /// live tail's first arrival at its key converts its rows into
+    /// [`expected`](Self::expected) and rebuilds the group from the live feed.
+    seeded: bool,
 }
 
 /// Buffers the most recent `depth` position-groups of a live tail and writes a
@@ -66,7 +79,7 @@ where
             head: None,
             // Seed the finalized watermark with the stored position's sort key so
             // a resumed live tail treats a re-observation at/below it as a deep
-            // reorg [position-trait.PARITY.2].
+            // reorg.
             flushed: seed.as_ref().map(|p| p.sort_key()),
             watermark: seed,
         }
@@ -88,7 +101,7 @@ where
         // Dedupe (Reobservation::Dedupe only): an event already covered by the
         // finalized watermark or the pending slot's fold at its own sort key is
         // an expected re-read across an overlapping backfill — encode no row and
-        // suppress it downstream [position-trait.DEDUP.1, position-trait.DEDUP.2].
+        // suppress it downstream.
         if P::REOBSERVATION == Reobservation::Dedupe && self.covered(&position) {
             return false;
         }
@@ -120,9 +133,9 @@ where
             return true;
         };
 
-        // Shallow reorg: the chain forked above `key`. Drop the old fork's
-        // buffered groups (the node re-emits the canonical ones) and rewind the
-        // head so those groups must re-confirm. Groups strictly below `key` are
+        // Shallow reorg: the chain forked above `key`. Rewind the old fork's
+        // buffered groups (the node re-emits the canonical ones) and the head,
+        // so those groups must re-confirm. Groups strictly below `key` are
         // untouched — they belong to the shared prefix. Halt-policy (block)
         // sources only (design §4 record step 5): a Dedupe (frontier) feed is
         // append-only, so a backwards position is jittered late arrival, not a
@@ -133,17 +146,96 @@ where
             && let Some(h) = self.head
             && key < h
         {
-            self.pending.retain(|&b, _| b < key);
+            self.rewind(key);
             self.head = Some(key);
         }
 
         // Fold this event into its sort-key group: a union of same-instant
         // identities for a frontier, the same block for `BlockPosition`.
+        let delivered = match self.pending.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(Pending {
+                    position,
+                    rows: vec![row],
+                    expected: Vec::new(),
+                    seeded: false,
+                });
+                true
+            }
+            Entry::Occupied(mut slot) => {
+                let pending = slot.get_mut();
+                if P::REOBSERVATION == Reobservation::Halt && pending.seeded {
+                    // First live contact with a backfill-seeded group at its
+                    // own key: the position is being re-emitted (boundary
+                    // overlap, or a reorg at the head), not extended. Rebuild
+                    // the group from the live feed, keeping the backfill copy
+                    // only as the downstream-dedupe set.
+                    pending.expected = std::mem::take(&mut pending.rows);
+                    pending.seeded = false;
+                }
+                pending.position = P::advance(Some(pending.position.clone()), position);
+                // A row identical to a still-unconfirmed backfill row is that
+                // event re-delivered across the boundary: keep it as canonical
+                // content, but the backfill segment already delivered it.
+                if let Some(i) = pending.expected.iter().position(|r| *r == row) {
+                    pending.expected.swap_remove(i);
+                    pending.rows.push(row);
+                    false
+                } else {
+                    pending.rows.push(row);
+                    true
+                }
+            }
+        };
+        self.head = Some(self.head.map_or(key, |h| h.max(key)));
+
+        self.flush_matured().await;
+        delivered
+    }
+
+    /// Buffer one backfill-tail event — the last `depth` positions of the gap
+    /// query, which must stay pending (not final) so the live tail can still
+    /// correct an in-window reorg of them. Groups recorded here are marked
+    /// seeded; the live tail's [`record`](Self::record) treats its first
+    /// arrival at a seeded key as a re-emission of that position rather than
+    /// an extension of it. Returns whether the event should be delivered
+    /// downstream, exactly as `record` does.
+    ///
+    /// The seed phase is one `query_range` snapshot, so there is no reorg
+    /// re-emission to correct: a backwards position here is an unordered
+    /// source, and — as in [`BlockWriter`](super::BlockWriter) — the buffered
+    /// groups' completeness can no longer be trusted, so the writer halts.
+    pub(super) async fn record_seeded(&mut self, position: P, event: &E) -> bool {
+        if !self.core.healthy() {
+            return true;
+        }
+        let key = position.sort_key();
+
+        if P::REOBSERVATION == Reobservation::Dedupe && self.covered(&position) {
+            return false;
+        }
+        if P::REOBSERVATION == Reobservation::Halt
+            && let Some(h) = self.head
+            && key < h
+        {
+            self.core.fail(format_args!(
+                "position {position:?} arrived after sort key {h} in the \
+                 backfill tail (unordered source)"
+            ));
+            self.pending.clear();
+            return true;
+        }
+        let Some(row) = self.core.encode(event) else {
+            self.pending.clear();
+            return true;
+        };
         match self.pending.entry(key) {
             Entry::Vacant(slot) => {
                 slot.insert(Pending {
                     position,
                     rows: vec![row],
+                    expected: Vec::new(),
+                    seeded: true,
                 });
             }
             Entry::Occupied(mut slot) => {
@@ -153,9 +245,39 @@ where
             }
         }
         self.head = Some(self.head.map_or(key, |h| h.max(key)));
-
         self.flush_matured().await;
         true
+    }
+
+    /// Halt this window's persistence for `reason` and drop the buffer — used
+    /// by the writer pipeline when the settled prefix below the window halted,
+    /// so flushing anything above it would advance the stored watermark over
+    /// the gap.
+    pub(super) fn halt(&mut self, reason: std::fmt::Arguments<'_>) {
+        self.core.fail(reason);
+        self.pending.clear();
+    }
+
+    /// Rewind the window for a re-emission at `key`: a live-origin group at or
+    /// above it is dropped — the node re-emits the canonical replacements —
+    /// while a backfill-seeded group converts its rows into the `expected`
+    /// dedupe set and stays in place, so (a) an identical re-delivery across
+    /// the backfill/live boundary is suppressed downstream and (b) a canonical
+    /// position that re-emits nothing still flushes (empty) instead of leaving
+    /// a hole below the advancing watermark.
+    fn rewind(&mut self, key: u64) {
+        let mut dropped = Vec::new();
+        for (&b, pending) in self.pending.range_mut(key..) {
+            if pending.seeded {
+                pending.expected = std::mem::take(&mut pending.rows);
+                pending.seeded = false;
+            } else {
+                dropped.push(b);
+            }
+        }
+        for b in dropped {
+            self.pending.remove(&b);
+        }
     }
 
     /// Whether `pos` is already covered by the finalized watermark or by the
@@ -184,17 +306,19 @@ where
         let Some(head) = self.head else { return };
         // Collect the matured sort keys first to avoid borrowing `pending`
         // across the await inside the flush loop.
+        // Saturating: at u64::MAX a group can never be buried deeper, so it
+        // matures at once instead of overflowing the add.
         let matured: Vec<u64> = self
             .pending
             .keys()
             .copied()
-            .filter(|&b| head >= b + self.depth)
+            .filter(|&b| head >= b.saturating_add(self.depth))
             .collect();
         for b in matured {
             let Some(pending) = self.pending.remove(&b) else {
                 continue;
             };
-            let Pending { position, rows } = pending;
+            let Pending { position, rows, .. } = pending;
             // A failed write means a later group must not advance the stored
             // watermark past the gap; drop the rest of the window and stop. The
             // shared core has already gone unhealthy and logged.
@@ -202,7 +326,10 @@ where
                 self.pending.clear();
                 return;
             }
-            self.flushed = Some(b);
+            // Max, not overwrite: a Dedupe position whose `contains` is scoped
+            // to its own identity can flush a jittered lower slot after a
+            // higher one, and the finalized watermark must never regress.
+            self.flushed = Some(self.flushed.map_or(b, |f| f.max(b)));
             // Fold the flushed group into the finalized watermark so a later
             // re-observation of a covered identity still dedupes.
             self.watermark = Some(P::advance(self.watermark.take(), position));
@@ -213,6 +340,12 @@ where
     #[cfg(test)]
     fn buffered_blocks(&self) -> Vec<u64> {
         self.pending.keys().copied().collect()
+    }
+
+    /// The finalized watermark's sort key.
+    #[cfg(test)]
+    fn flushed_key(&self) -> Option<u64> {
+        self.flushed
     }
 }
 
@@ -342,6 +475,18 @@ mod tests {
         assert_eq!(store.written(), Vec::<u64>::new());
     }
 
+    /// The maturity check `head >= key + depth` must saturate: near `u64::MAX`
+    /// the unchecked add panics in debug builds and wraps in release. At
+    /// saturation a group can never be buried deeper, so it flushes at once.
+    #[tokio::test]
+    async fn maturity_arithmetic_saturates_at_u64_max() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        w.record(BlockPosition(u64::MAX), &ping(1)).await;
+        assert_eq!(store.written(), vec![u64::MAX]);
+    }
+
     /// DEDUP.1/.2 on the live tail: an overlapping re-read is suppressed while a
     /// new same-instant identity is retained; the matured group flushes once
     /// carrying only the new identity. Also exercises depth-based maturity for a
@@ -378,6 +523,68 @@ mod tests {
             store.positions()[0],
             TestFrontier::at(2000, 0xc2),
             "the flushed group carries only the new identity"
+        );
+    }
+
+    /// A Dedupe position whose `contains` covers only its own identity — unlike
+    /// a time frontier it does NOT cover earlier slots, so a jittered lower
+    /// slot can still reach the buffer after a higher one has flushed.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct SlotId {
+        slot: u64,
+        id: u64,
+    }
+
+    impl Position for SlotId {
+        const REOBSERVATION: crate::persistence::Reobservation =
+            crate::persistence::Reobservation::Dedupe;
+
+        fn sort_key(&self) -> u64 {
+            self.slot
+        }
+        fn from_sort_key(key: u64) -> Self {
+            SlotId { slot: key, id: 0 }
+        }
+        fn advance(prev: Option<Self>, next: Self) -> Self {
+            match prev {
+                Some(prev) if prev.slot >= next.slot => prev,
+                _ => next,
+            }
+        }
+        fn contains(&self, pos: &Self) -> bool {
+            self == pos
+        }
+        fn resume_key(&self) -> u64 {
+            self.slot
+        }
+        fn encode(&self) -> String {
+            serde_json::to_string(self).expect("SlotId serialises")
+        }
+        fn decode(encoded: &str) -> anyhow::Result<Self> {
+            Ok(serde_json::from_str(encoded)?)
+        }
+    }
+
+    /// Flushing a jittered lower slot after a higher one (possible on a Dedupe
+    /// position whose `contains` is scoped to its own identity) must not walk
+    /// the finalized watermark's sort key backwards.
+    #[tokio::test]
+    async fn flushed_watermark_never_regresses_on_jittered_dedupe_flush() {
+        let store = RecordingStore::<SlotId>::default();
+        let mut w = ConfirmationWindow::<_, SlotId, Ping>::new(&store, record(), 1, None);
+
+        w.record(SlotId { slot: 5, id: 1 }, &ping(1)).await;
+        w.record(SlotId { slot: 7, id: 2 }, &ping(2)).await; // slot 5 matures
+        assert_eq!(w.flushed_key(), Some(5));
+
+        // A jittered, genuinely-new lower slot: stored (Dedupe never halts),
+        // but its flush must not regress the watermark below 5.
+        w.record(SlotId { slot: 3, id: 3 }, &ping(3)).await; // matures at head 7
+        assert_eq!(store.written(), vec![5, 3], "the late slot is stored");
+        assert_eq!(
+            w.flushed_key(),
+            Some(5),
+            "the finalized watermark must never regress"
         );
     }
 

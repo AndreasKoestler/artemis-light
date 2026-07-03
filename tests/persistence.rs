@@ -1125,6 +1125,126 @@ async fn confirmation_depth_corrects_a_shallow_reorg() {
     );
 }
 
+/// A reorg within the confirmation depth of the subscribe-time tip must be
+/// corrected in the confirmation window, not frozen into the store. The
+/// backfill covers `[resume ..= tip]`, but its last `confirmation_depth`
+/// positions are exactly the window a shallow reorg may still rewrite —
+/// final-flushing them with zero confirmations would leave the orphaned rows
+/// behind forever while the live re-emissions of the canonical blocks were
+/// silently dropped. Regression test for the backfill/live boundary reorg.
+#[tokio::test]
+async fn reorg_within_confirmation_depth_of_the_subscribe_tip_is_corrected() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    // Tip 7 at subscribe; blocks 6 and 7 arrive via backfill. At depth 2 they
+    // are within the confirmation window of the tip. The live tail re-emits
+    // them (the reorg's canonical versions, values 20/30), then advances so
+    // the corrected blocks mature.
+    let collector = FakeCollector::default()
+        .tip(7)
+        .backfill(vec![(6, 2), (7, 3)])
+        .live(vec![(6, 20), (7, 30), (8, 4), (9, 40), (10, 50)]);
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_confirmation_depth(NonZeroU64::new(2).unwrap());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Strategies saw the original fork live (2, 3) and must also see the
+    // canonical re-emissions (20, 30) — a reorg is not silently swallowed.
+    assert_eq!(
+        events,
+        vec![
+            value_event(2),
+            value_event(3),
+            value_event(20),
+            value_event(30),
+            value_event(4),
+            value_event(40),
+            value_event(50),
+        ]
+    );
+
+    // The store holds only the canonical chain: blocks 6/7 carry the corrected
+    // values, never the orphaned 2/3. Blocks 9/10 are still inside the window.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(8))
+    );
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x14".to_string(), "0x1e".to_string(), "0x4".to_string()],
+        "the orphaned backfill rows must never become final"
+    );
+}
+
+/// A live re-emission at or below the settled backfill boundary (tip −
+/// confirmation depth) is a reorg deeper than the confirmation depth: it must
+/// halt persistence — the finalized rows would need a delete to correct — not
+/// be silently discarded while later blocks advance the watermark over it.
+#[tokio::test]
+async fn reorg_deeper_than_confirmation_depth_at_subscribe_halts_persistence() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 5, 1).await; // last stored block = 5
+
+    // Tip 7, depth 1: block 6 settles as final, block 7 stays in the window.
+    // The live tail then re-emits block 5 — already final — a deep reorg.
+    let collector = FakeCollector::default()
+        .tip(7)
+        .backfill(vec![(6, 2), (7, 3)])
+        .live(vec![(5, 99), (8, 4), (9, 5)]);
+    let persisted = collector.with_persistence(store.clone());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Events keep flowing — a halt freezes persistence, not the stream.
+    assert_eq!(
+        events,
+        vec![
+            value_event(1),
+            value_event(2),
+            value_event(3),
+            value_event(99),
+            value_event(4),
+            value_event(5),
+        ]
+    );
+
+    // Persistence halted at the deep reorg: nothing after block 6 is written,
+    // so a restart re-syncs across the corrupted range instead of trusting a
+    // watermark that silently skipped the re-emitted block.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(6)),
+        "no block may advance the watermark past a deep reorg"
+    );
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x1".to_string(), "0x2".to_string()]
+    );
+}
+
+/// Bounded mode (`with_to_block`) pins the subscription to a snapshot: when the
+/// archive is already ahead of the snapshot, replay must stop at `to_block`
+/// rather than deliver events past it.
+#[tokio::test]
+async fn bounded_replay_is_clamped_to_the_snapshot_block() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 5, 1).await;
+    seed(&store, 6, 2).await;
+    seed(&store, 8, 3).await; // the archive is ahead of the snapshot
+
+    let collector = FakeCollector::default().tip(8);
+    let persisted = collector.with_persistence(store.clone()).with_to_block(6);
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+    assert_eq!(
+        events,
+        vec![value_event(1), value_event(2)],
+        "replay must not deliver events past the snapshot block"
+    );
+}
+
 /// The default (no confirmation-depth override) is depth 1: a block flushes
 /// when the next block arrives, and the open block stays unflushed.
 #[tokio::test]
@@ -1185,8 +1305,8 @@ async fn persisted_does_not_duplicate_events_at_backfill_live_boundary() {
     );
 }
 
-/// Phase 3 migration [position-trait.MIGRATE.2]: an archive written under the OLD
-/// two-column schema (`table_name`, `last_block`) resumes to the SAME
+/// Schema migration: an archive written under the OLD two-column schema
+/// (`table_name`, `last_block`) resumes to the SAME
 /// `BlockPosition` both BEFORE the first write (via the read-side `last_block`
 /// fallback, since the encoded `position` column does not exist yet) and AFTER it
 /// (via the lazily-added, CAST-backfilled `position` column). A file-backed
@@ -1275,7 +1395,7 @@ async fn pre_migration_archive_resumes_to_the_same_block() {
     );
 }
 
-/// Phase 3 error path [position-trait.MIGRATE.2]: a `position` cell that
+/// Migration error path: a `position` cell that
 /// `BlockPosition::decode` cannot parse (a wrong-typed / corrupt value, e.g. a
 /// JSON frontier read back under a block store) surfaces as a loud read error
 /// (`MalformedStoredPosition`, the `Position::decode` failure propagated verbatim),

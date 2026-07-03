@@ -3,11 +3,9 @@
 //! Stored cells have no `Serialize` impl, so the serving layer maps each cell by
 //! its declared column affinity. The decode rule lives in one place,
 //! [`cell_to_json`], generic over the backend via the [`Cell`] trait, so SQLite
-//! and PostgreSQL render identically (postgres-store.SERVE.3). The `_payload`
-//! column (lossless event JSON) is re-parsed into nested JSON, falling back to
-//! the raw string when unparsable (maintainer-confirmed). `BLOB` cells are
-//! rendered as `0x`-prefixed lowercase hex (Inferred: open question OQ-1
-//! default).
+//! and PostgreSQL render identically. The `_payload` column (lossless event
+//! JSON) is re-parsed into nested JSON, falling back to the raw string when
+//! unparsable. `BLOB` cells are rendered as `0x`-prefixed lowercase hex.
 
 use std::fmt::Write as _;
 
@@ -21,8 +19,7 @@ use crate::persistence::PAYLOAD_COLUMN;
 /// One queried row, abstracted over the storage backend so the cell→JSON decode
 /// rule in [`cell_to_json`] lives in exactly one place. SQLite (`SqliteRow`) and
 /// PostgreSQL (`PgRow`) each implement this by extracting a typed, nullable cell
-/// by name; the decode rule itself then cannot diverge between backends
-/// (postgres-store.SERVE.3).
+/// by name.
 pub(crate) trait Cell {
     fn try_i64(&self, name: &str) -> anyhow::Result<Option<i64>>;
     fn try_f64(&self, name: &str) -> anyhow::Result<Option<f64>>;
@@ -32,9 +29,8 @@ pub(crate) trait Cell {
 
 /// Implement [`Cell`] for a concrete `sqlx` row type. Every backend extracts
 /// the same four typed, nullable cells via `Row::try_get`, differing only in
-/// the row type — so the bodies are generated rather than copied per backend
-/// (postgres-store.SERVE.3). Used here for `SqliteRow` and by the PostgreSQL
-/// serving backend for `PgRow`.
+/// the row type — so the bodies are generated rather than copied per backend.
+/// Used here for `SqliteRow` and by the PostgreSQL serving backend for `PgRow`.
 macro_rules! impl_cell {
     ($row:ty) => {
         impl $crate::serving::json::Cell for $row {
@@ -104,15 +100,13 @@ fn cell_to_json<R: Cell>(row: &R, name: &str, ty: &str) -> anyhow::Result<Value>
 }
 
 /// Surface `_payload` as nested JSON, or the raw string if it does not parse.
-/// Shared with the PostgreSQL serving backend so payload rendering cannot
-/// diverge between backends (postgres-store.SERVE.3).
+/// Shared with the PostgreSQL serving backend.
 pub(crate) fn parse_payload(raw: String) -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::String(raw))
 }
 
 /// Render bytes as a `0x`-prefixed lowercase hex string. Shared with the
-/// PostgreSQL serving backend so blob rendering cannot diverge
-/// (postgres-store.SERVE.3).
+/// PostgreSQL serving backend.
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("0x");

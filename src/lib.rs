@@ -65,7 +65,7 @@ pub mod executor_ext;
 
 /// Opt-in, read-only HTTP serving layer over the persisted tables. Compiled
 /// only when the `serving` feature is enabled; absent otherwise so existing
-/// pipelines build unchanged (serving-layer.OPTIN.1/.2).
+/// pipelines build unchanged.
 #[cfg(feature = "serving")]
 pub mod serving;
 

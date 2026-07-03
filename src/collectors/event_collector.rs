@@ -104,9 +104,9 @@ where
 /// The [`EventCollector`] is block-aware: it recovers each event's block number
 /// from its [`Log`](alloy::rpc::types::Log) and can replay a historical range
 /// via the provider, so it can be wrapped with persistence. Its [`Position`] is
-/// the built-in [`BlockPosition`], so existing block code needs no position type
-/// [position-trait.BLOCK.1]; `u64` block numbers are wrapped/unwrapped at this
-/// alloy boundary [position-trait.PARITY.2].
+/// the built-in [`BlockPosition`], so existing block code needs no custom
+/// position type; `u64` block numbers are wrapped/unwrapped at this alloy
+/// boundary.
 ///
 /// [`Position`]: crate::persistence::Position
 #[async_trait]

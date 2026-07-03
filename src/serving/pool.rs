@@ -2,9 +2,9 @@
 //!
 //! Distinct from [`SqliteStore`](crate::persistence::SqliteStore)'s
 //! single-connection writer pool: this pool is opened `read_only(true)` so the
-//! SQLite driver rejects every write (serving-layer.READONLY.1), and it does not
-//! reuse the writer's pool. Under WAL, readers here observe committed snapshots
-//! without blocking the writer (serving-layer.CONCURRENCY.1).
+//! SQLite driver rejects every write, and it does not reuse the writer's pool.
+//! Under WAL, readers here observe committed snapshots without blocking the
+//! writer.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -15,18 +15,21 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 /// Open a read-only pool to `database_url` with `max_connections` connections.
 ///
 /// `create_if_missing(false)` means a missing database file is an error rather
-/// than a silently-created empty one. `:memory:` URLs are unsupported (each pool
-/// would see a private empty database); they surface here as an open error.
+/// than a silently-created empty one. `:memory:` URLs are rejected up front: a
+/// separate read-only pool would see a private empty database, not the writer's
+/// instance.
 pub async fn open_read_only_pool(
     database_url: &str,
     max_connections: u32,
 ) -> anyhow::Result<SqlitePool> {
-    // In-memory databases are unsupported: a separate read-only pool would see a
-    // private empty database, not the writer's instance. Reject fast (OQ-3).
     // Match the canonical in-memory forms precisely (`:memory:` as the whole
-    // path, or a `mode=memory` URI) rather than a loose substring, so a real
-    // file path that happens to contain ":memory:" is not falsely rejected.
-    let path = database_url.strip_prefix("sqlite:").unwrap_or(database_url);
+    // path — after either the `sqlite:` or `sqlite://` prefix — or a
+    // `mode=memory` URI) rather than a loose substring, so a real file path
+    // that happens to contain ":memory:" is not falsely rejected.
+    let path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(database_url);
     if path == ":memory:" || path.contains("mode=memory") {
         anyhow::bail!("in-memory databases are not supported by the serving layer");
     }
@@ -75,7 +78,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        // ...writes are rejected by the read-only connection (serving-layer.READONLY.1).
+        // ...writes are rejected by the read-only connection.
         let write = sqlx::query("INSERT INTO t (x) VALUES (1)")
             .execute(&pool)
             .await;
@@ -84,11 +87,21 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_url_is_rejected() {
-        assert!(open_read_only_pool("sqlite::memory:", 1).await.is_err());
-        assert!(
-            open_read_only_pool("sqlite:file:foo?mode=memory&cache=shared", 1)
+        // Every canonical in-memory spelling must hit the fast guard (not fall
+        // through to sqlx, which would bind a fresh private empty database).
+        for url in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            ":memory:",
+            "sqlite:file:foo?mode=memory&cache=shared",
+        ] {
+            let err = open_read_only_pool(url, 1)
                 .await
-                .is_err()
-        );
+                .expect_err("in-memory URL must be rejected");
+            assert!(
+                err.to_string().contains("in-memory"),
+                "{url} should be rejected by the in-memory guard, got: {err:#}"
+            );
+        }
     }
 }

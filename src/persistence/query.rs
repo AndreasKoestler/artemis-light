@@ -9,16 +9,15 @@
 //! that genuinely differ are supplied by a [`Dialect`]: the placeholder syntax,
 //! the intra-block tie-breaker, the column-type keywords, and the progress
 //! row-lock suffix. The two backends therefore cannot drift apart on the parts
-//! they share (postgres-store.PARITY.1). The watermark is no longer advanced by
-//! a SQL `MAX`/`GREATEST`: monotonicity now lives in `Position::advance` in Rust,
-//! applied inside the write transaction, so the upsert stores the already-advanced
-//! watermark verbatim. The progress table keeps the retained `last_block` sort key
-//! (the serving layer reads it) alongside the authoritative encoded `position`
-//! column — `Position::encode` output — which a pre-change archive gains through
-//! the lazy [`add_position_column`] + [`backfill_position_from_last_block`]
-//! migration [position-trait.MIGRATE.3]. Per-backend value binding and cell
-//! decoding are *not* here — they ride sqlx's per-database types and live in
-//! [`SqlStore`](super::SqlStore).
+//! they share. Watermark monotonicity lives in `Position::advance` in Rust,
+//! applied inside the write transaction, so the upsert stores the
+//! already-advanced watermark verbatim — no SQL `MAX`/`GREATEST`. The progress
+//! table keeps the retained `last_block` sort key (the serving layer reads it)
+//! alongside the authoritative encoded `position` column — `Position::encode`
+//! output — which a pre-change archive gains through the lazy
+//! [`add_position_column`] + [`backfill_position_from_last_block`] migration.
+//! Per-backend value binding and cell decoding are *not* here — they ride
+//! sqlx's per-database types and live in [`SqlStore`](super::SqlStore).
 
 use anyhow::Result;
 
@@ -34,8 +33,8 @@ use super::schema::{
 /// the surrounding transaction, so every later statement in it would be rejected.
 /// Running the probe inside this savepoint lets [`SqlStore`](super::SqlStore) roll
 /// back to it (clearing the aborted state) and still run the ADD COLUMN + backfill
-/// in the same write transaction [position-trait.MIGRATE.1]. SQLite tolerates the
-/// failed probe directly but is bracketed identically.
+/// in the same write transaction. SQLite tolerates the failed probe directly but
+/// is bracketed identically.
 pub(super) const MIGRATION_SAVEPOINT_BEGIN: &str = "SAVEPOINT artemis_position_probe";
 /// Discard the migration probe savepoint (see [`MIGRATION_SAVEPOINT_BEGIN`]).
 pub(super) const MIGRATION_SAVEPOINT_RELEASE: &str = "RELEASE SAVEPOINT artemis_position_probe";
@@ -71,7 +70,7 @@ fn select_column_list(schema: &TableSchema) -> String {
 /// `NOT NULL`; an old two-column archive gains it as a nullable column through the
 /// lazy [`add_position_column`] migration (SQLite cannot `ADD COLUMN` a `NOT NULL`
 /// column without a default), then [`backfill_position_from_last_block`] fills it
-/// — both shapes read identically [position-trait.MIGRATE.1].
+/// — both shapes read identically.
 pub(super) fn create_progress_table(dialect: &dyn Dialect) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} \
@@ -83,17 +82,16 @@ pub(super) fn create_progress_table(dialect: &dyn Dialect) -> String {
 /// The lazy migration's first statement: add the encoded `position` column to a
 /// pre-existing two-column progress table. Nullable (no `NOT NULL`) so SQLite
 /// accepts it without a default; [`backfill_position_from_last_block`] fills it in
-/// the same transaction [position-trait.MIGRATE.1]. Dialect-independent: identical
-/// SQL on both backends.
+/// the same transaction. Dialect-independent: identical SQL on both backends.
 pub(super) fn add_position_column() -> String {
     format!("ALTER TABLE {PROGRESS_TABLE} ADD COLUMN position TEXT")
 }
 
 /// The lazy migration's second statement: convert every pre-existing integer
 /// `last_block` into its encoded `BlockPosition` — decimal text — via a pure-SQL
-/// `CAST`, filling only the rows [`add_position_column`] left NULL
-/// [position-trait.MIGRATE.1]. Idempotent (the `WHERE position IS NULL` guard skips
-/// already-encoded rows) and dialect-independent.
+/// `CAST`, filling only the rows [`add_position_column`] left NULL. Idempotent
+/// (the `WHERE position IS NULL` guard skips already-encoded rows) and
+/// dialect-independent.
 pub(super) fn backfill_position_from_last_block() -> String {
     format!(
         "UPDATE {PROGRESS_TABLE} SET position = CAST(last_block AS TEXT) WHERE position IS NULL"
@@ -129,19 +127,28 @@ pub(super) fn create_event_table(schema: &TableSchema, dialect: &dyn Dialect) ->
     )
 }
 
-/// The per-row `INSERT`, with one dialect placeholder per bound column in
-/// [`insert_column_names`] order.
-pub(super) fn insert_statement(schema: &TableSchema, dialect: &dyn Dialect) -> String {
+/// The multi-row `INSERT`: one placeholder group per row (`rows` ≥ 1), each
+/// with one dialect placeholder per bound column in [`insert_column_names`]
+/// order, numbered continuously across rows for positional dialects. The
+/// caller chunks its rows so the total placeholder count stays under the
+/// backends' bind-parameter caps.
+pub(super) fn insert_statement(schema: &TableSchema, dialect: &dyn Dialect, rows: usize) -> String {
     let col_names = insert_column_names(schema);
-    let placeholders = (1..=col_names.len())
-        .map(|i| dialect.placeholder(i))
+    let groups = (0..rows)
+        .map(|row| {
+            let placeholders = (1..=col_names.len())
+                .map(|i| dialect.placeholder(row * col_names.len() + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({placeholders})")
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "INSERT INTO {} ({}) VALUES ({})",
+        "INSERT INTO {} ({}) VALUES {}",
         quote_ident(&schema.table),
         col_names.join(", "),
-        placeholders
+        groups
     )
 }
 
@@ -151,7 +158,15 @@ pub(super) fn insert_statement(schema: &TableSchema, dialect: &dyn Dialect) -> S
 /// `(table_name, last_block, position)`; both bound values are the already
 /// monotonically-advanced watermark computed by `Position::advance` in Rust, so
 /// the conflict clause writes them verbatim (`excluded.*`) with no SQL
-/// `MAX`/`GREATEST` [position-trait.MIGRATE.3].
+/// `MAX`/`GREATEST` — a generic `Position`'s encoded text is not SQL-comparable,
+/// so the database cannot enforce monotonicity itself.
+///
+/// The verbatim write is only safe under the one-writer-per-table contract:
+/// [`locked_progress_select`]'s row lock serialises the read-advance-upsert
+/// once a progress row exists, but it cannot lock a row that has not been
+/// inserted yet, so two writers racing a table's *first* write can interleave
+/// and regress the watermark. Concurrent writers on one table are a caller
+/// violation this statement does not defend against.
 pub(super) fn watermark_upsert(dialect: &dyn Dialect) -> String {
     format!(
         "INSERT INTO {PROGRESS_TABLE} (table_name, last_block, position) VALUES ({}, {}, {}) \
@@ -165,10 +180,11 @@ pub(super) fn watermark_upsert(dialect: &dyn Dialect) -> String {
 
 /// The in-transaction watermark read that precedes the advance-and-upsert:
 /// selects the current encoded `position` for a table under the dialect's row-lock
-/// suffix, so the read-advance-upsert is serialised per progress row. Binds
-/// `(table_name)`. The resume point is the encoded `position` value
-/// [position-trait.MIGRATE.3], not the integer sort key — the migration has already
-/// run in this transaction, so the column is present. Runs *inside* the write
+/// suffix, so the read-advance-upsert is serialised per *existing* progress row
+/// (a not-yet-inserted row cannot be locked — see [`watermark_upsert`]). Binds
+/// `(table_name)`. The resume point is the encoded `position` value, not the
+/// integer sort key — the migration has already run in this transaction, so the
+/// column is present. Runs *inside* the write
 /// transaction (unlike [`stored_position_query`], the lock-free read used by
 /// `stored_position`).
 pub(super) fn locked_progress_select(dialect: &dyn Dialect) -> String {
@@ -184,7 +200,7 @@ pub(super) fn locked_progress_select(dialect: &dyn Dialect) -> String {
 /// transaction (the locked in-transaction twin is [`locked_progress_select`]). On a
 /// pre-migration archive the `position` column is absent, or an old binary may have
 /// left it NULL; in both cases the caller falls back to [`last_block_query`] and
-/// decodes the decimal text [position-trait.MIGRATE.2].
+/// decodes the decimal text.
 pub(super) fn stored_position_query(dialect: &dyn Dialect) -> String {
     format!(
         "SELECT position FROM {PROGRESS_TABLE} WHERE table_name = {}",
@@ -195,8 +211,7 @@ pub(super) fn stored_position_query(dialect: &dyn Dialect) -> String {
 /// The read-side `last_block` fallback lookup: the retained integer sort key for a
 /// table, or no row when nothing has been written. Binds `(table_name)`. Used only
 /// when the encoded `position` column is absent (a pre-migration archive) or NULL,
-/// so an old block archive resumes at the same block before its first write
-/// [position-trait.MIGRATE.2].
+/// so an old block archive resumes at the same block before its first write.
 pub(super) fn last_block_query(dialect: &dyn Dialect) -> String {
     format!(
         "SELECT last_block FROM {PROGRESS_TABLE} WHERE table_name = {}",
@@ -205,8 +220,10 @@ pub(super) fn last_block_query(dialect: &dyn Dialect) -> String {
 }
 
 /// The replay `SELECT`: every event column for blocks up to (and including) the
-/// `<= placeholder` bound, ordered by block then the dialect's tie-breaker for a
-/// stable, deterministic replay. Binds `(up_to_sort_key)`.
+/// `<= placeholder` bound, ordered by block then the dialect's tie-breaker so
+/// one block's rows come back in (approximately) write order — see
+/// [`Dialect::tiebreak`] for what each backend's column actually guarantees.
+/// Binds `(up_to_sort_key)`.
 pub(super) fn replay_query(schema: &TableSchema, dialect: &dyn Dialect) -> String {
     format!(
         "SELECT {} FROM {} WHERE {BLOCK_NUMBER_COLUMN} <= {} \
@@ -242,7 +259,7 @@ pub(crate) fn range_query(table: &str, dialect: &dyn Dialect) -> String {
 ///
 /// A short argument list would silently desync columns from values (sqlx binds
 /// `NULL` for the gap), corrupting the table rather than erroring; both stores
-/// bail here instead, rolling their transaction back (postgres-store.PGSTORE.6).
+/// bail here instead, rolling their transaction back.
 pub(super) fn check_row_shape(schema: &TableSchema, row: &Row) -> Result<()> {
     if row.0.len() != schema.columns.len() {
         anyhow::bail!(
@@ -295,12 +312,28 @@ mod tests {
     #[test]
     fn insert_statement_emits_one_placeholder_per_column() {
         // block_number + 2 event columns = 3 placeholders.
-        let q = insert_statement(&schema(), &SqliteDialect);
+        let q = insert_statement(&schema(), &SqliteDialect, 1);
         assert!(q.contains("VALUES (?, ?, ?)"), "{q}");
     }
 
-    // [position-trait.MIGRATE.3] The fresh progress DDL has three columns,
-    // including the authoritative encoded `position TEXT NOT NULL`.
+    #[test]
+    fn insert_statement_emits_one_placeholder_group_per_row() {
+        let q = insert_statement(&schema(), &SqliteDialect, 3);
+        assert!(q.contains("VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)"), "{q}");
+    }
+
+    // PostgreSQL placeholders are positional, so numbering must continue
+    // across the rows of one multi-row insert.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn insert_statement_numbers_placeholders_across_rows() {
+        use crate::persistence::dialect::PgDialect;
+        let q = insert_statement(&schema(), &PgDialect, 2);
+        assert!(q.contains("VALUES ($1, $2, $3), ($4, $5, $6)"), "{q}");
+    }
+
+    // The fresh progress DDL has three columns, including the authoritative
+    // encoded `position TEXT NOT NULL`.
     #[test]
     fn create_progress_table_has_three_columns_including_position() {
         let ddl = create_progress_table(&SqliteDialect);
@@ -310,9 +343,9 @@ mod tests {
         assert!(ddl.contains("position TEXT NOT NULL"), "{ddl}");
     }
 
-    // [position-trait.MIGRATE.1] The lazy migration adds the column, then converts
-    // every integer last_block into its encoded BlockPosition via a pure-SQL CAST.
-    // These statements are dialect-independent.
+    // The lazy migration adds the column, then converts every integer last_block
+    // into its encoded BlockPosition via a pure-SQL CAST. These statements are
+    // dialect-independent.
     #[test]
     fn add_column_and_cast_backfill_compose() {
         assert_eq!(

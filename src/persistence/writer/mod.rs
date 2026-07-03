@@ -104,6 +104,11 @@ impl<'a, S, E: Serialize> GapFreeWriter<'a, S, E> {
             // No event has been encoded, so there is nothing to persist: the
             // buffered rows `flush` writes are only ever produced by `encode`,
             // which captures the schema. An empty group is a healthy no-op.
+            debug_assert!(
+                rows.is_empty(),
+                "rows buffered without a captured schema: they were not produced \
+                 by encode and would be silently dropped"
+            );
             return true;
         };
         match self.store.write(schema, position, rows).await {
@@ -128,59 +133,34 @@ impl<'a, S, E: Serialize> GapFreeWriter<'a, S, E> {
     }
 }
 
-/// Wrap a stream of `(position, event)` so that each event is buffered and
-/// written to `store` one transaction per complete position-group, while the
-/// plain events flow downstream unchanged.
+/// Wrap the Backfill and Live Tail segments' `(position, event)` streams so
+/// each event is persisted while flowing downstream unchanged: backfill first,
+/// then live, in one pipeline, because the confirmation window spans their
+/// boundary.
 ///
-/// A group is "complete" once a higher sort key is observed. The trailing group
-/// is flushed at stream end only when `flush_final` is set (true for a finite
-/// backfill range, false for a live tail).
+/// Positions at or below `final_cut` (tip − confirmation depth) are settled:
+/// nothing can reorg them without exceeding the depth, so a [`BlockWriter`]
+/// writes them one transaction per complete group, trailing group included.
+/// Positions above the cut are exactly the window a shallow reorg may still
+/// rewrite — final-flushing them with zero confirmations would freeze orphaned
+/// rows into the store on the very next in-window reorg (re-exposed on every
+/// reconnect) — so they stay pending in a [`ConfirmationWindow`], seeded from
+/// the backfill tail and matured (or reorg-corrected, or deduped on a boundary
+/// re-delivery) by the live tail. The window's watermark starts at `final_cut`:
+/// a live re-emission at or below it is a reorg deeper than the depth (Halt).
+///
+/// There is no final flush for the window — the live tail never ends, and the
+/// unflushed window is intentionally left for a restart's backfill to re-fetch
+/// (the whole window, not just a single open position). In bounded mode the
+/// caller passes `final_cut` = the snapshot tip and an empty live stream, so
+/// every group settles through the `BlockWriter` exactly as before.
 pub(super) fn persist_and_emit<'a, E, P, S>(
-    mut source: CollectorStream<'a, (P, E)>,
-    store: &'a S,
-    record: Arc<Record<E>>,
-    flush_final: bool,
-    seed: Option<P>,
-) -> CollectorStream<'a, E>
-where
-    E: Serialize + Send + Sync + 'static,
-    P: Position,
-    S: Store<P> + 'a,
-{
-    let stream = async_stream::stream! {
-        let mut writer = BlockWriter::new(store, record, seed);
-
-        while let Some((position, event)) = source.next().await {
-            // `record` returns false for a Dedupe re-observation already covered
-            // by the watermark: suppress it downstream too (replay delivered it
-            // once). The Halt (block) path never suppresses, so EVM emission is
-            // bit-identical [position-trait.DEDUP.2].
-            if writer.record(position, &event).await {
-                yield event;
-            }
-        }
-
-        if flush_final {
-            writer.finish().await;
-        }
-    };
-
-    Box::pin(stream)
-}
-
-/// Like [`persist_and_emit`], but persists with a [`ConfirmationWindow`]: a
-/// group is written only once it is `depth` confirmations deep, and an in-window
-/// reorg is corrected before any orphaned row is written. The window's finalized
-/// watermark is seeded from the stored position at subscribe so a live
-/// re-observation at or below it is a deep reorg. There is no `flush_final` —
-/// the live tail never ends, and the unflushed window is intentionally left for
-/// a restart's backfill to re-fetch (the whole window, not just a single open
-/// position).
-pub(super) fn persist_and_emit_windowed<'a, E, P, S>(
-    mut source: CollectorStream<'a, (P, E)>,
+    mut backfill: CollectorStream<'a, (P, E)>,
+    mut live: CollectorStream<'a, (P, E)>,
     store: &'a S,
     record: Arc<Record<E>>,
     depth: u64,
+    final_cut: u64,
     seed: Option<P>,
 ) -> CollectorStream<'a, E>
 where
@@ -189,12 +169,37 @@ where
     S: Store<P> + 'a,
 {
     let stream = async_stream::stream! {
-        let mut writer = ConfirmationWindow::new(store, record, depth, seed);
-        while let Some((position, event)) = source.next().await {
-            // Suppress a Dedupe re-observation downstream; deliver otherwise.
-            // Halt sources never suppress, so live block emission is unchanged
-            // [position-trait.DEDUP.2].
-            if writer.record(position, &event).await {
+        let mut settled = BlockWriter::new(store, record.clone(), seed.clone());
+        // Everything at or below the cut is settled by the BlockWriter before
+        // the live stream is polled, so the window's watermark starts there.
+        let window_seed = Some(P::advance(seed, P::from_sort_key(final_cut)));
+        let mut window = ConfirmationWindow::new(store, record, depth, window_seed);
+
+        // `record` / `record_seeded` return false for a Dedupe re-observation
+        // already covered by the watermark: suppress it downstream too (replay
+        // delivered it once). The Halt (block) path suppresses only a live row
+        // the backfill tail already delivered across the boundary.
+        while let Some((position, event)) = backfill.next().await {
+            let delivered = if position.sort_key() <= final_cut {
+                settled.record(position, &event).await
+            } else {
+                window.record_seeded(position, &event).await
+            };
+            if delivered {
+                yield event;
+            }
+        }
+        settled.finish().await;
+        if !settled.healthy() {
+            // The settled prefix has a hole: the window flushing anything
+            // above it would advance the stored watermark over the gap.
+            window.halt(format_args!(
+                "backfill persistence halted below the confirmation window"
+            ));
+        }
+
+        while let Some((position, event)) = live.next().await {
+            if window.record(position, &event).await {
                 yield event;
             }
         }

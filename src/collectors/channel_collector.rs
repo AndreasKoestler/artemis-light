@@ -8,8 +8,12 @@ use tokio_stream::wrappers::BroadcastStream;
 /// A [`Collector`] over an in-process [`broadcast`](tokio::sync::broadcast)
 /// channel: each event sent to the channel becomes a collected event. It holds
 /// the `Sender` (not a `Receiver`) so every `subscribe` mints a fresh receiver
-/// — surviving the reconnect driver's re-subscription, where a single
-/// `Receiver` could not. The seam through which execution feedback (an
+/// — a single `Receiver` could not be subscribed twice across the reconnect
+/// driver's re-subscription. Delivery is best-effort during reconnect windows:
+/// events sent between a stream's death and the re-subscribe are lost, since a
+/// fresh receiver sees only later sends (with no live receiver the send itself
+/// errors, which the sending side may drop quietly). The seam through which
+/// execution feedback (an
 /// [`ExecutionOutcome`](crate::executor_ext::ExecutionOutcome)) — or any
 /// in-process source — re-enters the pipeline as events.
 pub struct ChannelCollector<T> {
