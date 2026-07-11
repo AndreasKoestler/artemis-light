@@ -20,6 +20,26 @@ use super::store::Store;
 use super::writer::persist_and_emit;
 use crate::types::{Collector, CollectorStream};
 
+/// One item of a live position-indexed stream: a positioned event, or a
+/// retraction of a previously delivered position.
+///
+/// A retraction is a reorg's *removal* signal — e.g. an EVM node re-sending a
+/// log with `removed: true` — telling the pipeline that events at that position
+/// no longer happened. Without it a same-height reorg (block `N` replaced by
+/// `N′` before `N + 1` arrives) is invisible to the confirmation window: the
+/// replacement's events arrive at the same sort key as the orphaned ones and
+/// would be appended beside them rather than replacing them. Retractions only
+/// affect persistence (the buffered window is rewound); events already
+/// delivered downstream cannot be unwound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Indexed<P, E> {
+    /// An event at its position.
+    Event(P, E),
+    /// Everything buffered at (and above) this position no longer happened;
+    /// the canonical replacements will be re-emitted.
+    Retract(P),
+}
+
 /// A collector that is aware of its ordering [`Position`] and can replay
 /// historical ranges — the capability [`Persisted`] needs to record events and
 /// fill the gap between the last stored position and the source's tip.
@@ -32,9 +52,10 @@ pub trait PersistableCollector<E>: Send + Sync {
     /// The collector's ordering [`Position`] — the persistence key.
     type Pos: Position;
 
-    /// Live, position-indexed events from the source's tip onward — `(Pos, E)`
-    /// pairs.
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (Self::Pos, E)>>;
+    /// Live, position-indexed events from the source's tip onward, plus reorg
+    /// retractions ([`Indexed::Retract`]) where the source can observe them. A
+    /// source with no retraction signal simply never yields one.
+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, Indexed<Self::Pos, E>>>;
 
     /// Historical position-indexed events for the inclusive range `from..=to`
     /// (a block range, or a time window up to a finality lag).
@@ -69,6 +90,7 @@ pub trait PersistExt<E>: PersistableCollector<E> + Sized {
     /// the event's Solidity signature now — [`subscribe`](crate::types::Collector::subscribe)
     /// has no `SolEvent` bound and reads the captured name. EVM call sites are
     /// unchanged.
+    #[must_use]
     fn with_persistence<S: Store<Self::Pos>>(self, store: S) -> Persisted<Self, S>
     where
         E: SolEvent,
@@ -79,6 +101,7 @@ pub trait PersistExt<E>: PersistableCollector<E> + Sized {
     /// Record every event into `store` under the explicit `table` name,
     /// **without** requiring `E: SolEvent` — the entry point for a non-EVM event
     /// type whose table name cannot be derived from a Solidity signature.
+    #[must_use]
     fn with_persistence_named<S: Store<Self::Pos>>(
         self,
         store: S,
@@ -94,6 +117,7 @@ pub trait PersistExt<E>: PersistableCollector<E> + Sized {
     /// [`Persisted::with_confirmation_depth`]). Equivalent to chaining
     /// [`with_persistence`](Self::with_persistence), `with_start_block`, and
     /// `with_confirmation_depth`.
+    #[must_use]
     fn persisted<S: Store<Self::Pos>>(
         self,
         store: S,
@@ -208,6 +232,7 @@ impl<C, S> Persisted<C, S> {
     /// Cap the backfill at `block` (a sort key) and skip the live tail. The
     /// stream ends naturally once backfill-to-`block` is exhausted — no timeout
     /// needed. Useful for bounded/testing contexts that pin to a snapshot block.
+    #[must_use]
     pub fn with_to_block(mut self, block: u64) -> Self {
         self.to_block = Some(block);
         self
@@ -217,6 +242,7 @@ impl<C, S> Persisted<C, S> {
     /// signature — the name source for a non-EVM event type built via a bare
     /// [`Persisted::new`]. A schema override set through
     /// [`try_with_schema`](Persisted::try_with_schema) still wins at subscribe.
+    #[must_use]
     pub fn with_table(mut self, table: impl Into<String>) -> Self {
         self.table = Some(table.into());
         self
@@ -245,6 +271,7 @@ impl<C, S> Persisted<C, S> {
     /// about recent history shouldn't have to fetch (or be able to fetch) the
     /// whole chain. Stored history beyond this block wins: the backfill resumes
     /// from the last stored position as usual.
+    #[must_use]
     pub fn with_start_block(mut self, block: u64) -> Self {
         self.start_block = block;
         self
@@ -255,6 +282,7 @@ impl<C, S> Persisted<C, S> {
     /// time, so no single RPC call exceeds provider range caps or buffers an
     /// unbounded result. A [`NonZeroU64`] makes a zero-width chunk (which could
     /// never make progress) unrepresentable at the call site.
+    #[must_use]
     pub fn with_backfill_chunk_size(mut self, blocks: NonZeroU64) -> Self {
         self.backfill_chunk_size = blocks.get();
         self
@@ -267,6 +295,7 @@ impl<C, S> Persisted<C, S> {
     /// halts persistence (a restart re-syncs). Choose `depth` above the deepest
     /// reorg you expect. A [`NonZeroU64`] makes a zero depth (which would write
     /// the open live position before it can be confirmed) unrepresentable.
+    #[must_use]
     pub fn with_confirmation_depth(mut self, depth: NonZeroU64) -> Self {
         self.confirmation_depth = depth.get();
         self
@@ -315,7 +344,7 @@ where
         // the subscribe without mutating any state. A schema override wins; else
         // the name captured by `with_persistence` / `with_persistence_named` /
         // `with_table` is used; a bare `Persisted::new` over a non-SolEvent type
-        // resolves neither and errors [subscribe_no_table_error]. Shared (Arc)
+        // resolves neither and errors. Shared (Arc)
         // between the backfill and live writers, so a schema frozen during
         // backfill is reused by the live tail.
         let record = Arc::new(match (self.schema.clone(), self.table.clone()) {
@@ -337,20 +366,14 @@ where
         };
         let tip = self.collector.tip().await?;
         let tip_key = tip.sort_key();
-        // Cap the effective tip (a sort key) at to_block when in bounded mode.
         let effective_tip = self.to_block.map(|b| b.min(tip_key)).unwrap_or(tip_key);
 
         let last = self.store.stored_position(record.table()).await?;
 
-        // 1. Replay stored history, reconstructed from the database — but only
-        //    on the first subscribe. On a reconnect the engine subscribes again;
-        //    re-emitting the whole archive would re-deliver every historical
-        //    event to strategies, so subsequent subscribes skip replay and let
-        //    the backfill segment cover only the gap since the last stored
-        //    position.
-        //    In bounded mode the archive may already be ahead of the snapshot;
-        //    replay is then clamped to `to_block` so no event past the snapshot
-        //    is delivered.
+        // 1. Replay stored history — first subscribe only (see the `replayed`
+        //    field doc). In bounded mode the archive may already be ahead of
+        //    the snapshot; replay is then clamped to `to_block` so no event
+        //    past the snapshot is delivered.
         let replay_up_to = match (self.to_block, &last) {
             (Some(cap), Some(l)) if l.sort_key() > cap => Some(C::Pos::from_sort_key(cap)),
             _ => last.clone(),
@@ -414,7 +437,7 @@ where
         //    `poison` is cancelled by a failed backfill chunk; ending the whole
         //    stream hands the failure to the Reconnect Policy, whose resubscribe
         //    backfills again from the last stored position.
-        let live_source: CollectorStream<'_, (C::Pos, E)> = match live_source {
+        let live_source: CollectorStream<'_, Indexed<C::Pos, E>> = match live_source {
             None => Box::pin(futures::stream::empty()),
             Some(src) => Box::pin(src.take_until(poison.cancelled_owned())),
         };
@@ -430,10 +453,16 @@ where
         // dropped while zero-confirmation backfill rows stay final forever. In
         // bounded mode there is no live tail to mature or correct a window, so
         // the whole snapshot range settles final exactly as before.
+        //
+        // `checked_sub`, not saturating: when the tip is younger than the
+        // depth there is no position with `depth` confirmations yet, so
+        // *nothing* may settle final — a saturated cut of 0 would write
+        // position 0's rows with fewer confirmations than the caller asked
+        // for. `None` routes the whole gap through the confirmation window.
         let final_cut = if self.to_block.is_some() {
-            effective_tip
+            Some(effective_tip)
         } else {
-            effective_tip.saturating_sub(self.confirmation_depth)
+            effective_tip.checked_sub(self.confirmation_depth)
         };
         let synced = persist_and_emit(
             backfill_source,
@@ -625,13 +654,6 @@ fn is_response_size_error(e: &anyhow::Error) -> bool {
         || s.contains("too big")
 }
 
-// A zero confirmation depth is nonsensical (a position can never be buried zero
-// deep before it is written — that is the same position) and would defeat the
-// reorg protection the knob exists for. It is now unrepresentable:
-// `with_confirmation_depth` takes a `NonZeroU64`, so the invalid value cannot
-// reach the builder — the same way `with_backfill_chunk_size` rejects a zero
-// chunk.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,7 +676,7 @@ mod tests {
         type Pos = BlockPosition;
         async fn subscribe_indexed(
             &self,
-        ) -> Result<CollectorStream<'_, (BlockPosition, LedgerRow)>> {
+        ) -> Result<CollectorStream<'_, Indexed<BlockPosition, LedgerRow>>> {
             Ok(Box::pin(futures::stream::empty()))
         }
         async fn query_range(
@@ -692,9 +714,9 @@ mod tests {
 
     /// A bare `Persisted::new` over a non-SolEvent type resolves no table name
     /// (no schema override, no captured name, and `E` is not `SolEvent`), so
-    /// subscribe errors with the documented literal and mutates no state
-    /// [subscribe_no_table_error]. Discriminating: had subscribe fallen back to
-    /// a derived or empty name it would succeed, so the `Ok` arm panics.
+    /// subscribe errors with the documented literal and mutates no state.
+    /// Had subscribe fallen back to a derived or empty name it would succeed,
+    /// so the `Ok` arm panics.
     #[tokio::test]
     async fn subscribe_without_table_name_errors() {
         let persisted = Persisted::new(BareCollector, NullStore);

@@ -11,8 +11,8 @@ use alloy::primitives::U256;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::persistence::{
-    BlockPosition, PersistExt, PersistableCollector, PostgresStore, Record, Row, SqlType, SqlValue,
-    SqliteStore, Store, TableSchema,
+    BlockPosition, Indexed, PersistExt, PersistableCollector, PostgresStore, Record, Row, SqlType,
+    SqlValue, SqliteStore, Store, TableSchema,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -58,11 +58,13 @@ impl FakeCollector {
 impl PersistableCollector<ValueSet> for FakeCollector {
     type Pos = BlockPosition;
 
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
+    async fn subscribe_indexed(
+        &self,
+    ) -> Result<CollectorStream<'_, Indexed<BlockPosition, ValueSet>>> {
         let events: Vec<_> = self
             .live
             .iter()
-            .map(|&(b, v)| (BlockPosition(b), value_event(v)))
+            .map(|&(b, v)| Indexed::Event(BlockPosition(b), value_event(v)))
             .collect();
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -540,37 +542,27 @@ async fn with_pool_store_matches_connect_store_parity() {
 /// No Docker / container is needed — the pool is lazy and never reaches a server.
 #[tokio::test]
 async fn with_pool_defers_connectivity_errors_to_first_use() {
-    // Connect options targeting port 1 — the same unreachable target the eager
-    // `connect` prior art uses — so the URL path's errors-at-connect and the
-    // injected path's errors-at-first-use are pinned against the same failure.
     let opts: PgConnectOptions = "postgres://postgres:postgres@127.0.0.1:1/postgres"
         .parse()
         .expect("parse connect options");
 
-    // `connect_lazy_with` opens no connection now (returns `Pool`, not a future),
-    // so no I/O happens at pool construction. A short acquire timeout bounds the
-    // first-use failure: a connection-refused error is retried with backoff until
-    // this deadline, then surfaces as `PoolTimedOut`.
+    // Lazy pool: no I/O at construction. The short acquire timeout bounds the
+    // first-use failure (connection-refused retries surface as `PoolTimedOut`).
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(2))
         .connect_lazy_with(opts);
 
-    // `with_pool` returns `Self` (no `.await`, no `Result`), so merely reaching
-    // this binding proves construction did no connect round-trip and no I/O.
     let store = PostgresStore::with_pool(pool);
 
-    // The connectivity error surfaces here, at the first store operation — not at
-    // construction. A connection failure is not the missing-table SQLSTATE (42P01),
-    // so `stored_position` propagates it as `Err` rather than misclassifying it as
-    // `Ok(None)`.
+    // A connection failure is not the missing-table SQLSTATE (42P01), so
+    // `stored_position` propagates it as `Err` rather than misclassifying it
+    // as `Ok(None)`.
     let first_use: Result<Option<BlockPosition>> = store.stored_position("t").await;
     assert!(
         first_use.is_err(),
         "first store use over an unreachable injected pool must surface the connectivity error"
     );
 
-    // A second read fails the same way — the store fabricated no success and
-    // holds no partial or half-initialised state.
     let follow_up = store.replay(&value_set_schema(), BlockPosition(100)).await;
     assert!(
         follow_up.is_err(),
@@ -589,16 +581,14 @@ async fn with_pool_defers_connectivity_errors_to_first_use() {
 async fn with_pool_store_leaves_injected_pool_open_on_drop() {
     let (_container, url) = start_postgres().await;
 
-    // Caller-owned pool; the store receives a clone — a handle to the SAME pool.
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
         .await
         .unwrap();
 
-    // Construct a store over the injected pool and actually use it (so the
-    // "still usable after drop" claim is non-vacuous: the store acquired and
-    // returned a connection from the borrowed pool), then drop every store handle.
+    // Use the store (so the "still usable after drop" claim is non-vacuous),
+    // then drop every store handle.
     {
         let store = PostgresStore::with_pool(pool.clone());
         let schema = value_set_schema();
@@ -610,11 +600,8 @@ async fn with_pool_store_leaves_injected_pool_open_on_drop() {
             )
             .await
             .unwrap();
-        drop(store); // the store's PgPool clone is dropped by compiler drop glue only.
     }
 
-    // The caller's retained handle still answers queries: the store never closed
-    // the borrowed pool.
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&pool)
         .await
