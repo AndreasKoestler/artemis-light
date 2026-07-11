@@ -283,6 +283,14 @@ mod tests {
         );
     }
 
+    // The `u64` ⇄ `BlockPosition` conversions are the ergonomic sugar callers
+    // use at the boundary; they round-trip the block number unchanged.
+    #[test]
+    fn block_position_round_trips_through_u64() {
+        assert_eq!(BlockPosition::from(7u64), BlockPosition(7));
+        assert_eq!(u64::from(BlockPosition(7)), 7u64);
+    }
+
     // decode∘encode == id, and encode is the decimal string.
     #[test]
     fn encode_decode_round_trips() {

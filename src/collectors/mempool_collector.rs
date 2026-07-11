@@ -119,3 +119,20 @@ where
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tuning setters mutate their fields and hand the collector back;
+    /// the provider itself is untouched, so a `()` stand-in proves the builders
+    /// need no live RPC.
+    #[test]
+    fn builder_setters_apply() {
+        let collector = MempoolCollector::new(Arc::new(()))
+            .with_max_concurrent_lookups(NonZeroUsize::new(4).unwrap())
+            .with_rpc_timeout(Duration::from_secs(3));
+        assert_eq!(collector.max_concurrent_lookups, 4);
+        assert_eq!(collector.rpc_timeout, Duration::from_secs(3));
+    }
+}
