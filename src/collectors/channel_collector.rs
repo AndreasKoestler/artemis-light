@@ -81,7 +81,10 @@ mod tests {
         // The lag surfaces as a filtered-out `None`, so the next delivered item
         // is the retained tail — the stream neither errors nor terminates.
         let next = stream.next().await;
-        assert!(next.is_some(), "the stream survives a lag and yields the tail");
+        assert!(
+            next.is_some(),
+            "the stream survives a lag and yields the tail"
+        );
     }
 
     #[tokio::test]

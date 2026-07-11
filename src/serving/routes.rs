@@ -188,8 +188,8 @@ pub async fn get_status_handler(State(state): State<AppState>) -> impl IntoRespo
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::rows::Bounds;
+    use super::*;
     use async_trait::async_trait;
     use axum::http::StatusCode;
     use serde_json::{Map, Value};
