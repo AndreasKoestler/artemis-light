@@ -13,7 +13,6 @@ pub struct Map<E, F> {
 }
 
 impl<E, F> Map<E, F> {
-    /// Creates a new `Map` wrapping `collector` with the mapping function `f`.
     pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
         Self { collector, f }
     }

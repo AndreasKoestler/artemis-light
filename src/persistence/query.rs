@@ -9,9 +9,8 @@
 //! that genuinely differ are supplied by a [`Dialect`]: the placeholder syntax,
 //! the intra-block tie-breaker, the column-type keywords, and the progress
 //! row-lock suffix. The two backends therefore cannot drift apart on the parts
-//! they share. Watermark monotonicity lives in `Position::advance` in Rust,
-//! applied inside the write transaction, so the upsert stores the
-//! already-advanced watermark verbatim — no SQL `MAX`/`GREATEST`. The progress
+//! they share. Watermark monotonicity lives in `Position::advance`, not SQL
+//! (see [`watermark_upsert`]). The progress
 //! table keeps the retained `last_block` sort key (the serving layer reads it)
 //! alongside the authoritative encoded `position` column — `Position::encode`
 //! output — which a pre-change archive gains through the lazy
@@ -241,12 +240,18 @@ pub(super) fn replay_query(schema: &TableSchema, dialect: &dyn Dialect) -> Strin
 /// read-side twin of [`replay_query`] — both depend only on the same two dialect
 /// facts (placeholder, tie-breaker).
 #[cfg(feature = "serving")]
-pub(crate) fn range_query(table: &str, dialect: &dyn Dialect) -> String {
+pub(crate) fn range_query(table: &str, schema: Option<&str>, dialect: &dyn Dialect) -> String {
     let block = quote_ident(BLOCK_NUMBER_COLUMN);
+    // The optional schema pins the table reference (e.g. `"public"."transfer"`)
+    // so a reader on a pool whose search_path fronts another schema still
+    // resolves the relation introspection validated.
+    let table_ref = match schema {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(table),
+    };
     format!(
-        "SELECT * FROM {} WHERE {block} BETWEEN {} AND {} \
+        "SELECT * FROM {table_ref} WHERE {block} BETWEEN {} AND {} \
          ORDER BY {block} ASC, {} ASC LIMIT {} OFFSET {}",
-        quote_ident(table),
         dialect.placeholder(1),
         dialect.placeholder(2),
         dialect.tiebreak(),
@@ -360,9 +365,6 @@ mod tests {
 
     #[test]
     fn watermark_upsert_stores_both_columns_verbatim() {
-        // No SQL MAX/GREATEST: both bound values are already advanced in Rust, so
-        // the conflict clause copies `excluded.*` as-is — for BlockPosition the
-        // `position` text is the same decimal as `last_block`.
         let q = watermark_upsert(&SqliteDialect);
         assert!(
             q.contains("(table_name, last_block, position) VALUES (?, ?, ?)"),
@@ -415,8 +417,15 @@ mod tests {
     #[cfg(feature = "serving")]
     #[test]
     fn range_query_binds_four_positions_with_tiebreak() {
-        let q = range_query("transfer", &SqliteDialect);
+        let q = range_query("transfer", None, &SqliteDialect);
         assert!(q.contains("BETWEEN ? AND ?"), "{q}");
         assert!(q.contains("rowid ASC LIMIT ? OFFSET ?"), "{q}");
+    }
+
+    #[cfg(feature = "serving")]
+    #[test]
+    fn range_query_schema_qualifies_and_quotes_the_table_reference() {
+        let q = range_query("a\"b", Some("public"), &SqliteDialect);
+        assert!(q.contains("FROM \"public\".\"a\"\"b\""), "{q}");
     }
 }

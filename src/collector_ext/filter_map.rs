@@ -11,7 +11,6 @@ pub struct FilterMap<E, F> {
 }
 
 impl<E, F> FilterMap<E, F> {
-    /// Creates a new `FilterMap` wrapping `collector` with the filter-map function `f`.
     pub fn new(collector: Box<dyn Collector<E>>, f: F) -> Self {
         Self { collector, f }
     }

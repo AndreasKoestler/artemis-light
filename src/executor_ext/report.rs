@@ -24,7 +24,9 @@ pub struct ExecutionOutcome<A> {
 /// composes anywhere in the reliability stack; place it outermost to report
 /// the stack's final post-retry/post-fallback verdict. Reporting is
 /// best-effort: a dropped receiver is logged and ignored, never failing the
-/// submission.
+/// submission. Pair it with a
+/// [`ChannelCollector`](crate::collectors::ChannelCollector) over the same
+/// channel to feed verdicts back to strategies as events.
 pub struct Report<A> {
     executor: Box<dyn Executor<A>>,
     outcomes: Sender<ExecutionOutcome<A>>,

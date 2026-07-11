@@ -232,9 +232,8 @@ where
 
         match encoded {
             // The authoritative encoded resume point is present: decode it. A
-            // malformed / wrong-typed value fails loudly here (MalformedStoredPosition
-            // propagated verbatim from `Position::decode`), never a silent genesis
-            // re-sync.
+            // malformed / wrong-typed value fails loudly here (the `Position::decode`
+            // error propagated verbatim), never a silent genesis re-sync.
             Some(Some(text)) => Ok(Some(P::decode(&text)?)),
             // The column is absent (pre-migration archive) or NULL (an old binary
             // wrote after the migration): resume from `last_block`'s decimal text,
@@ -617,7 +616,7 @@ mod tests {
         );
     }
 
-    // errorPath: sort keys are stored in signed 64-bit columns, so a key above
+    // Sort keys are stored in signed 64-bit columns, so a key above
     // i64::MAX must fail loudly and descriptively — `as i64` would silently
     // wrap it negative, corrupting the archive's ordering.
     #[tokio::test]

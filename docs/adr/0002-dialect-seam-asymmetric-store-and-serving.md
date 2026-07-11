@@ -73,3 +73,6 @@ expression (`MAX` vs `GREATEST`)" is no longer a Dialect fact. A generic
 `Position::advance` and the upsert writes the advanced value verbatim. The
 Dialect gained an error-classification fact instead: benign duplicate-object
 DDL races (PostgreSQL SQLSTATEs `42P07`/`42701`/`23505`; never on SQLite).
+The same rework renamed the Store orchestration methods this document refers
+to as `write_block` / `last_block`: they are now `write` / `stored_position`
+(`replay` kept its name), generic over the position type.

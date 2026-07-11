@@ -99,7 +99,7 @@ pub(crate) async fn query_rows(
     // for every table the persistence layer creates. `list_tables` surfaces any
     // non-internal table in the file, so a foreign table created by other tooling
     // sharing the DB would fail here (no `block_number`), surfacing as a 500.
-    let sql = range_query(table, &SqliteDialect);
+    let sql = range_query(table, None, &SqliteDialect);
     let rows = sqlx::query(&sql)
         .bind(bounds.from_block as i64)
         .bind(bounds.to_block as i64)

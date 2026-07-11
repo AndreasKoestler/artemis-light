@@ -11,8 +11,6 @@ pub struct FilterMapEvent<E, A, F> {
 }
 
 impl<E, A, F> FilterMapEvent<E, A, F> {
-    /// Creates a new `FilterMapEvent` wrapping `strategy` with the projection
-    /// function `f`.
     pub fn new(strategy: Box<dyn Strategy<E, A>>, f: F) -> Self {
         Self { strategy, f }
     }

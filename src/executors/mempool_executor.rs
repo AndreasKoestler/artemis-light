@@ -193,7 +193,6 @@ impl ReplacementSchedule {
 /// An executor that sends transactions to the mempool.
 pub struct MempoolExecutor<M> {
     client: Arc<M>,
-    /// Timeout for individual RPC calls.
     rpc_timeout: Duration,
     /// Percentage applied to the provider's suggested priority fee (100 = as-is).
     priority_fee_bump_percent: u64,

@@ -137,7 +137,7 @@ where
         // buffered groups (the node re-emits the canonical ones) and the head,
         // so those groups must re-confirm. Groups strictly below `key` are
         // untouched — they belong to the shared prefix. Halt-policy (block)
-        // sources only (design §4 record step 5): a Dedupe (frontier) feed is
+        // sources only: a Dedupe (frontier) feed is
         // append-only, so a backwards position is jittered late arrival, not a
         // reorg. It falls through to a plain insert into its own slot below —
         // never a rewind that would drop a higher already-buffered slot and
@@ -258,6 +258,62 @@ where
         self.pending.clear();
     }
 
+    /// Fold the settled (backfill) writer's finalized watermark into this
+    /// window's. The window is seeded with only the *sort key* of the settled
+    /// boundary ([`Position::from_sort_key`], an empty identity set for a
+    /// frontier), so without this fold a live re-delivery of an identity the
+    /// settled writer stored *at* the boundary instant would not be covered and
+    /// would be stored a second time.
+    pub(super) fn absorb(&mut self, settled: Option<P>) {
+        if let Some(position) = settled {
+            self.flushed = Some(
+                self.flushed
+                    .map_or(position.sort_key(), |f| f.max(position.sort_key())),
+            );
+            self.watermark = Some(P::advance(self.watermark.take(), position));
+        }
+    }
+
+    /// Apply a reorg *retraction* at `position` — the node re-sent a log with
+    /// `removed: true`, signalling that events at this position no longer
+    /// happened. Only meaningful for [`Reobservation::Halt`] sources (a Dedupe
+    /// feed is append-only and never retracts; a stray retraction is ignored).
+    ///
+    /// A retraction at or below the finalized watermark is a reorg deeper than
+    /// the confirmation depth — unfixable without a delete, so halt. Inside the
+    /// window it rewinds exactly like a backwards re-emission: live-origin
+    /// groups at or above the key are dropped (the node re-emits the canonical
+    /// replacements, which may share the retracted key — the same-height reorg
+    /// a re-emission alone cannot reveal), seeded groups convert their rows
+    /// into the downstream-dedupe set, and `head` rewinds below the key so the
+    /// canonical re-fill must re-confirm.
+    pub(super) fn retract(&mut self, position: P) {
+        if !self.core.healthy() {
+            return;
+        }
+        if P::REOBSERVATION == Reobservation::Dedupe {
+            tracing::warn!(
+                "ignoring retraction at {position:?}: append-only (Dedupe) \
+                 sources do not reorg"
+            );
+            return;
+        }
+        let key = position.sort_key();
+        if let Some(f) = self.flushed
+            && key <= f
+        {
+            let depth = self.depth;
+            self.core.fail(format_args!(
+                "position {position:?} retracted at/below the watermark \
+                 (reorg deeper than confirmation depth {depth})"
+            ));
+            self.pending.clear();
+            return;
+        }
+        self.rewind(key);
+        self.head = self.head.map(|h| h.min(key.saturating_sub(1)));
+    }
+
     /// Rewind the window for a re-emission at `key`: a live-origin group at or
     /// above it is dropped — the node re-emits the canonical replacements —
     /// while a backfill-seeded group converts its rows into the `expected`
@@ -282,8 +338,7 @@ where
 
     /// Whether `pos` is already covered by the finalized watermark or by the
     /// pending (buffered-but-unflushed) group at `pos`'s own sort key — the
-    /// dedupe test for [`Reobservation::Dedupe`] positions (design §4 record
-    /// step 5: "the pending slot's fold at `pos.sort_key()`").
+    /// dedupe test for [`Reobservation::Dedupe`] positions.
     ///
     /// The pending-fold check is scoped to the *same* sort-key slot on purpose.
     /// Consulting every pending slot would let a slot at a higher sort key (a
@@ -491,6 +546,83 @@ mod tests {
         );
     }
 
+    /// A same-height reorg — block `N` replaced by `N′` before `N + 1` arrives —
+    /// re-emits at `key == head`, which a re-emission alone cannot distinguish
+    /// from another event in the same block. The node's `removed`-log
+    /// *retraction* is the only signal, and it must drop the orphaned buffered
+    /// rows so only the replacement's rows are ever written.
+    #[tokio::test]
+    async fn retraction_drops_orphaned_rows_of_a_same_height_reorg() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        // Block 6 with the soon-to-be-orphaned event A.
+        w.record(BlockPosition(6), &ping(60)).await;
+        // The reorg: the node retracts block 6's logs...
+        w.retract(BlockPosition(6));
+        assert_eq!(w.buffered_blocks(), Vec::<u64>::new(), "orphan dropped");
+        // ...and re-emits the replacement 6′ with A′, then the chain advances.
+        w.record(BlockPosition(6), &ping(61)).await;
+        w.record(BlockPosition(7), &ping(70)).await;
+        w.record(BlockPosition(8), &ping(80)).await; // block 6 matures (6+2<=8)
+
+        assert_eq!(store.written(), vec![6], "block 6 written once");
+        assert_eq!(
+            store.total_rows(),
+            1,
+            "only the replacement row is stored; the orphan is gone"
+        );
+    }
+
+    /// A retraction at or below the finalized watermark is a reorg deeper than
+    /// the confirmation depth: the orphaned row is already final, so the writer
+    /// halts rather than leaving it silently wrong.
+    #[tokio::test]
+    async fn retraction_at_or_below_the_watermark_halts() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 1);
+
+        w.record(BlockPosition(5), &ping(1)).await;
+        w.record(BlockPosition(6), &ping(2)).await; // block 5 flushes (watermark 5)
+        assert_eq!(store.written(), vec![5]);
+
+        w.retract(BlockPosition(5));
+        w.record(BlockPosition(7), &ping(3)).await; // would mature block 6
+        assert_eq!(store.written(), vec![5], "nothing written after the halt");
+    }
+
+    /// Absorbing the settled (backfill) writer's watermark closes the boundary
+    /// leak: an identity the settled writer stored *at* the cut instant must
+    /// dedupe when the live tail re-delivers it, not store a second row.
+    #[tokio::test]
+    async fn absorbed_settled_watermark_dedupes_boundary_instant_redelivery() {
+        let store = RecordingStore::<TestFrontier>::default();
+        // Window seeded as `persist_and_emit` does: the cut's sort key with an
+        // EMPTY identity set.
+        let mut w = ConfirmationWindow::<_, TestFrontier, Ping>::new(
+            &store,
+            record(),
+            1,
+            Some(TestFrontier::from_sort_key(4999)),
+        );
+        // The settled writer stored identity 0xc1 at the cut instant 4999.
+        w.absorb(Some(TestFrontier::at(4999, 0xc1)));
+
+        // The live tail re-delivers 0xc1@4999 (the pre-tip subscription race):
+        // covered by the absorbed watermark -> suppressed, no row.
+        assert!(
+            !w.record(TestFrontier::at(4999, 0xc1), &ping(1)).await,
+            "the boundary-instant re-delivery is deduped"
+        );
+        // A genuinely new identity at the boundary instant still flows.
+        assert!(w.record(TestFrontier::at(4999, 0xc2), &ping(2)).await);
+        w.record(TestFrontier::at(6000, 0xd1), &ping(3)).await; // matures 4999
+
+        assert_eq!(store.written(), vec![4999]);
+        assert_eq!(store.total_rows(), 1, "0xc1 never re-stored");
+        assert_eq!(store.positions()[0], TestFrontier::at(4999, 0xc2));
+    }
+
     /// A reorg deeper than the confirmation depth re-emits an already-flushed
     /// block. That row is finalized — undoing it would need a delete the writer
     /// doesn't do — so persistence halts rather than writing the orphaned and
@@ -544,10 +676,10 @@ mod tests {
         assert_eq!(store.written(), vec![u64::MAX]);
     }
 
-    /// DEDUP.1/.2 on the live tail: an overlapping re-read is suppressed while a
+    /// On the live tail an overlapping re-read is suppressed while a
     /// new same-instant identity is retained; the matured group flushes once
     /// carrying only the new identity. Also exercises depth-based maturity for a
-    /// Dedupe (frontier) position. Discriminating: without the dedupe skip the
+    /// Dedupe (frontier) position. Without the dedupe skip the
     /// re-read would either halt (old sort-key `<=` check) or add a second row.
     #[tokio::test]
     async fn dedupe_skip_suppresses_and_matures_in_window() {
@@ -652,7 +784,7 @@ mod tests {
     /// must not drop that higher slot. A same-instant re-observation already
     /// folded into its own slot IS still deduped.
     ///
-    /// Discriminating on both halves of the fix:
+    /// Both halves of the fix are exercised:
     ///   * against the old `pending.values().any(...)` covered check, the new
     ///     event at t=2 is reported "contained" by the pending t=3 slot
     ///     (`contains` is true for any earlier instant) and wrongly suppressed —

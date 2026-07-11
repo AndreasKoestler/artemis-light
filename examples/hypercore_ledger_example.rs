@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use artemis_light::persistence::{
-    PAYLOAD_COLUMN, PersistExt, PersistableCollector, Position, Row, SqlType, SqlValue,
+    Indexed, PAYLOAD_COLUMN, PersistExt, PersistableCollector, Position, Row, SqlType, SqlValue,
     SqliteStore, Store, TableSchema, TimeFrontier,
 };
 use artemis_light::types::{Collector, CollectorStream};
@@ -125,15 +125,21 @@ impl SimulatedLedgerFeed {
 impl PersistableCollector<LedgerUpdate> for SimulatedLedgerFeed {
     type Pos = TimeFrontier;
 
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (TimeFrontier, LedgerUpdate)>> {
+    async fn subscribe_indexed(
+        &self,
+    ) -> Result<CollectorStream<'_, Indexed<TimeFrontier, LedgerUpdate>>> {
         // The example runs both legs in bounded mode (`with_to_block`), which
         // never subscribes to a live tail — the whole feed is drained through
         // `query_range`. The scripted entries are returned here too so the
-        // collector is a complete implementation on its own.
-        let items: Vec<(TimeFrontier, LedgerUpdate)> = self
+        // collector is a complete implementation on its own. An append-only
+        // ledger feed never reorgs, so it never yields `Indexed::Retract`.
+        let items: Vec<Indexed<TimeFrontier, LedgerUpdate>> = self
             .events
             .iter()
-            .map(|(time, hash)| Self::item(*time, hash))
+            .map(|(time, hash)| {
+                let (position, event) = Self::item(*time, hash);
+                Indexed::Event(position, event)
+            })
             .collect();
         Ok(Box::pin(futures::stream::iter(items)))
     }

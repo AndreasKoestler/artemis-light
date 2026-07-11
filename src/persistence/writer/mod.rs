@@ -18,7 +18,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use serde::Serialize;
 
-use crate::persistence::{Position, Record, Row, Store, TableSchema};
+use crate::persistence::{Indexed, Position, Record, Row, Store, TableSchema};
 use crate::types::CollectorStream;
 
 mod block;
@@ -141,13 +141,23 @@ impl<'a, S, E: Serialize> GapFreeWriter<'a, S, E> {
 /// Positions at or below `final_cut` (tip − confirmation depth) are settled:
 /// nothing can reorg them without exceeding the depth, so a [`BlockWriter`]
 /// writes them one transaction per complete group, trailing group included.
-/// Positions above the cut are exactly the window a shallow reorg may still
-/// rewrite — final-flushing them with zero confirmations would freeze orphaned
-/// rows into the store on the very next in-window reorg (re-exposed on every
-/// reconnect) — so they stay pending in a [`ConfirmationWindow`], seeded from
-/// the backfill tail and matured (or reorg-corrected, or deduped on a boundary
-/// re-delivery) by the live tail. The window's watermark starts at `final_cut`:
-/// a live re-emission at or below it is a reorg deeper than the depth (Halt).
+/// `final_cut` is `None` when the tip is younger than the depth — no position
+/// has enough confirmations yet, so nothing settles and the whole gap stays
+/// pending in the window. Positions above the cut are exactly the window a
+/// shallow reorg may still rewrite — final-flushing them with zero
+/// confirmations would freeze orphaned rows into the store on the very next
+/// in-window reorg (re-exposed on every reconnect) — so they stay pending in a
+/// [`ConfirmationWindow`], seeded from the backfill tail and matured (or
+/// reorg-corrected, or deduped on a boundary re-delivery) by the live tail.
+/// The window's watermark starts at `final_cut` and, once the backfill ends,
+/// absorbs the settled writer's folded watermark — so a boundary-instant
+/// identity the settled writer stored dedupes instead of storing twice. A live
+/// re-emission at or below the watermark is a reorg deeper than the depth
+/// (Halt).
+///
+/// The live stream carries [`Indexed`] items: a [`Retract`](Indexed::Retract)
+/// rewinds the window (dropping buffered orphans so a same-height replacement
+/// starts a fresh group) without emitting anything downstream.
 ///
 /// There is no final flush for the window — the live tail never ends, and the
 /// unflushed window is intentionally left for a restart's backfill to re-fetch
@@ -156,11 +166,11 @@ impl<'a, S, E: Serialize> GapFreeWriter<'a, S, E> {
 /// every group settles through the `BlockWriter` exactly as before.
 pub(super) fn persist_and_emit<'a, E, P, S>(
     mut backfill: CollectorStream<'a, (P, E)>,
-    mut live: CollectorStream<'a, (P, E)>,
+    mut live: CollectorStream<'a, Indexed<P, E>>,
     store: &'a S,
     record: Arc<Record<E>>,
     depth: u64,
-    final_cut: u64,
+    final_cut: Option<u64>,
     seed: Option<P>,
 ) -> CollectorStream<'a, E>
 where
@@ -172,7 +182,11 @@ where
         let mut settled = BlockWriter::new(store, record.clone(), seed.clone());
         // Everything at or below the cut is settled by the BlockWriter before
         // the live stream is polled, so the window's watermark starts there.
-        let window_seed = Some(P::advance(seed, P::from_sort_key(final_cut)));
+        // With no cut nothing settles: the window starts at the stored seed.
+        let window_seed = match final_cut {
+            Some(cut) => Some(P::advance(seed, P::from_sort_key(cut))),
+            None => seed,
+        };
         let mut window = ConfirmationWindow::new(store, record, depth, window_seed);
 
         // `record` / `record_seeded` return false for a Dedupe re-observation
@@ -180,7 +194,8 @@ where
         // delivered it once). The Halt (block) path suppresses only a live row
         // the backfill tail already delivered across the boundary.
         while let Some((position, event)) = backfill.next().await {
-            let delivered = if position.sort_key() <= final_cut {
+            let settles = final_cut.is_some_and(|cut| position.sort_key() <= cut);
+            let delivered = if settles {
                 settled.record(position, &event).await
             } else {
                 window.record_seeded(position, &event).await
@@ -190,7 +205,12 @@ where
             }
         }
         settled.finish().await;
-        if !settled.healthy() {
+        if settled.healthy() {
+            // The window's seed carries only the cut's sort key (an empty
+            // identity set for a frontier); fold in what the settled writer
+            // actually stored so a boundary-instant re-delivery dedupes.
+            window.absorb(settled.watermark());
+        } else {
             // The settled prefix has a hole: the window flushing anything
             // above it would advance the stored watermark over the gap.
             window.halt(format_args!(
@@ -198,14 +218,101 @@ where
             ));
         }
 
-        while let Some((position, event)) = live.next().await {
-            if window.record(position, &event).await {
-                yield event;
+        while let Some(item) = live.next().await {
+            match item {
+                Indexed::Event(position, event) => {
+                    if window.record(position, &event).await {
+                        yield event;
+                    }
+                }
+                Indexed::Retract(position) => window.retract(position),
             }
         }
     };
 
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Ping, RecordingStore, ping, record};
+    use super::*;
+    use crate::persistence::BlockPosition;
+
+    fn indexed(items: Vec<(u64, u64)>) -> CollectorStream<'static, (BlockPosition, Ping)> {
+        Box::pin(futures::stream::iter(
+            items
+                .into_iter()
+                .map(|(b, v)| (BlockPosition(b), ping(v)))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn live(
+        items: Vec<Indexed<BlockPosition, Ping>>,
+    ) -> CollectorStream<'static, Indexed<BlockPosition, Ping>> {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// With no `final_cut` (the tip is younger than the confirmation depth)
+    /// NOTHING may settle final: every backfilled position stays pending in
+    /// the window, waiting for `depth` confirmations that have not happened
+    /// yet. A saturated cut of 0 used to write position 0 under-confirmed.
+    #[tokio::test]
+    async fn no_final_cut_settles_nothing() {
+        let store = RecordingStore::default();
+        // tip = 3, depth = 5: positions 0..=3 backfilled, no live tail yet.
+        let mut out = persist_and_emit(
+            indexed(vec![(0, 1), (1, 2), (2, 3), (3, 4)]),
+            live(vec![]),
+            &store,
+            record(),
+            5,
+            None,
+            None,
+        );
+        let mut delivered = 0;
+        while StreamExt::next(&mut out).await.is_some() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 4, "events still flow downstream");
+        assert_eq!(
+            store.written(),
+            Vec::<u64>::new(),
+            "nothing has depth-5 confirmations, so nothing settles final"
+        );
+    }
+
+    /// A live retraction rewinds the window across the backfill/live boundary:
+    /// the seeded group converts to a dedupe set, the replacement's rows win.
+    #[tokio::test]
+    async fn live_retraction_corrects_a_seeded_backfill_group() {
+        let store = RecordingStore::default();
+        // tip = 6, depth = 2, cut = 4: blocks 5..=6 seed the window pending.
+        let mut out = persist_and_emit(
+            indexed(vec![(4, 40), (5, 50), (6, 60)]),
+            live(vec![
+                Indexed::Retract(BlockPosition(6)),
+                Indexed::Event(BlockPosition(6), ping(61)),
+                Indexed::Event(BlockPosition(7), ping(70)),
+                Indexed::Event(BlockPosition(8), ping(80)),
+            ]),
+            &store,
+            record(),
+            2,
+            Some(4),
+            None,
+        );
+        while StreamExt::next(&mut out).await.is_some() {}
+        // Block 4 settled; blocks 5 and 6 flushed by the live tail with 6
+        // carrying only the replacement row.
+        assert_eq!(store.written(), vec![4, 5, 6]);
+        assert_eq!(
+            store.total_rows(),
+            3,
+            "the retracted block-6 orphan is not stored"
+        );
+    }
 }
 
 /// Event types and stores shared by the [`block`] and [`window`] writer tests.
@@ -346,7 +453,7 @@ pub(super) mod test_support {
 
     /// A test-only [`Position`] with a [`Reobservation::Dedupe`] policy: a
     /// `(time, seen-set)` frontier, so the writer dedupe/suppress path can be
-    /// exercised without depending on `TimeFrontier` (Phase 5). Its `advance`
+    /// exercised without depending on `TimeFrontier`. Its `advance`
     /// moves time forward (dropping the stale seen-set), unions same-instant
     /// identities, and treats an earlier instant as a no-op; `contains` covers
     /// any earlier instant and a same-instant subset.

@@ -8,15 +8,15 @@ Suggested reading order:
 | Example | Demonstrates | Needs a node? |
 |---|---|---|
 | [`basic_example`](basic_example.rs) | The core pipeline: a custom `Collector`, `Strategy`, and `Executor` wired through the `Engine`, plus cooperative shutdown | No |
-| [`combinators_example`](combinators_example.rs) | Composing collectors with `CollectorExt`: `map`, `filter_map`, `merge`, `chain`, `fallback`, and the `merge_all`/`chain_all`/`fallback_all` list forms | No |
+| [`combinators_example`](combinators_example.rs) | Composing collectors with `CollectorExt`: `map`, `filter_map`, `merge`, `chain`, `fallback`, and the `merge_all`/`chain_all` list forms | No |
 | [`adapters_example`](adapters_example.rs) | Mounting narrow strategies and executors into an umbrella-enum engine with `StrategyExt::filter_map_event`/`map_action` and `ExecutorExt::filter_map_action` | No |
 | [`observer_example`](observer_example.rs) | A passive `Observer` watching every event and action crossing the engine's channels | No |
-| [`reliability_example`](reliability_example.rs) | Reliability wrappers for executors (`retry`, `fallback`, `rate_limit`, `circuit_breaker`, `gated`/`dry_run`) and strategy-side risk guards (`filter_actions`, `cooldown`) | No |
+| [`reliability_example`](reliability_example.rs) | Reliability wrappers for executors (`retry`, `fallback`, `rate_limit`, `circuit_breaker`, `gated`/`dry_run`, `deadline` over `Expires` actions) and strategy-side risk guards (`filter_actions`, `cooldown`) | No |
 | [`feedback_example`](feedback_example.rs) | Execution feedback: `ExecutorExt::report` publishes each action's verdict, a `ChannelCollector` feeds it back as an event, and the strategy stops re-submitting once a trade is confirmed | No |
 | [`liquidation_bot_example`](liquidation_bot_example.rs) | The same combinators in their production seats: a risk-gated, cooled-down liquidation strategy feeding a `retry` → `fallback` → `rate_limit` → `circuit_breaker` → `gated` submission stack, per-route policies under an umbrella `Action`, and a dry-run shadow executor | No |
 | [`reconnect_example`](reconnect_example.rs) | The collector reconnect lifecycle: `ReconnectConfig`, exponential backoff, recovery, and escalation to the fatal token | No |
 | [`persistence_example`](persistence_example.rs) | Recording events to SQLite with `.with_persistence(store)` and replaying them after a restart | Anvil |
-| [`hypercore_ledger_example`](hypercore_ledger_example.rs) | Persistence keyed by a custom `TimeFrontier` `Position` (not a block number) over a simulated `(time, hash)` ledger feed: same-millisecond events, restart, overlapping re-read, and writer-side dedupe to exactly-once stored effect — all on an in-memory store | No |
+| [`hypercore_ledger_example`](hypercore_ledger_example.rs) | Persistence keyed by a custom `TimeFrontier` `Position` (not a block number) over a simulated `(time, hash)` ledger feed: same-millisecond events, restart, overlapping re-read, and writer-side dedupe to exactly-once stored effect — plus bounded mode (`.with_to_block(..)`), all on an in-memory store | No |
 | [`confirmation_depth_example`](confirmation_depth_example.rs) | Lagging the store behind the live edge with `.with_confirmation_depth(n)` so a shallow reorg is absorbed before any row is written; events still arrive live | Anvil |
 | [`onchain_example`](onchain_example.rs) | An end-to-end on-chain pipeline: `BlockCollector` → strategy → `MempoolExecutor` submitting real transactions | Anvil |
 | [`serving_example`](serving_example.rs) | Indexing events into a file-backed SQLite store, standing up the read-only `ServingLayer` over it, and navigating the HTTP/JSON API (health, status, tables, schema, paged rows) with a tiny client | Anvil |
@@ -63,13 +63,8 @@ The example drops its own `value_set` and `_artemis_progress` tables at startup
 (over the caller's pool) so re-runs are deterministic; point it only at a demo
 database.
 
-**Verified run.** This example has been executed end-to-end against a real
-PostgreSQL (not merely compiled). Environment: macOS, `postgres:16` in Docker
-via the one-liner above, Foundry `anvil` on `$PATH`, crate built with
-`--features postgres`, on 2026-07-01. With `DATABASE_URL` of the shape
-`postgres://postgres:postgres@localhost:<port>/postgres` pointing at the
-container, `cargo run --example injected_pool_example --features postgres` exited
-`0` and printed exactly:
+**Expected output.** A successful run against a real PostgreSQL exits `0` and
+prints exactly:
 
 ```
 First run — persisting 3 events through the injected pool:

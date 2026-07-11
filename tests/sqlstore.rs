@@ -26,7 +26,7 @@ async fn seeded_db(setup: &[&str]) -> (tempfile::TempDir, String) {
     (dir, url)
 }
 
-// errorPath: a foreign pre-migration progress table holding a NULL
+// A foreign pre-migration progress table holding a NULL
 // `last_block` must surface as an error from `stored_position`, not a panic
 // inside library code.
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn stored_position_errs_on_a_null_last_block_cell() {
     assert!(result.is_err(), "a NULL last_block must err, not panic");
 }
 
-// errorPath: a corrupted `position` cell (a non-textual BLOB) must surface as
+// A corrupted `position` cell (a non-textual BLOB) must surface as
 // an error from `stored_position`, not a panic.
 #[tokio::test]
 async fn stored_position_errs_on_a_wrong_typed_position_cell() {

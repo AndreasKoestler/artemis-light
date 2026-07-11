@@ -105,7 +105,7 @@ mod pg {
     use super::super::json;
     use super::super::rows::Bounds;
     use super::ServingBackend;
-    use crate::persistence::{Dialect, PROGRESS_TABLE, PgDialect, quote_ident, range_query};
+    use crate::persistence::{Dialect, PROGRESS_TABLE, PgDialect, range_query};
 
     /// The `information_schema` existence probe behind
     /// [`ServingBackend::table_exists`]. Filters to `BASE TABLE` exactly like
@@ -129,14 +129,7 @@ mod pg {
     /// writer intentionally writes unqualified via the session `search_path`
     /// (documented on `PostgresStore`); pinning here is read-side only.
     fn range_query_public(table: &str) -> String {
-        let ident = quote_ident(table);
-        // `range_query` interpolates the quoted table exactly once, in its
-        // FROM clause; qualify that occurrence.
-        range_query(table, &PgDialect).replacen(
-            &format!("FROM {ident}"),
-            &format!("FROM public.{ident}"),
-            1,
-        )
+        range_query(table, Some("public"), &PgDialect)
     }
 
     /// A read-only PostgreSQL serving backend.
@@ -314,13 +307,13 @@ mod pg {
         fn data_queries_are_schema_qualified() {
             let sql = range_query_public("transfer");
             assert!(
-                sql.contains("FROM public.\"transfer\""),
-                "range query must read public.\"transfer\", got: {sql}"
+                sql.contains("FROM \"public\".\"transfer\""),
+                "range query must read \"public\".\"transfer\", got: {sql}"
             );
             // The table name stays quoted; only the FROM clause is qualified.
             let quoted = range_query_public("a\"b");
             assert!(
-                quoted.contains("FROM public.\"a\"\"b\""),
+                quoted.contains("FROM \"public\".\"a\"\"b\""),
                 "quoting must survive qualification, got: {quoted}"
             );
             let wm = watermarks_sql();
