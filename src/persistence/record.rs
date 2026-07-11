@@ -50,11 +50,7 @@ enum ColumnsSource {
     /// Declared via a schema override, validated at construction.
     Declared(Vec<Column>),
     /// Inferred from the first successfully encoded event, then frozen for
-    /// the lifetime of the `Record`. The store's `CREATE TABLE IF NOT EXISTS`
-    /// freezes the table on the first write anyway; a later event that would
-    /// infer differently (e.g. a `u64` crossing `i64::MAX`) must still fit
-    /// the frozen types — `encode` rejects it descriptively rather than
-    /// letting a strictly-typed backend fail the insert opaquely.
+    /// the lifetime of the `Record` (see "The freeze contract" on [`Record`]).
     Inferred(OnceLock<Vec<Column>>),
 }
 
@@ -384,7 +380,7 @@ mod tests {
         );
     }
 
-    // errorPath: a column frozen as Integer from the first event later receives
+    // A column frozen as Integer from the first event later receives
     // a u64 above i64::MAX (which encodes as decimal text). On PostgreSQL that
     // bind would fail with an opaque backend error and permanently halt the
     // gap-free writer; the Record must instead err descriptively, naming the

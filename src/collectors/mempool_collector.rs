@@ -17,9 +17,7 @@ const DEFAULT_MAX_CONCURRENT_LOOKUPS: usize = 16;
 /// [events](Transaction) which contain the transaction.
 pub struct MempoolCollector<M> {
     provider: Arc<M>,
-    /// Maximum number of concurrent transaction lookups.
     max_concurrent_lookups: usize,
-    /// Timeout for individual RPC calls.
     rpc_timeout: Duration,
 }
 
@@ -48,7 +46,6 @@ impl<M> MempoolCollector<M> {
     }
 }
 
-/// Implementation of the [Collector](Collector) trait for the [MempoolCollector](MempoolCollector).
 #[async_trait]
 impl<M> Collector<Transaction> for MempoolCollector<M>
 where

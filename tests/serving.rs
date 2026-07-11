@@ -386,7 +386,7 @@ async fn status_empty_before_any_write() {
     assert_eq!(body_json(resp).await, serde_json::json!({ "tables": [] }));
 }
 
-// ---- Phase 6: lifecycle, concurrency, isolation, non-goals ----
+// ---- Lifecycle, concurrency, isolation, non-goals ----
 
 #[tokio::test]
 async fn serve_shuts_down_gracefully_and_releases_address() {

@@ -22,7 +22,7 @@ impl SqliteStore {
     /// Use `"sqlite::memory:"` for an ephemeral in-memory database. A single
     /// connection is used so an in-memory database is shared across calls and
     /// every write sees a consistent view; the pool never retires it (see
-    /// [`pool_options`]), because an in-memory database dies with its
+    /// `pool_options` below), because an in-memory database dies with its
     /// connection.
     ///
     /// File databases run in WAL journal mode with `synchronous = NORMAL` and
@@ -61,12 +61,8 @@ fn pool_options() -> SqlitePoolOptions {
 mod tests {
     use super::*;
 
-    /// sqlx's pool defaults (min_connections 0, a 10-minute idle timeout, a
-    /// 30-minute max lifetime) retire an idle connection — and for
-    /// `sqlite::memory:` the database lives *in* that one connection, so a
-    /// retired connection reopens as a fresh empty database, silently
-    /// destroying the archive. The pool must never retire its single
-    /// connection.
+    /// The pool must never retire its single connection — see [`pool_options`]
+    /// for why a retired connection destroys an in-memory archive.
     #[test]
     fn pool_never_retires_its_single_connection() {
         let opts = pool_options();

@@ -22,7 +22,6 @@ impl<M> LogCollector<M> {
     }
 }
 
-/// Implementation of the [Collector](Collector) trait for the [LogCollector](LogCollector).
 #[async_trait]
 impl<M> Collector<Log> for LogCollector<M>
 where

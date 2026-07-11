@@ -27,7 +27,6 @@ pub struct Deadline<A> {
 }
 
 impl<A> Deadline<A> {
-    /// Creates a new `Deadline` around `executor`.
     pub fn new(executor: Box<dyn Executor<A>>) -> Self {
         Self { executor }
     }

@@ -71,7 +71,6 @@ pub(crate) async fn run<E>(
             Ok(s) => s,
             Err(e) => {
                 error!("collector stream creation failed: {e}");
-                // fall through to the creation-failure policy below.
                 match policy.on_creation_failed() {
                     Decision::Retry { after } => {
                         warn!("retrying stream creation in {after:?}");

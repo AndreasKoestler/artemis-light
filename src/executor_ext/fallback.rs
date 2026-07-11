@@ -12,8 +12,6 @@ pub struct Fallback<A> {
 }
 
 impl<A> Fallback<A> {
-    /// Creates a new `Fallback` trying `primary` first and `fallback` on
-    /// error.
     pub fn new(primary: Box<dyn Executor<A>>, fallback: Box<dyn Executor<A>>) -> Self {
         Self { primary, fallback }
     }

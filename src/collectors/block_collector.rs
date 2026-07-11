@@ -84,7 +84,6 @@ impl<M> BlockCollector<M> {
     }
 }
 
-/// Implementation of the [Collector](Collector) trait for the [BlockCollector](BlockCollector).
 #[async_trait]
 impl<M> Collector<NewBlock> for BlockCollector<M>
 where

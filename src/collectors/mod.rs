@@ -2,20 +2,11 @@
 //! turning them into internal events. For example, a collector might listen to
 //! a stream of new blocks, and turn them into a stream of `NewBlock` events.
 
-/// This collector listens to a stream of new blocks.
 mod block_collector;
-
-/// This collector turns an in-process broadcast channel into events.
 mod channel_collector;
-
-/// This collector listens to a stream of new event logs.
-mod log_collector;
-
-/// This collector listens to a stream of new pending transactions.
-mod mempool_collector;
-
-/// This collector listens to a stream of new events.
 mod event_collector;
+mod log_collector;
+mod mempool_collector;
 
 /// Crate-private subscribe-or-poll downgrade shared by the collectors above.
 mod fallback;

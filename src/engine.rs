@@ -33,27 +33,15 @@ pub struct EngineHandle {
 /// The main engine of Artemis. This struct is responsible for orchestrating the
 /// data flow between collectors, strategies, and executors.
 pub struct Engine<E, A> {
-    /// The set of collectors that the engine will use to collect events.
     collectors: Vec<Box<dyn Collector<E>>>,
-
-    /// The set of strategies that the engine will use to process events.
     strategies: Vec<Box<dyn Strategy<E, A>>>,
-
-    /// The set of executors that the engine will use to execute actions.
     executors: Vec<Box<dyn Executor<A>>>,
-
     /// Passive observers of every event and action crossing the channels.
     observers: Vec<Box<dyn Observer<E, A>>>,
-
-    /// The capacity of the event channel.
     event_channel_capacity: usize,
-
-    /// The capacity of the action channel.
     action_channel_capacity: usize,
-
     /// How collectors reconnect after a lost or failed stream.
     reconnect_config: ReconnectConfig,
-
     _a: PhantomData<A>,
 }
 
@@ -73,36 +61,20 @@ impl<E, A> Default for Engine<E, A> {
 }
 
 impl<E, A> Engine<E, A> {
-    pub fn new(
-        collectors: Vec<Box<dyn Collector<E>>>,
-        strategies: Vec<Box<dyn Strategy<E, A>>>,
-        executors: Vec<Box<dyn Executor<A>>>,
-        event_channel_capacity: usize,
-        action_channel_capacity: usize,
-    ) -> Self {
-        Self {
-            collectors,
-            strategies,
-            executors,
-            observers: vec![],
-            event_channel_capacity,
-            action_channel_capacity,
-            reconnect_config: ReconnectConfig::default(),
-            _a: PhantomData,
-        }
-    }
-
+    #[must_use]
     pub fn with_event_channel_capacity(mut self, capacity: usize) -> Self {
         self.event_channel_capacity = capacity;
         self
     }
 
+    #[must_use]
     pub fn with_action_channel_capacity(mut self, capacity: usize) -> Self {
         self.action_channel_capacity = capacity;
         self
     }
 
     /// Sets the [`ReconnectConfig`] applied to every collector.
+    #[must_use]
     pub fn with_reconnect_config(mut self, config: ReconnectConfig) -> Self {
         self.reconnect_config = config;
         self
@@ -156,11 +128,6 @@ where
     /// Errors are [`anyhow::Error`], matching every other fallible API in the
     /// crate, so `engine.run().await?` composes in an `anyhow` (or plain
     /// `Box<dyn Error>`) `main` without a conversion shim.
-    ///
-    /// The per-role spawning is delegated to the private `spawn_executors`,
-    /// `spawn_observers`, `spawn_collectors`, and `sync_and_spawn_strategies`
-    /// helpers; this method owns only the startup *ordering* and the
-    /// channel/token setup the order depends on.
     pub async fn run(self) -> anyhow::Result<EngineHandle> {
         let (event_sender, _): (Sender<E>, _) = broadcast::channel(self.event_channel_capacity);
         let (action_sender, _): (Sender<A>, _) = broadcast::channel(self.action_channel_capacity);

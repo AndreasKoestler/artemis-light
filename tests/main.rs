@@ -74,7 +74,6 @@ pub async fn spawn_anvil_http_with_signer() -> Result<(impl Provider + Clone, An
     Ok((provider, anvil))
 }
 
-/// Test that block collector correctly emits blocks.
 #[tokio::test]
 async fn test_block_collector_sends_blocks() {
     let (provider, _anvil) = spawn_anvil().await.unwrap();
@@ -117,7 +116,6 @@ async fn test_block_collector_polls_when_subscriptions_are_unavailable() {
     assert_eq!(block.hash, chain_block.header.hash);
 }
 
-/// Test that mempool collector correctly emits blocks.
 #[tokio::test]
 async fn test_mempool_collector_sends_txs() {
     let (provider, _anvil) = spawn_anvil().await.expect("Failed to spawn anvil");
@@ -198,7 +196,7 @@ async fn test_mempool_executor_sends_tx_simple() {
         gas_bid_info: None,
     };
     mempool_executor.execute(action).await.unwrap();
-    //Sleep to seconds so that the tx has time to be mined
+    // Give the transaction time to be mined.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let tx = provider.get_transaction_count(account).await.unwrap();
     assert_eq!(tx, 1);
@@ -364,16 +362,13 @@ async fn test_log_collector_receives_logs() {
     let (provider, _anvil) = spawn_anvil_with_signer().await.unwrap();
     let provider = Arc::new(provider);
 
-    // Deploy the Emitter contract
     let contract = Emitter::deploy(provider.clone()).await.unwrap();
     let contract_addr = *contract.address();
 
-    // Create a log collector filtered to this contract's address
     let filter = Filter::new().address(contract_addr);
     let log_collector = LogCollector::new(provider.clone(), filter);
     let log_stream = log_collector.subscribe().await.unwrap();
 
-    // Call setValue to emit the ValueSet event
     contract
         .setValue(U256::from(42))
         .send()
@@ -383,7 +378,6 @@ async fn test_log_collector_receives_logs() {
         .await
         .unwrap();
 
-    // Verify the log matches
     let log = log_stream.into_future().await.0.unwrap();
     assert_eq!(log.address(), contract_addr);
 }
@@ -427,15 +421,12 @@ async fn test_event_collector_receives_events() {
     let (provider, _anvil) = spawn_anvil_with_signer().await.unwrap();
     let provider = Arc::new(provider);
 
-    // Deploy the Emitter contract
     let contract = Emitter::deploy(provider.clone()).await.unwrap();
 
-    // Create an event collector for ValueSet events
     let event_filter = contract.ValueSet_filter();
     let event_collector = EventCollector::new(event_filter);
     let event_stream = event_collector.subscribe().await.unwrap();
 
-    // Call setValue to emit the ValueSet event
     contract
         .setValue(U256::from(42))
         .send()
@@ -445,7 +436,6 @@ async fn test_event_collector_receives_events() {
         .await
         .unwrap();
 
-    // Verify the decoded event value
     let ev = event_stream.into_future().await.0.unwrap();
     assert_eq!(ev.value, U256::from(42));
 }
@@ -557,21 +547,17 @@ async fn test_complete_flow() {
             let number = event.0;
             let (tx, rx) = oneshot::channel();
 
-            // Spawn a task that listens on the oneshot receiver
             let pending_txs = Arc::clone(&self.pending_txs);
             let successful_tx = Arc::clone(&self.successful_tx);
             let failed_tx = Arc::clone(&self.failed_tx);
 
             tokio::spawn(async move {
-                // Increment pending counter
                 pending_txs.fetch_add(1, Ordering::Relaxed);
 
                 match rx.await {
                     Ok(success) => {
-                        // Decrease pending count
                         pending_txs.fetch_sub(1, Ordering::Relaxed);
 
-                        // Increase appropriate counter based on whether number was even or odd
                         if success {
                             successful_tx.fetch_add(1, Ordering::Relaxed);
                         } else {
@@ -603,14 +589,12 @@ async fn test_complete_flow() {
     #[async_trait]
     impl Executor<NumberAction> for NumberExecutor {
         async fn execute(&mut self, action: NumberAction) -> Result<()> {
-            // Send response: true if number is even, false if odd
             let success = action.number.is_multiple_of(2);
             action.response_tx.send(success).unwrap();
             Ok(())
         }
     }
 
-    // Run the test
     let pending_txs = Arc::new(AtomicUsize::new(0));
     let successful_tx = Arc::new(AtomicUsize::new(0));
     let failed_tx = Arc::new(AtomicUsize::new(0));
@@ -623,7 +607,6 @@ async fn test_complete_flow() {
     );
     let mut executor = NumberExecutor::new();
 
-    // Create collector stream and execute flow
     let mut event_stream = collector.subscribe().await.unwrap();
 
     while let Some(event) = event_stream.next().await {
@@ -636,7 +619,6 @@ async fn test_complete_flow() {
     // Give threads time to process
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Verify results
     // Numbers 1-10: even numbers are 2,4,6,8,10 (5 numbers) -> successful
     // Numbers 1-10: odd numbers are 1,3,5,7,9 (5 numbers) -> failed
     assert_eq!(pending_txs.load(Ordering::Relaxed), 0);

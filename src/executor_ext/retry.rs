@@ -42,7 +42,6 @@ pub struct Retry<A> {
 }
 
 impl<A> Retry<A> {
-    /// Creates a new `Retry` wrapping `executor` with the given `policy`.
     pub fn new(executor: Box<dyn Executor<A>>, policy: RetryPolicy) -> Self {
         Self { executor, policy }
     }
