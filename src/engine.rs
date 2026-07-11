@@ -381,14 +381,16 @@ async fn strategy_task<E, A>(
 mod tests {
     use super::*;
 
-    /// `Engine::new` seeds the pipeline from explicit collector/strategy/
-    /// executor lists and the two channel capacities, starting with no observers
-    /// and the default reconnect config — the `with_*` builders layer on top. The
-    /// run behaviour is covered by the integration suite; this pins the plain
-    /// constructor the examples reach for.
+    /// `Engine::default` plus the `with_*` builders is the construction path the
+    /// examples reach for: it starts empty (no collectors/strategies/executors/
+    /// observers) with default capacities, and each builder layers a capacity on
+    /// top. The run behaviour is covered by the integration suite; this pins the
+    /// builder surface.
     #[test]
-    fn new_seeds_capacities_and_starts_with_no_observers() {
-        let engine = Engine::<u32, u32>::new(vec![], vec![], vec![], 8, 16);
+    fn builders_set_capacities_and_start_with_no_observers() {
+        let engine = Engine::<u32, u32>::default()
+            .with_event_channel_capacity(8)
+            .with_action_channel_capacity(16);
         assert_eq!(engine.event_channel_capacity, 8);
         assert_eq!(engine.action_channel_capacity, 16);
         assert!(engine.observers.is_empty());
