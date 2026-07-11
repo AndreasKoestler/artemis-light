@@ -401,6 +401,63 @@ mod tests {
         assert_eq!(w.buffered_blocks(), vec![3], "block 3 stays open");
     }
 
+    /// Backfill-tail seeds stay pending (never flushed by the seed phase) until
+    /// buried `depth` deep, and a second event at a seeded key folds into the
+    /// same buffered group rather than opening a new one.
+    #[tokio::test]
+    async fn seeded_groups_accumulate_and_stay_pending_until_buried() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        assert!(w.record_seeded(BlockPosition(1), &ping(1)).await);
+        assert!(w.record_seeded(BlockPosition(1), &ping(1)).await); // occupied: folds in
+        assert!(w.record_seeded(BlockPosition(2), &ping(2)).await);
+
+        // At depth 2, head 2 buries nothing (block 1 needs head >= 3).
+        assert_eq!(store.written(), Vec::<u64>::new());
+        assert_eq!(w.buffered_blocks(), vec![1, 2]);
+    }
+
+    /// An unencodable event in the seed phase can't be trusted to sit in a
+    /// half-built buffer, so — as in the live path — the window drops its buffer.
+    #[tokio::test]
+    async fn seeding_an_unencodable_event_drops_the_buffer() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, BadPing>(&store, 2);
+
+        assert!(w.record_seeded(BlockPosition(1), &bad_ping(1)).await);
+        assert!(w.record_seeded(BlockPosition(2), &bad_ping(0)).await); // unencodable
+        assert!(w.buffered_blocks().is_empty(), "the buffer is dropped");
+    }
+
+    /// The seed phase is one snapshot, so a backwards sort key is an unordered
+    /// source, not a reorg re-emission (a `Halt` position): the window halts and
+    /// clears rather than silently trusting the buffered groups.
+    #[tokio::test]
+    async fn seeding_a_backwards_position_halts_as_an_unordered_source() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        assert!(w.record_seeded(BlockPosition(5), &ping(5)).await);
+        assert!(w.record_seeded(BlockPosition(4), &ping(4)).await); // 4 < head 5 -> halt
+        assert!(w.buffered_blocks().is_empty(), "halt clears the buffer");
+    }
+
+    /// `halt` is the writer pipeline's signal that the settled prefix below the
+    /// window failed: it marks the window unhealthy and drops the buffer so
+    /// nothing above the gap can advance the stored watermark.
+    #[tokio::test]
+    async fn halt_marks_unhealthy_and_clears_the_buffer() {
+        let store = RecordingStore::default();
+        let mut w = window::<_, Ping>(&store, 2);
+
+        w.record(BlockPosition(1), &ping(1)).await;
+        assert_eq!(w.buffered_blocks(), vec![1]);
+
+        w.halt(format_args!("settled prefix below the window halted"));
+        assert!(w.buffered_blocks().is_empty());
+    }
+
     /// A shallow reorg — a block re-emitted while still inside the unflushed
     /// window — must be corrected in the buffer: the old fork's higher blocks
     /// are dropped, `head` rewinds, and only the canonical row is ever written.

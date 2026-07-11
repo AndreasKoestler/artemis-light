@@ -240,4 +240,17 @@ mod tests {
             "a postgres URL must error when the postgres feature is off"
         );
     }
+
+    /// The paging and pool-size setters mutate their fields and hand the
+    /// builder back, so a full configuration is one chained expression.
+    #[test]
+    fn builder_setters_apply() {
+        let layer = ServingLayer::new("sqlite::memory:", any_addr())
+            .with_max_connections(8)
+            .with_default_limit(50)
+            .with_max_limit(500);
+        assert_eq!(layer.max_connections, 8);
+        assert_eq!(layer.default_limit, 50);
+        assert_eq!(layer.max_limit, 500);
+    }
 }

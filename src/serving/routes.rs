@@ -185,3 +185,59 @@ pub async fn get_status_handler(State(state): State<AppState>) -> impl IntoRespo
         Err(e) => database_error("watermark read", e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::rows::Bounds;
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use serde_json::{Map, Value};
+
+    /// A backend whose every operation fails — for driving the handlers'
+    /// error arms without a live database.
+    struct FailingBackend;
+
+    #[async_trait]
+    impl ServingBackend for FailingBackend {
+        async fn health(&self) -> anyhow::Result<()> {
+            anyhow::bail!("database unreachable")
+        }
+        async fn list_tables(&self) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("database unreachable")
+        }
+        async fn table_exists(&self, _table: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("database unreachable")
+        }
+        async fn table_columns(&self, _table: &str) -> anyhow::Result<Vec<(String, String)>> {
+            anyhow::bail!("database unreachable")
+        }
+        async fn query_rows(
+            &self,
+            _table: &str,
+            _bounds: &Bounds,
+        ) -> anyhow::Result<Vec<Map<String, Value>>> {
+            anyhow::bail!("database unreachable")
+        }
+        async fn watermarks(&self) -> anyhow::Result<Vec<(String, i64)>> {
+            anyhow::bail!("database unreachable")
+        }
+    }
+
+    /// A backend failure renders the opaque 500 — the client never sees the
+    /// underlying error text (that goes only to the server logs).
+    #[test]
+    fn database_error_renders_an_opaque_500() {
+        let response = database_error("table listing", anyhow::anyhow!("boom"));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// When the database is unreachable, `/health` reports 503 rather than
+    /// claiming liveness.
+    #[tokio::test]
+    async fn health_reports_unavailable_when_the_backend_is_down() {
+        let state = AppState::new(Arc::new(FailingBackend), 100, 1000);
+        let response = get_health_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

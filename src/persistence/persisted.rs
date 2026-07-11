@@ -318,13 +318,7 @@ where
         // resolves neither and errors [subscribe_no_table_error]. Shared (Arc)
         // between the backfill and live writers, so a schema frozen during
         // backfill is reused by the live tail.
-        let record = Arc::new(match (self.schema.clone(), self.table.clone()) {
-            (Some(schema), _) => Record::<E>::declared(schema)?,
-            (None, Some(table)) => Record::<E>::inferred(table),
-            (None, None) => anyhow::bail!(
-                "no table name for persisted events: use with_persistence (SolEvent types), with_persistence_named, with_table, or try_with_schema"
-            ),
-        });
+        let record = resolve_record::<E>(self.schema.clone(), self.table.clone())?;
 
         // In bounded mode (to_block set), skip the live subscription entirely —
         // the stream ends when backfill-to-to_block is exhausted.
@@ -355,30 +349,7 @@ where
             (Some(cap), Some(l)) if l.sort_key() > cap => Some(C::Pos::from_sort_key(cap)),
             _ => last.clone(),
         };
-        let first_subscribe = !self.replayed.load(Ordering::SeqCst);
-        let replay: CollectorStream<'_, E> = if first_subscribe {
-            let inner = replay_stored(&self.store, &record, replay_up_to).await?;
-            // Flip the replay-once flag when the archive is first *consumed*,
-            // not merely when `subscribe` succeeds. The engine retries
-            // `subscribe` on error, but it also discards the returned stream
-            // when a *sibling* fails the composite subscribe — e.g. this
-            // `Persisted` chained or merged with another collector, where the
-            // other source's subscribe errors after this one already succeeded.
-            // In that case the stream is dropped without ever being polled, so
-            // flipping the flag eagerly here would make the retry skip the DB
-            // replay while backfill covers only positions after `last` —
-            // stranding the stored history. A zero-item stream that sets the
-            // flag on its first poll, chained ahead of the real replay, ties the
-            // flip to actual consumption.
-            let replayed = &self.replayed;
-            let mark = futures::stream::poll_fn(move |_| {
-                replayed.store(true, Ordering::SeqCst);
-                std::task::Poll::Ready(None::<E>)
-            });
-            Box::pin(mark.chain(inner)) as CollectorStream<'_, E>
-        } else {
-            Box::pin(futures::stream::empty()) as CollectorStream<'_, E>
-        };
+        let replay = replay_segment(&self.store, &self.replayed, &record, replay_up_to).await?;
 
         // 2. Backfill the RPC gap `[resume ..= effective_tip]`, never reaching
         //    below the configured start block. `resume` is the stored position's
@@ -396,18 +367,14 @@ where
             .map(|l| l.resume_key())
             .unwrap_or(0)
             .max(self.start_block);
-        let backfill_source: CollectorStream<'_, (C::Pos, E)> = if backfill_from > effective_tip {
-            Box::pin(futures::stream::empty())
-        } else {
-            chunked_query(
-                &self.collector,
-                backfill_from,
-                effective_tip,
-                self.backfill_chunk_size,
-                poison.clone(),
-            )
-            .await?
-        };
+        let backfill_source = backfill_segment(
+            &self.collector,
+            backfill_from,
+            effective_tip,
+            self.backfill_chunk_size,
+            poison.clone(),
+        )
+        .await?;
 
         // 3. Live tail. Skipped entirely in bounded mode (to_block set) — the
         //    stream ends naturally once backfill is exhausted. It ends when
@@ -447,6 +414,84 @@ where
 
         Ok(Segments { replay, synced }.into_stream())
     }
+}
+
+/// Resolve the [`Record`] — the table name and the event ↔ row mapping — from
+/// the configured schema/table. A schema override wins; else the captured table
+/// name is inferred; a bare `Persisted::new` over a non-SolEvent type resolves
+/// neither and errors [subscribe_no_table_error]. Wrapped in an `Arc` so a
+/// schema frozen during backfill is shared with the live writer.
+fn resolve_record<E>(schema: Option<TableSchema>, table: Option<String>) -> Result<Arc<Record<E>>>
+where
+    E: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    Ok(Arc::new(match (schema, table) {
+        (Some(schema), _) => Record::<E>::declared(schema)?,
+        (None, Some(table)) => Record::<E>::inferred(table),
+        (None, None) => anyhow::bail!(
+            "no table name for persisted events: use with_persistence (SolEvent types), with_persistence_named, with_table, or try_with_schema"
+        ),
+    }))
+}
+
+/// The replay segment: stored history, reconstructed from the database, but only
+/// on the first subscribe. On a reconnect the engine subscribes again;
+/// re-emitting the whole archive would re-deliver every historical event to
+/// strategies, so subsequent subscribes skip replay and let the backfill segment
+/// cover only the gap since the last stored position.
+///
+/// The replay-once flag flips when the archive is first *consumed*, not merely
+/// when `subscribe` succeeds. The engine retries `subscribe` on error, but it
+/// also discards the returned stream when a *sibling* fails the composite
+/// subscribe — e.g. this `Persisted` chained or merged with another collector,
+/// where the other source's subscribe errors after this one already succeeded.
+/// In that case the stream is dropped without ever being polled, so flipping the
+/// flag eagerly would make the retry skip the DB replay while backfill covers
+/// only positions after `last` — stranding the stored history. A zero-item
+/// stream that sets the flag on its first poll, chained ahead of the real
+/// replay, ties the flip to actual consumption.
+async fn replay_segment<'s, E, S, P>(
+    store: &'s S,
+    replayed: &'s AtomicBool,
+    record: &Record<E>,
+    replay_up_to: Option<P>,
+) -> Result<CollectorStream<'s, E>>
+where
+    E: DeserializeOwned + Send + 's,
+    S: Store<P> + 's,
+    P: Position,
+{
+    if replayed.load(Ordering::SeqCst) {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    let inner = replay_stored(store, record, replay_up_to).await?;
+    let mark = futures::stream::poll_fn(move |_| {
+        replayed.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None::<E>)
+    });
+    Ok(Box::pin(mark.chain(inner)))
+}
+
+/// The backfill segment: the RPC gap `[from ..= to]` (sort keys), sliced into
+/// bounded chunks queried one at a time. When the stored height has already
+/// reached the tip (a restart within one interval, or a node whose tip lags the
+/// store) there is no gap, and querying the inverted range would be rejected —
+/// return an empty stream instead.
+async fn backfill_segment<'s, C, E>(
+    collector: &'s C,
+    from: u64,
+    to: u64,
+    chunk: u64,
+    poison: CancellationToken,
+) -> Result<CollectorStream<'s, (C::Pos, E)>>
+where
+    C: PersistableCollector<E> + ?Sized,
+    E: Send + 's,
+{
+    if from > to {
+        return Ok(Box::pin(futures::stream::empty()));
+    }
+    chunked_query(collector, from, to, chunk, poison).await
 }
 
 /// Replay stored events up to and including `last`, reconstructed from each

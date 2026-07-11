@@ -673,5 +673,33 @@ mod test {
                     .await
             );
         }
+
+        /// The tuning setters mutate their fields and hand the executor back,
+        /// so a full configuration is one chained expression.
+        #[test]
+        fn builder_setters_apply() {
+            let asserter = Asserter::new();
+            let executor = mocked_executor(&asserter)
+                .with_rpc_timeout(Duration::from_secs(2))
+                .with_priority_fee_bump(150);
+            assert_eq!(executor.rpc_timeout, Duration::from_secs(2));
+            assert_eq!(executor.priority_fee_bump_percent, 150);
+        }
+
+        /// Replacement pins the nonce off `tx.from`; without it there is nothing
+        /// to pin, so the submit fails before any RPC is spent.
+        #[tokio::test]
+        async fn send_with_replacement_requires_from_to_pin_the_nonce() {
+            let asserter = Asserter::new();
+            let executor = mocked_executor(&asserter);
+            let err = executor
+                .send_with_replacement(TransactionRequest::default(), fees(200, 20), policy(1, 125))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("tx.from"),
+                "expected a `tx.from` diagnostic, got: {err}"
+            );
+        }
     }
 }

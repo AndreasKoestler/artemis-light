@@ -10,6 +10,7 @@ use alloy::{
 use artemis_light::{
     collectors::{BlockCollector, EventCollector, LogCollector, MempoolCollector},
     executors::{GasBidInfo, MempoolExecutor, SubmitTxToMempool},
+    persistence::{BlockPosition, PersistableCollector},
     types::{ActionStream, Collector, Executor},
 };
 
@@ -358,6 +359,48 @@ async fn replacement_speeds_up_a_stuck_transaction() {
     );
 }
 
+/// Watch-only replacement (`max_replacements = 0`): the first confirmation
+/// timeout is the give-up signal. With auto-mining off the submission never
+/// mines, so the give-up sweep finds no receipt and `execute` surfaces the
+/// unconfirmed error rather than hanging or falsely reporting success.
+#[tokio::test]
+async fn replacement_gives_up_when_the_submission_never_mines() {
+    use alloy::providers::ext::AnvilApi;
+    use artemis_light::executors::{EscalationPercent, ReplacementPolicy};
+    use std::time::Duration;
+
+    let (provider, anvil) = spawn_anvil_with_signer().await.unwrap();
+    let provider = Arc::new(provider);
+    let from = anvil.addresses()[0];
+    let to = anvil.addresses()[1];
+
+    // Never mine: the submission stays pending past the confirmation timeout.
+    provider.anvil_set_auto_mine(false).await.unwrap();
+
+    let mut executor = MempoolExecutor::new(provider.clone()).with_replacement(ReplacementPolicy {
+        confirmation_timeout: Duration::from_millis(200),
+        max_replacements: 0,
+        escalation_percent: EscalationPercent::new(125).unwrap(),
+    });
+
+    let tx = TransactionRequest::default()
+        .with_from(from)
+        .with_to(to)
+        .with_value(U256::from(1u64));
+
+    let err = executor
+        .execute(SubmitTxToMempool {
+            tx,
+            gas_bid_info: None,
+        })
+        .await
+        .expect_err("an unmined submission with no replacements budgeted must fail");
+    assert!(
+        err.to_string().contains("unconfirmed"),
+        "expected an 'unconfirmed' give-up error, got: {err}"
+    );
+}
+
 /// Test that LogCollector receives logs emitted by a contract.
 #[tokio::test]
 async fn test_log_collector_receives_logs() {
@@ -448,6 +491,19 @@ async fn test_event_collector_receives_events() {
     // Verify the decoded event value
     let ev = event_stream.into_future().await.0.unwrap();
     assert_eq!(ev.value, U256::from(42));
+
+    // The backfill path reads the same event back through `query_range` over
+    // the mined block span, exercising the range query and its log-indexing
+    // closures (which the live subscription above does not).
+    let tip = provider.get_block_number().await.unwrap();
+    let ranged: Vec<_> = event_collector
+        .query_range(BlockPosition(0), BlockPosition(tip))
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert_eq!(ranged.len(), 1, "the one emitted event is found in range");
+    assert_eq!(ranged[0].1.value, U256::from(42));
 }
 
 /// Over plain HTTP there is no pubsub, so the event subscription fails and

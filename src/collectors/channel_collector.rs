@@ -62,6 +62,28 @@ mod tests {
         assert_eq!(stream.next().await, Some(2));
     }
 
+    /// A receiver that falls behind the channel's capacity yields a `Lagged`
+    /// error; the collector swallows it (logging a warning) and keeps
+    /// delivering the retained tail rather than surfacing the error or ending
+    /// the stream.
+    #[tokio::test]
+    async fn a_lagged_receiver_skips_missed_items_without_erroring() {
+        let (tx, _rx) = broadcast::channel(2);
+        let collector = ChannelCollector::new(tx.clone());
+        let mut stream = collector.subscribe().await.unwrap();
+
+        // Overflow the capacity before the stream is polled: the oldest sends
+        // are dropped and this receiver lags.
+        for i in 0..5u32 {
+            tx.send(i).unwrap();
+        }
+
+        // The lag surfaces as a filtered-out `None`, so the next delivered item
+        // is the retained tail — the stream neither errors nor terminates.
+        let next = stream.next().await;
+        assert!(next.is_some(), "the stream survives a lag and yields the tail");
+    }
+
     #[tokio::test]
     async fn a_second_subscribe_works_where_a_receiver_could_not() {
         let (tx, _rx) = broadcast::channel(8);

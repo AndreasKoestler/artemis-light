@@ -293,68 +293,99 @@ where
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(&query::create_progress_table(&self.dialect))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| self.classify_ddl(e))?;
-        sqlx::query(&query::create_event_table(schema, &self.dialect))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| self.classify_ddl(e))?;
-
-        // Lazily migrate a pre-change two-column archive to the encoded-position
-        // schema, once per store instance and inside this same write transaction
-        // so the schema change and the rows it enables commit or roll back
-        // together. `CREATE TABLE IF NOT EXISTS` above is a no-op
-        // for an existing two-column table, so the probe below still sees the old
-        // shape. The probe runs under a SAVEPOINT: its undefined-column error is,
-        // on PostgreSQL, an aborted-transaction signal that would poison the outer
-        // write transaction, so rolling back to the savepoint clears it before the
-        // ADD COLUMN + CAST backfill run in the same transaction.
-        if !self.migration_checked.load(Ordering::Relaxed) {
-            sqlx::query(query::MIGRATION_SAVEPOINT_BEGIN)
-                .execute(&mut *tx)
-                .await?;
-            match sqlx::query(&query::probe_position_column())
-                .fetch_optional(&mut *tx)
-                .await
-            {
-                // The `position` column is present: nothing to migrate.
-                Ok(_) => {
-                    sqlx::query(query::MIGRATION_SAVEPOINT_RELEASE)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                // A pre-migration archive: undo the poisoned probe, then add the
-                // column and convert every integer last_block into its encoded
-                // BlockPosition via CAST(last_block AS TEXT).
-                Err(e) if self.dialect.is_undefined_column(&e) => {
-                    sqlx::query(query::MIGRATION_SAVEPOINT_ROLLBACK)
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query(query::MIGRATION_SAVEPOINT_RELEASE)
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query(&query::add_position_column())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| self.classify_ddl(e))?;
-                    sqlx::query(&query::backfill_position_from_last_block())
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        self.create_tables(&mut tx, schema).await?;
+        self.migrate_if_needed(&mut tx).await?;
 
         // The sort key is the totally-ordered scalar bound into the implicit
         // `block_number` column — byte-identical to today's block number for
         // `BlockPosition`.
         let sort_key = SqlValue::Integer(sort_key_to_i64(position.sort_key())?);
-        // Rows go in as multi-row inserts — one round-trip per chunk instead of
-        // per row — chunked so the bind parameters stay under the shared cap.
-        // The full-chunk statement is built once and reused; only a trailing
-        // partial chunk needs its own.
+        self.insert_rows(&mut tx, schema, &sort_key, rows).await?;
+        self.advance_watermark(&mut tx, schema, position).await?;
+
+        tx.commit().await?;
+        // Record the migration check only after a successful commit: a rolled-back
+        // write undoes any ADD COLUMN, so the next write must re-probe.
+        self.migration_checked.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Create the progress and event tables if absent. A DDL failure the dialect
+    /// classifies as a benign duplicate-object race is wrapped in [`DdlRace`] so
+    /// `write` can retry it once.
+    async fn create_tables(&self, conn: &mut DB::Connection, schema: &TableSchema) -> Result<()> {
+        sqlx::query(&query::create_progress_table(&self.dialect))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| self.classify_ddl(e))?;
+        sqlx::query(&query::create_event_table(schema, &self.dialect))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| self.classify_ddl(e))?;
+        Ok(())
+    }
+
+    /// Lazily migrate a pre-change two-column archive to the encoded-position
+    /// schema, once per store instance and inside the caller's write transaction
+    /// so the schema change and the rows it enables commit or roll back together.
+    /// `CREATE TABLE IF NOT EXISTS` (run by [`create_tables`](Self::create_tables))
+    /// is a no-op for an existing two-column table, so the probe below still sees
+    /// the old shape. The probe runs under a SAVEPOINT: its undefined-column error
+    /// is, on PostgreSQL, an aborted-transaction signal that would poison the
+    /// outer write transaction, so rolling back to the savepoint clears it before
+    /// the ADD COLUMN + CAST backfill run in the same transaction.
+    async fn migrate_if_needed(&self, conn: &mut DB::Connection) -> Result<()> {
+        if self.migration_checked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        sqlx::query(query::MIGRATION_SAVEPOINT_BEGIN)
+            .execute(&mut *conn)
+            .await?;
+        match sqlx::query(&query::probe_position_column())
+            .fetch_optional(&mut *conn)
+            .await
+        {
+            // The `position` column is present: nothing to migrate.
+            Ok(_) => {
+                sqlx::query(query::MIGRATION_SAVEPOINT_RELEASE)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            // A pre-migration archive: undo the poisoned probe, then add the
+            // column and convert every integer last_block into its encoded
+            // BlockPosition via CAST(last_block AS TEXT).
+            Err(e) if self.dialect.is_undefined_column(&e) => {
+                sqlx::query(query::MIGRATION_SAVEPOINT_ROLLBACK)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(query::MIGRATION_SAVEPOINT_RELEASE)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(&query::add_position_column())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| self.classify_ddl(e))?;
+                sqlx::query(&query::backfill_position_from_last_block())
+                    .execute(&mut *conn)
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// Insert `rows` as multi-row inserts — one round-trip per chunk instead of
+    /// per row — chunked so the bind parameters stay under the shared cap. The
+    /// full-chunk statement is built once and reused; only a trailing partial
+    /// chunk needs its own. Each row binds `sort_key` (the implicit
+    /// `block_number` column) ahead of its own cells.
+    async fn insert_rows(
+        &self,
+        conn: &mut DB::Connection,
+        schema: &TableSchema,
+        sort_key: &SqlValue,
+        rows: &[Row],
+    ) -> Result<()> {
         let params_per_row = 1 + schema.columns.len();
         let chunk_rows = rows_per_chunk(params_per_row);
         let mut full_chunk_insert: Option<String> = None;
@@ -373,23 +404,33 @@ where
             let mut args = <DB::Arguments<'_>>::default();
             for row in chunk {
                 query::check_row_shape(schema, row)?;
-                bind_value::<DB>(&mut args, &sort_key)?;
+                bind_value::<DB>(&mut args, sort_key)?;
                 for value in &row.0 {
                     bind_value::<DB>(&mut args, value)?;
                 }
             }
-            sqlx::query_with(insert, args).execute(&mut *tx).await?;
+            sqlx::query_with(insert, args).execute(&mut *conn).await?;
         }
+        Ok(())
+    }
 
-        // Read the previous watermark under the row lock, then advance it in Rust
-        // via `Position::advance` and upsert the result — all in this one
-        // transaction.
+    /// Read the previous watermark under the row lock, advance it in Rust via
+    /// [`Position::advance`], and upsert the result: the retained `last_block`
+    /// sort key (the serving layer keeps reading it) and the authoritative
+    /// encoded `position`. For `BlockPosition` the encoded text is the same
+    /// decimal as `last_block`.
+    async fn advance_watermark<P: Position>(
+        &self,
+        conn: &mut DB::Connection,
+        schema: &TableSchema,
+        position: P,
+    ) -> Result<()> {
         let select = query::locked_progress_select(&self.dialect);
         let table_cell = SqlValue::Text(schema.table.clone());
         let mut args = <DB::Arguments<'_>>::default();
         bind_value::<DB>(&mut args, &table_cell)?;
         let prev_row = sqlx::query_with(&select, args)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
         // Reconstruct the previous position from the authoritative encoded
         // `position` column, guaranteed present by the migration above.
@@ -413,9 +454,7 @@ where
             );
         }
 
-        // Upsert both columns: the retained `last_block` sort key (the serving
-        // layer keeps reading it) and the authoritative encoded `position`. For
-        // `BlockPosition` the encoded text is the same decimal as `last_block`.
+        // Upsert both columns.
         let upsert = query::watermark_upsert(&self.dialect);
         let next_key_cell = SqlValue::Integer(sort_key_to_i64(next.sort_key())?);
         let next_position_cell = SqlValue::Text(next.encode());
@@ -423,12 +462,7 @@ where
         bind_value::<DB>(&mut args, &table_cell)?;
         bind_value::<DB>(&mut args, &next_key_cell)?;
         bind_value::<DB>(&mut args, &next_position_cell)?;
-        sqlx::query_with(&upsert, args).execute(&mut *tx).await?;
-
-        tx.commit().await?;
-        // Record the migration check only after a successful commit: a rolled-back
-        // write undoes any ADD COLUMN, so the next write must re-probe.
-        self.migration_checked.store(true, Ordering::Relaxed);
+        sqlx::query_with(&upsert, args).execute(&mut *conn).await?;
         Ok(())
     }
 
@@ -474,6 +508,19 @@ mod tests {
     use super::*;
     use crate::persistence::dialect::SqliteDialect;
     use crate::persistence::position::BlockPosition;
+
+    /// The [`DdlRace`] marker renders a stable, source-preserving message: the
+    /// retry path matches on the type, but the logs still see the underlying
+    /// backend error through `source`.
+    #[test]
+    fn ddl_race_displays_a_stable_message_and_exposes_its_source() {
+        let race = DdlRace(sqlx::Error::PoolClosed);
+        assert_eq!(
+            race.to_string(),
+            "lost a concurrent DDL race (object already exists)"
+        );
+        assert!(std::error::Error::source(&race).is_some());
+    }
 
     /// A SQLite-backed dialect whose first `column_type` is deliberately
     /// malformed — so the first write attempt fails at the DDL, like a writer

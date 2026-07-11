@@ -127,6 +127,21 @@ mod test {
         assert!(actions.is_empty());
     }
 
+    /// The probe's own `process_event` is an inert no-op — it exists so the
+    /// probe is a complete `Strategy` for the sync-delegation tests; asserting
+    /// it yields nothing pins that it never fabricates actions.
+    #[tokio::test]
+    async fn sync_probe_process_event_yields_no_actions() {
+        let (mut probe, _synced) = SyncProbe::new();
+        let actions = probe
+            .process_event(1)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(actions.is_empty());
+    }
+
     #[tokio::test]
     async fn filter_map_event_delegates_sync_state_to_the_inner_strategy() {
         let (probe, synced) = SyncProbe::new();
