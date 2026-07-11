@@ -1,7 +1,7 @@
 //! Integration tests for the opt-in serving layer.
 //!
 //! Compiled only under the `serving` feature so `cargo test` (default features)
-//! is unaffected (serving-layer.OPTIN.2). Handlers are exercised in-process via
+//! is unaffected. Handlers are exercised in-process via
 //! `Router::oneshot` against a temp-file SQLite database seeded through the real
 //! `SqliteStore` writer.
 #![cfg(feature = "serving")]
@@ -9,7 +9,9 @@
 use std::net::SocketAddr;
 
 use artemis_light::ServingLayer;
-use artemis_light::persistence::{Row, SqlType, SqlValue, SqliteStore, Store, TableSchema};
+use artemis_light::persistence::{
+    BlockPosition, Row, SqlType, SqlValue, SqliteStore, Store, TableSchema,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
@@ -48,9 +50,9 @@ async fn seed_two_tables(path: &str) {
         .col("value", SqlType::Integer)
         .col("_payload", SqlType::Text);
     store
-        .write_block(
+        .write(
             &value_set,
-            100,
+            BlockPosition(100),
             vec![Row(vec![
                 SqlValue::Integer(7),
                 SqlValue::Text("{\"value\":\"7\"}".to_string()),
@@ -62,9 +64,9 @@ async fn seed_two_tables(path: &str) {
         .col("amount", SqlType::Integer)
         .col("_payload", SqlType::Text);
     store
-        .write_block(
+        .write(
             &transfer,
-            50,
+            BlockPosition(50),
             vec![Row(vec![
                 SqlValue::Integer(3),
                 SqlValue::Text("{\"amount\":\"3\"}".to_string()),
@@ -85,9 +87,9 @@ async fn seed_value_set_blocks(path: &str, rows: &[(u64, i64)]) {
         .col("_payload", SqlType::Text);
     for (block, value) in rows {
         store
-            .write_block(
+            .write(
                 &schema,
-                *block,
+                BlockPosition(*block),
                 vec![Row(vec![
                     SqlValue::Integer(*value),
                     SqlValue::Text(format!("{{\"value\":\"{value}\"}}")),
@@ -279,6 +281,46 @@ async fn rows_paging_and_block_range() {
 }
 
 #[tokio::test]
+async fn rows_extreme_u64_params_clamp_instead_of_wrapping() {
+    // Validated u64 params above i64::MAX must clamp, not wrap negative when
+    // bound as i64: u64::MAX as from_block means "return nothing", as to_block
+    // means "everything up to the bound", and a huge offset is past the end.
+    let dir = tempfile::tempdir().unwrap();
+    let url = dir.path().join("events.db").to_str().unwrap().to_string();
+    seed_value_set_blocks(&url, &[(100, 7), (101, 8)]).await;
+    let router = router_for(&url).await;
+
+    // from_block = u64::MAX: no block can match → empty page, not everything.
+    let resp = get(
+        &router,
+        "/tables/value_set/rows?from_block=18446744073709551615",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["rows"], serde_json::json!([]));
+
+    // to_block = u64::MAX: everything up to the bound, not an empty page.
+    let resp = get(
+        &router,
+        "/tables/value_set/rows?to_block=18446744073709551615",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+    // offset = u64::MAX: far past the end → empty page, not page zero (and not
+    // a backend-dependent 500).
+    let resp = get(
+        &router,
+        "/tables/value_set/rows?offset=18446744073709551615",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["rows"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn rows_invalid_limit_is_400_with_no_rows() {
     let dir = tempfile::tempdir().unwrap();
     let url = dir.path().join("events.db").to_str().unwrap().to_string();
@@ -428,9 +470,9 @@ async fn reads_stay_consistent_during_concurrent_writes() {
             .col("_payload", SqlType::Text);
         for b in 2..=50u64 {
             store
-                .write_block(
+                .write(
                     &schema,
-                    b,
+                    BlockPosition(b),
                     vec![Row(vec![
                         SqlValue::Integer(b as i64),
                         SqlValue::Text(format!("{{\"value\":\"{b}\"}}")),
@@ -493,11 +535,14 @@ async fn reads_do_not_mutate_the_database() {
     } // read pool dropped
 
     // Re-open with the writer: the watermark is exactly what was seeded — the
-    // serving layer advanced nothing (serving-layer.READONLY.1).
+    // serving layer advanced nothing.
     let store = SqliteStore::connect(&format!("sqlite:{url}"))
         .await
         .unwrap();
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(101));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(101))
+    );
 }
 
 #[tokio::test]

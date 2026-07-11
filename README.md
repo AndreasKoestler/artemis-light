@@ -61,7 +61,7 @@ The **Engine** fans-out every event to every strategy via a `tokio::sync::broadc
 | **Strategy** | `Strategy<E, A>` | User-defined: receives events, produces action streams |
 | **Executor** | `MempoolExecutor` | Submits EIP-1559-priced transactions to the public mempool; optionally watches for confirmation and replaces a stuck transaction at an escalated fee |
 | **Observer** | `Observer<E, A>` | Passive consumer of every event and action crossing the channels |
-| **Persistence** | `Persisted<C, S>` | Wraps a block-aware collector to record events to a SQL `Store` and replay them on restart |
+| **Persistence** | `Persisted<C, S>` | Wraps a position-aware collector to record events to a SQL `Store` and replay them on restart |
 
 `MempoolExecutor` prices transactions with EIP-1559 fields from the provider's
 fee estimate (with a configurable `with_priority_fee_bump`). By default it is
@@ -221,6 +221,136 @@ runnable demo (record live events, then recover them on a simulated restart):
 cargo run --example persistence_example
 ```
 
+### Beyond block numbers: the `Position` trait
+
+The persistence layer is generic over a `Position` — the ordering key a source
+resumes and dedupes on — not just a block number. The built-in
+[`BlockPosition`](src/persistence/position.rs) is the default, so every EVM call
+site above stays a one-liner. To persist a **non-block** source (a queue offset,
+a `(time, seen-set)` frontier) implement `Position` for your key and you inherit
+the same resume / backfill / gap-free machinery.
+
+The shipped reference [`TimeFrontier`](src/persistence/position.rs) is a worked
+`(time_ms, hash-set)` frontier: several events can share one millisecond, so a
+bare scalar cannot express "everything up to instant *t*, but only these
+identities *at* *t*". Its re-observation policy is *dedupe* (not halt), so an
+overlapping backfill re-reads the boundary instant and the writer stores each
+re-observed identity exactly once. See
+[`examples/hypercore_ledger_example.rs`](examples/hypercore_ledger_example.rs)
+for a self-contained, verified run of a HyperCore-shaped ledger feed:
+
+```sh
+cargo run --example hypercore_ledger_example
+```
+
+> **Scope — this does not solve completeness or finality.** A late event
+> arriving *below* a frontier's boundary instant is deliberately **skipped**:
+> the frontier resumes and dedupes, it does not backfill history it has already
+> advanced past. Completeness, finality, and reconciliation of late or reorged
+> data remain the **consumer's responsibility**.
+
+## Migrating to position-generic persistence
+
+`0.2.0` generalises durable persistence from a hardwired `u64` block number to
+the generic `Position` trait. **The breaking surface is confined to the `Store`
+and `PersistableCollector` traits** (plus the internal `Dialect` seam). If you
+only use the built-ins — `EventCollector`, `SqliteStore`, `PostgresStore`,
+`with_persistence` / `persisted!` over a `SolEvent` — **your code is
+source-compatible and needs no changes**: `Store` and `PersistableCollector`
+default their position type to `BlockPosition`, so `dyn Store` and `S: Store`
+still mean `Store<BlockPosition>`, and the concrete store aliases are unchanged.
+
+You only migrate if you wrote a **custom `Store`, `PersistableCollector`, or
+`Dialect` impl**.
+
+### `Store`: method renames and signatures
+
+| 0.1 (block-hardwired) | 0.2 (position-generic) |
+|---|---|
+| `write_block(&self, schema, block: u64, rows)` | `write(&self, schema, position: P, rows)` |
+| `last_block(&self, table) -> Option<u64>` | `stored_position(&self, table) -> Option<P>` |
+| `replay(&self, schema, to: u64)` | `replay(&self, schema, up_to: P)` |
+
+The monotonic-advance rule moved **out of SQL and into `Position::advance`**,
+applied inside the single write transaction. Where 0.1 leaned on a SQL
+`GREATEST(...)` upsert (via `Dialect::monotonic_watermark_set`), 0.2 reads the
+previous position under the row lock, folds it with `P::advance(prev, next)`, and
+writes the result — so the watermark rule is expressed once, for any position
+type, and stays atomic with the row write.
+
+### `PersistableCollector`: an associated position type
+
+```diff
+ #[async_trait]
+ impl PersistableCollector<MyEvent> for MyCollector {
+-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, MyEvent)>> { .. }
+-    async fn query_range(&self, from: u64, to: u64) -> Result<CollectorStream<'_, (u64, MyEvent)>> { .. }
+-    async fn tip(&self) -> Result<u64> { .. }
++    type Pos = BlockPosition;  // or your custom Position
++    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (Self::Pos, MyEvent)>> { .. }
++    async fn query_range(&self, from: Self::Pos, to: Self::Pos) -> Result<CollectorStream<'_, (Self::Pos, MyEvent)>> { .. }
++    async fn tip(&self) -> Result<Self::Pos> { .. }
+ }
+```
+
+`tip()` now returns the current frontier / finality boundary as a `Pos`, and the
+`(Pos, E)` pairs replace the old `(u64, E)`. For a block source, set
+`type Pos = BlockPosition` and wrap/unwrap `u64` at the boundary
+(`BlockPosition(n)` / `position.sort_key()`).
+
+### Worked port of a custom `Store`
+
+```rust
+use anyhow::Result;
+use async_trait::async_trait;
+use artemis_light::persistence::{BlockPosition, Position, Row, Store, TableSchema};
+
+#[async_trait]
+impl Store for MyStore {           // `Store` == `Store<BlockPosition>` by default
+    async fn write(
+        &self,
+        schema: &TableSchema,
+        position: BlockPosition,    // was `block: u64`
+        rows: Vec<Row>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // ... INSERT `rows` into `schema.table` ...
+
+        // Advance the watermark IN RUST, inside this same transaction — no SQL
+        // GREATEST. Read the previous position under the row lock, fold it, and
+        // persist both the sort key and the encoded value.
+        let prev = self.read_position(&mut tx, &schema.table).await?; // Option<BlockPosition>
+        let next = BlockPosition::advance(prev, position);
+        self.upsert_progress(&mut tx, &schema.table, next.sort_key(), &next.encode()).await?;
+
+        tx.commit().await
+    }
+
+    async fn stored_position(&self, table: &str) -> Result<Option<BlockPosition>> {
+        // was `last_block`; decode the stored TEXT value, or None when empty.
+        let encoded: Option<String> = self.read_encoded_position(table).await?;
+        encoded.map(|e| BlockPosition::decode(&e)).transpose()
+    }
+
+    async fn replay(&self, schema: &TableSchema, up_to: BlockPosition) -> Result<Vec<Row>> {
+        let to = up_to.sort_key();  // was the `to: u64` argument
+        // ... SELECT rows with sort_key <= `to`, ascending ...
+        # Ok(vec![])
+    }
+}
+```
+
+Swapping `BlockPosition` for a custom `Position` (e.g. `TimeFrontier`) is the
+only change needed to persist a non-block source — the body is identical because
+`advance` / `encode` / `decode` / `sort_key` are all defined by the trait.
+
+### `Dialect`: `monotonic_watermark_set` removed
+
+Custom `Dialect` impls must **drop `monotonic_watermark_set`** — the method no
+longer exists (monotonicity is now `Position::advance` in Rust, above). The
+`Dialect` seam gained `progress_row_lock` and `is_undefined_column`, both with
+default implementations, so no further action is required.
+
 ## Serving layer (opt-in)
 
 Behind the **non-default `serving` cargo feature**, a `ServingLayer` exposes the
@@ -230,7 +360,7 @@ progress. It is purely additive: with the feature off, nothing is compiled and n
 existing pipeline behavior changes.
 
 ```toml
-artemis-light = { version = "0.1", features = ["serving"] }
+artemis-light = { version = "0.2", features = ["serving"] }
 ```
 
 ```rust,ignore
@@ -275,7 +405,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artemis-light = "0.1"
+artemis-light = "0.2"
 ```
 
 ### Minimal example

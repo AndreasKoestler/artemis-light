@@ -12,8 +12,8 @@ use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
 use artemis_light::persistence::{
-    Column, PersistExt, PersistableCollector, Record, Row, SqlType, SqlValue, SqliteStore, Store,
-    TableSchema,
+    BlockPosition, Column, PersistExt, PersistableCollector, Record, Row, SqlType, SqlValue,
+    SqliteStore, Store, TableSchema,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -75,8 +75,8 @@ struct FakeCollector {
     /// rejected with a provider "response size / block range" error — used to
     /// simulate Alchemy's "up to a 2,000 block range" / 10K-log result cap.
     size_limit: AtomicUsize,
-    /// Every `(from, to)` range passed to `query_range`, for asserting how the
-    /// wrapper slices the backfill.
+    /// Every `(from, to)` sort-key range passed to `query_range`, for asserting
+    /// how the wrapper slices the backfill.
     queried: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
 }
 
@@ -120,20 +120,26 @@ fn value_event(value: u64) -> ValueSet {
 
 #[async_trait]
 impl PersistableCollector<ValueSet> for FakeCollector {
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, ValueSet)>> {
+    type Pos = BlockPosition;
+
+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
         let events: Vec<_> = self
             .live
             .iter()
-            .map(|&(b, v)| (b, value_event(v)))
+            .map(|&(b, v)| (BlockPosition(b), value_event(v)))
             .collect();
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
     async fn query_range(
         &self,
-        from: u64,
-        to: u64,
-    ) -> Result<CollectorStream<'_, (u64, ValueSet)>> {
+        from: BlockPosition,
+        to: BlockPosition,
+    ) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
+        // The wrapper slices on sort keys; unwrap to the block numbers this fake
+        // was scripted with.
+        let from = from.0;
+        let to = to.0;
         let call_number = {
             let mut queried = self.queried.lock().unwrap();
             queried.push((from, to));
@@ -164,13 +170,13 @@ impl PersistableCollector<ValueSet> for FakeCollector {
             .backfill
             .iter()
             .filter(|&&(b, _)| b >= from && b <= to)
-            .map(|&(b, v)| (b, value_event(v)))
+            .map(|&(b, v)| (BlockPosition(b), value_event(v)))
             .collect();
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn tip(&self) -> Result<u64> {
-        Ok(self.tip)
+    async fn tip(&self) -> Result<BlockPosition> {
+        Ok(BlockPosition(self.tip))
     }
 }
 
@@ -178,7 +184,7 @@ impl PersistableCollector<ValueSet> for FakeCollector {
 async fn stored_values(store: &SqliteStore) -> Vec<String> {
     let schema = value_set_schema();
     store
-        .replay(&schema, i64::MAX as u64)
+        .replay(&schema, BlockPosition(i64::MAX as u64))
         .await
         .unwrap()
         .into_iter()
@@ -212,9 +218,9 @@ async fn sqlite_store_uses_wal_for_file_databases() {
     // live database, not just at open time.
     let store = SqliteStore::connect(&url).await.unwrap();
     store
-        .write_block(
+        .write(
             &value_set_schema(),
-            1,
+            BlockPosition(1),
             vec![Row(vec![SqlValue::Text("a".into())])],
         )
         .await
@@ -241,9 +247,9 @@ async fn write_block_then_replay_reads_rows_back() {
     let schema = value_set_schema();
 
     store
-        .write_block(
+        .write(
             &schema,
-            7,
+            BlockPosition(7),
             vec![
                 Row(vec![SqlValue::Text("0x2a".into())]),
                 Row(vec![SqlValue::Text("0x2b".into())]),
@@ -252,7 +258,7 @@ async fn write_block_then_replay_reads_rows_back() {
         .await
         .unwrap();
 
-    let rows = store.replay(&schema, 100).await.unwrap();
+    let rows = store.replay(&schema, BlockPosition(100)).await.unwrap();
     assert_eq!(
         rows,
         vec![
@@ -262,26 +268,43 @@ async fn write_block_then_replay_reads_rows_back() {
     );
 }
 
-/// Slice 2: `last_block` reports the highest written block, `None` when empty.
+/// Slice 2: `stored_position` reports the highest written block, `None` when empty.
 #[tokio::test]
 async fn last_block_tracks_highest_written_block() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let schema = value_set_schema();
 
     // Nothing stored yet.
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), None);
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        None::<BlockPosition>
+    );
 
     store
-        .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("a".into())])])
+        .write(
+            &schema,
+            BlockPosition(5),
+            vec![Row(vec![SqlValue::Text("a".into())])],
+        )
         .await
         .unwrap();
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(5))
+    );
 
     store
-        .write_block(&schema, 9, vec![Row(vec![SqlValue::Text("b".into())])])
+        .write(
+            &schema,
+            BlockPosition(9),
+            vec![Row(vec![SqlValue::Text("b".into())])],
+        )
         .await
         .unwrap();
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(9));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(9))
+    );
 }
 
 /// Slice 3: a failing row in a batch rolls back the whole block, leaving prior
@@ -293,16 +316,20 @@ async fn write_block_is_atomic_on_failure() {
 
     // Block 5 is written cleanly.
     store
-        .write_block(&schema, 5, vec![Row(vec![SqlValue::Text("ok".into())])])
+        .write(
+            &schema,
+            BlockPosition(5),
+            vec![Row(vec![SqlValue::Text("ok".into())])],
+        )
         .await
         .unwrap();
 
     // Block 9's second row has too few values for the schema, so its INSERT
     // fails partway through the batch.
     let result = store
-        .write_block(
+        .write(
             &schema,
-            9,
+            BlockPosition(9),
             vec![
                 Row(vec![SqlValue::Text("good".into())]),
                 Row(vec![]), // missing the `value` column
@@ -314,10 +341,13 @@ async fn write_block_is_atomic_on_failure() {
     // Block 9 rolled back entirely: only block 5's row survives and the
     // progress marker still points at block 5.
     assert_eq!(
-        store.replay(&schema, 100).await.unwrap(),
+        store.replay(&schema, BlockPosition(100)).await.unwrap(),
         vec![Row(vec![SqlValue::Text("ok".into())])]
     );
-    assert_eq!(store.last_block(&schema.table).await.unwrap(), Some(5));
+    assert_eq!(
+        store.stored_position(&schema.table).await.unwrap(),
+        Some(BlockPosition(5))
+    );
 }
 
 /// Slice 4: a Record without a declared schema is a best guess from the event
@@ -394,13 +424,18 @@ struct NullStore;
 
 #[async_trait]
 impl Store for NullStore {
-    async fn write_block(&self, _schema: &TableSchema, _block: u64, _rows: Vec<Row>) -> Result<()> {
+    async fn write(
+        &self,
+        _schema: &TableSchema,
+        _position: BlockPosition,
+        _rows: Vec<Row>,
+    ) -> Result<()> {
         unreachable!("the store must not be reached")
     }
-    async fn last_block(&self, _table: &str) -> Result<Option<u64>> {
+    async fn stored_position(&self, _table: &str) -> Result<Option<BlockPosition>> {
         unreachable!("the store must not be reached")
     }
-    async fn replay(&self, _schema: &TableSchema, _to: u64) -> Result<Vec<Row>> {
+    async fn replay(&self, _schema: &TableSchema, _up_to: BlockPosition) -> Result<Vec<Row>> {
         unreachable!("the store must not be reached")
     }
 }
@@ -495,7 +530,10 @@ async fn persisted_records_live_events_per_complete_block() {
     assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
 
     // Only block 10 is complete and flushed; block 11 is still open.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(10));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(10))
+    );
     assert_eq!(
         stored_values(&store).await,
         vec!["0x1".to_string(), "0x2".to_string()]
@@ -507,7 +545,10 @@ async fn seed(store: &SqliteStore, block: u64, value: u64) {
     let record = Record::<ValueSet>::new(None).unwrap();
     let row = record.encode(&value_event(value)).unwrap();
     let schema = record.schema().unwrap();
-    store.write_block(&schema, block, vec![row]).await.unwrap();
+    store
+        .write(&schema, BlockPosition(block), vec![row])
+        .await
+        .unwrap();
 }
 
 /// Slice 8: on subscribe, stored history is replayed first (reconstructed from
@@ -556,7 +597,10 @@ async fn persisted_backfills_gap_between_last_stored_and_tip() {
 
     // Backfilled blocks 6 and 7 are now stored (last complete block = 7); the
     // open live block 9 is not flushed.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(7));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(7))
+    );
     assert_eq!(
         stored_values(&store).await,
         vec!["0x1".to_string(), "0x2".to_string(), "0x3".to_string()]
@@ -622,7 +666,10 @@ async fn backfill_is_sliced_into_bounded_chunks() {
     // The gap was queried in inclusive, block-aligned windows of 10.
     assert_eq!(*queried.lock().unwrap(), vec![(0, 9), (10, 19), (20, 25)]);
     // Backfilled blocks are complete, so the trailing one is flushed too.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(25));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(25))
+    );
 }
 
 /// A window the provider rejects as too large (its response-size / block-range
@@ -660,7 +707,10 @@ async fn backfill_splits_a_window_that_exceeds_the_response_size_limit() {
         ]
     );
     // The whole gap was covered despite the split: trailing backfill flushed.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(25));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(25))
+    );
 }
 
 /// With an empty store, the Backfill segment must begin at the configured
@@ -743,7 +793,10 @@ async fn mid_backfill_chunk_failure_ends_the_stream_without_corrupting_progress(
     );
 
     // The complete first chunk was flushed; nothing later advanced progress.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(5));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(5))
+    );
     assert_eq!(stored_values(&store).await, vec!["0x1".to_string()]);
 }
 
@@ -762,13 +815,19 @@ async fn override_schema_redirects_table_and_types() {
     let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 
     // Progress and rows live under the overridden table, not the derived one.
-    assert_eq!(store.last_block("custom_values").await.unwrap(), Some(1));
-    assert_eq!(store.last_block("value_set").await.unwrap(), None);
+    assert_eq!(
+        store.stored_position("custom_values").await.unwrap(),
+        Some(BlockPosition(1))
+    );
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        None::<BlockPosition>
+    );
 
     let rows = store
         .replay(
             &TableSchema::new("custom_values").col("value", SqlType::Numeric),
-            i64::MAX as u64,
+            BlockPosition(i64::MAX as u64),
         )
         .await
         .unwrap();
@@ -816,7 +875,8 @@ async fn event_collector_with_persistence_records_against_anvil() {
         stored_values(&store).await,
         vec!["0xb".to_string(), "0x16".to_string()]
     );
-    assert!(store.last_block("value_set").await.unwrap().unwrap() > 0);
+    let last: Option<BlockPosition> = store.stored_position("value_set").await.unwrap();
+    assert!(last.unwrap().0 > 0);
 }
 
 /// A stored payload that cannot be deserialized into its event type (a code or
@@ -830,9 +890,9 @@ async fn persisted_replay_fails_loudly_on_unreadable_payload() {
     // Seed a row whose `_payload` is not valid JSON for `ValueSet`.
     let payload_schema = TableSchema::new("value_set").col("_payload", SqlType::Text);
     store
-        .write_block(
+        .write(
             &payload_schema,
-            5,
+            BlockPosition(5),
             vec![Row(vec![SqlValue::Text("not a valid payload".into())])],
         )
         .await
@@ -966,7 +1026,7 @@ async fn composite_subscribe_failure_does_not_strand_replay() {
     assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
 }
 
-/// A store that fails `write_block` for one specific block, delegating
+/// A store that fails `write` for one specific block, delegating
 /// everything else to an inner [`SqliteStore`].
 struct FlakyStore {
     inner: Arc<SqliteStore>,
@@ -975,17 +1035,22 @@ struct FlakyStore {
 
 #[async_trait]
 impl Store for FlakyStore {
-    async fn write_block(&self, schema: &TableSchema, block: u64, rows: Vec<Row>) -> Result<()> {
-        if block == self.fail_at {
-            anyhow::bail!("simulated write failure at block {block}");
+    async fn write(
+        &self,
+        schema: &TableSchema,
+        position: BlockPosition,
+        rows: Vec<Row>,
+    ) -> Result<()> {
+        if position.0 == self.fail_at {
+            anyhow::bail!("simulated write failure at block {}", position.0);
         }
-        self.inner.write_block(schema, block, rows).await
+        self.inner.write(schema, position, rows).await
     }
-    async fn last_block(&self, table: &str) -> Result<Option<u64>> {
-        self.inner.last_block(table).await
+    async fn stored_position(&self, table: &str) -> Result<Option<BlockPosition>> {
+        self.inner.stored_position(table).await
     }
-    async fn replay(&self, schema: &TableSchema, to: u64) -> Result<Vec<Row>> {
-        self.inner.replay(schema, to).await
+    async fn replay(&self, schema: &TableSchema, up_to: BlockPosition) -> Result<Vec<Row>> {
+        self.inner.replay(schema, up_to).await
     }
 }
 
@@ -1018,7 +1083,10 @@ async fn persisted_halts_on_write_failure_to_avoid_gaps() {
 
     // Only block 5 was persisted before the failure; block 7 must NOT advance
     // the height past the gap at block 6.
-    assert_eq!(inner.last_block("value_set").await.unwrap(), Some(5));
+    assert_eq!(
+        inner.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(5))
+    );
     assert_eq!(stored_values(&inner).await, vec!["0x1".to_string()]);
 }
 
@@ -1046,11 +1114,134 @@ async fn confirmation_depth_corrects_a_shallow_reorg() {
     // Block 10 matures once head reaches 12 (10+2), block 11 once head reaches
     // 13. Their stored values are the corrected 3 and 4, not the orphaned 1
     // and 2; the orphaned fork's rows were dropped before any write.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(11));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(11))
+    );
     assert_eq!(
         stored_values(&store).await,
         vec!["0x3".to_string(), "0x4".to_string()],
         "the store holds the corrected chain, never the orphaned rows"
+    );
+}
+
+/// A reorg within the confirmation depth of the subscribe-time tip must be
+/// corrected in the confirmation window, not frozen into the store. The
+/// backfill covers `[resume ..= tip]`, but its last `confirmation_depth`
+/// positions are exactly the window a shallow reorg may still rewrite —
+/// final-flushing them with zero confirmations would leave the orphaned rows
+/// behind forever while the live re-emissions of the canonical blocks were
+/// silently dropped. Regression test for the backfill/live boundary reorg.
+#[tokio::test]
+async fn reorg_within_confirmation_depth_of_the_subscribe_tip_is_corrected() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+
+    // Tip 7 at subscribe; blocks 6 and 7 arrive via backfill. At depth 2 they
+    // are within the confirmation window of the tip. The live tail re-emits
+    // them (the reorg's canonical versions, values 20/30), then advances so
+    // the corrected blocks mature.
+    let collector = FakeCollector::default()
+        .tip(7)
+        .backfill(vec![(6, 2), (7, 3)])
+        .live(vec![(6, 20), (7, 30), (8, 4), (9, 40), (10, 50)]);
+    let persisted = collector
+        .with_persistence(store.clone())
+        .with_confirmation_depth(NonZeroU64::new(2).unwrap());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Strategies saw the original fork live (2, 3) and must also see the
+    // canonical re-emissions (20, 30) — a reorg is not silently swallowed.
+    assert_eq!(
+        events,
+        vec![
+            value_event(2),
+            value_event(3),
+            value_event(20),
+            value_event(30),
+            value_event(4),
+            value_event(40),
+            value_event(50),
+        ]
+    );
+
+    // The store holds only the canonical chain: blocks 6/7 carry the corrected
+    // values, never the orphaned 2/3. Blocks 9/10 are still inside the window.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(8))
+    );
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x14".to_string(), "0x1e".to_string(), "0x4".to_string()],
+        "the orphaned backfill rows must never become final"
+    );
+}
+
+/// A live re-emission at or below the settled backfill boundary (tip −
+/// confirmation depth) is a reorg deeper than the confirmation depth: it must
+/// halt persistence — the finalized rows would need a delete to correct — not
+/// be silently discarded while later blocks advance the watermark over it.
+#[tokio::test]
+async fn reorg_deeper_than_confirmation_depth_at_subscribe_halts_persistence() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 5, 1).await; // last stored block = 5
+
+    // Tip 7, depth 1: block 6 settles as final, block 7 stays in the window.
+    // The live tail then re-emits block 5 — already final — a deep reorg.
+    let collector = FakeCollector::default()
+        .tip(7)
+        .backfill(vec![(6, 2), (7, 3)])
+        .live(vec![(5, 99), (8, 4), (9, 5)]);
+    let persisted = collector.with_persistence(store.clone());
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+
+    // Events keep flowing — a halt freezes persistence, not the stream.
+    assert_eq!(
+        events,
+        vec![
+            value_event(1),
+            value_event(2),
+            value_event(3),
+            value_event(99),
+            value_event(4),
+            value_event(5),
+        ]
+    );
+
+    // Persistence halted at the deep reorg: nothing after block 6 is written,
+    // so a restart re-syncs across the corrupted range instead of trusting a
+    // watermark that silently skipped the re-emitted block.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(6)),
+        "no block may advance the watermark past a deep reorg"
+    );
+    assert_eq!(
+        stored_values(&store).await,
+        vec!["0x1".to_string(), "0x2".to_string()]
+    );
+}
+
+/// Bounded mode (`with_to_block`) pins the subscription to a snapshot: when the
+/// archive is already ahead of the snapshot, replay must stop at `to_block`
+/// rather than deliver events past it.
+#[tokio::test]
+async fn bounded_replay_is_clamped_to_the_snapshot_block() {
+    let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    seed(&store, 5, 1).await;
+    seed(&store, 6, 2).await;
+    seed(&store, 8, 3).await; // the archive is ahead of the snapshot
+
+    let collector = FakeCollector::default().tip(8);
+    let persisted = collector.with_persistence(store.clone()).with_to_block(6);
+
+    let events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
+    assert_eq!(
+        events,
+        vec![value_event(1), value_event(2)],
+        "replay must not deliver events past the snapshot block"
     );
 }
 
@@ -1064,7 +1255,10 @@ async fn default_confirmation_depth_is_one() {
 
     let _events: Vec<ValueSet> = persisted.subscribe().await.unwrap().collect().await;
 
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(10));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(10))
+    );
     assert_eq!(
         stored_values(&store).await,
         vec!["0x1".to_string(), "0x2".to_string()]
@@ -1101,9 +1295,155 @@ async fn persisted_does_not_duplicate_events_at_backfill_live_boundary() {
     );
 
     // Stored once each; the open live block 8 is not flushed.
-    assert_eq!(store.last_block("value_set").await.unwrap(), Some(7));
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(7))
+    );
     assert_eq!(
         stored_values(&store).await,
         vec!["0x1".to_string(), "0x2".to_string(), "0x3".to_string()]
+    );
+}
+
+/// Schema migration: an archive written under the OLD two-column schema
+/// (`table_name`, `last_block`) resumes to the SAME
+/// `BlockPosition` both BEFORE the first write (via the read-side `last_block`
+/// fallback, since the encoded `position` column does not exist yet) and AFTER it
+/// (via the lazily-added, CAST-backfilled `position` column). A file-backed
+/// database is used because fabricating the pre-migration schema needs a
+/// connection the store also sees; an in-memory SQLite database is private to a
+/// single connection.
+#[tokio::test]
+async fn pre_migration_archive_resumes_to_the_same_block() {
+    use std::str::FromStr;
+
+    let path =
+        std::env::temp_dir().join(format!("artemis_migrate_resume_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("sqlite:{}", path.display());
+
+    // Fabricate a pre-change two-column archive with a stored `last_block = 42`,
+    // exactly as an old (pre-position) binary would have created it.
+    {
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE _artemis_progress \
+             (table_name TEXT PRIMARY KEY, last_block INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _artemis_progress (table_name, last_block) VALUES ('value_set', 42)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let store = SqliteStore::connect(&url).await.unwrap();
+    let schema = value_set_schema();
+
+    // BEFORE the first write: the `position` column does not exist, so
+    // stored_position falls back to decoding `last_block`'s decimal text.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(42)),
+        "a pre-migration archive must resume at the same block before its first write"
+    );
+
+    // The first write migrates the schema in-transaction (ADD COLUMN + CAST
+    // backfill) and re-observes block 42, so the watermark stays 42.
+    store
+        .write(
+            &schema,
+            BlockPosition(42),
+            vec![Row(vec![SqlValue::Text("x".into())])],
+        )
+        .await
+        .unwrap();
+
+    // AFTER the first write: the migrated `position` column decodes to the same
+    // BlockPosition.
+    assert_eq!(
+        store.stored_position("value_set").await.unwrap(),
+        Some(BlockPosition(42)),
+        "the migrated position column must decode to the same block"
+    );
+
+    // Inspect the archive directly: the `position` column now exists and holds
+    // CAST(last_block AS TEXT) for the previously integer-only row.
+    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    let (encoded,): (String,) =
+        sqlx::query_as("SELECT position FROM _artemis_progress WHERE table_name = 'value_set'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        encoded, "42",
+        "the migration must store CAST(last_block AS TEXT) in the position column"
+    );
+}
+
+/// Migration error path: a `position` cell that
+/// `BlockPosition::decode` cannot parse (a wrong-typed / corrupt value, e.g. a
+/// JSON frontier read back under a block store) surfaces as a loud read error
+/// (`MalformedStoredPosition`, the `Position::decode` failure propagated verbatim),
+/// never a silent genesis re-sync.
+#[tokio::test]
+async fn malformed_position_cell_errors_on_read() {
+    use std::str::FromStr;
+
+    let path = std::env::temp_dir().join(format!(
+        "artemis_migrate_malformed_{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("sqlite:{}", path.display());
+
+    // Fabricate a current-schema archive whose `position` cell is not a decimal
+    // BlockPosition (a JSON frontier value).
+    {
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE _artemis_progress \
+             (table_name TEXT PRIMARY KEY, last_block INTEGER NOT NULL, position TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _artemis_progress (table_name, last_block, position) \
+             VALUES ('value_set', 5, '{\"time_ms\":5,\"seen\":[]}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    let store = SqliteStore::connect(&url).await.unwrap();
+    let result: Result<Option<BlockPosition>> = store.stored_position("value_set").await;
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        result.is_err(),
+        "a malformed position cell must fail loudly on read, not silently re-sync from genesis"
     );
 }

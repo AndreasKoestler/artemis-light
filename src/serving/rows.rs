@@ -52,16 +52,22 @@ pub(crate) struct RowsResponse {
 impl RowsQueryParams {
     /// Validate and resolve the parameters, applying defaults and clamping
     /// `limit` to `[1, max_limit]`. Any non-numeric / negative value yields
-    /// `InvalidQuery(<name>)` (serving-layer.ERRORS.2).
+    /// `InvalidQuery(<name>)`.
     pub(crate) fn resolve(
         &self,
         default_limit: u64,
         max_limit: u64,
     ) -> Result<Bounds, ServingError> {
-        let from_block = parse_u64("from_block", &self.from_block, 0)?;
-        let to_block = parse_u64("to_block", &self.to_block, i64::MAX as u64)?;
-        let limit = parse_u64("limit", &self.limit, default_limit)?.clamp(1, max_limit.max(1));
-        let offset = parse_u64("offset", &self.offset, 0)?;
+        // Every bound below is bound to SQL as i64, so clamp to i64::MAX rather
+        // than letting `as i64` wrap negative (which would flip the query's
+        // meaning, and diverge between backends on `offset`). Clamping is
+        // semantically exact: no table holds more than i64::MAX rows or blocks.
+        const MAX_BIND: u64 = i64::MAX as u64;
+        let from_block = parse_u64("from_block", &self.from_block, 0)?.min(MAX_BIND);
+        let to_block = parse_u64("to_block", &self.to_block, MAX_BIND)?.min(MAX_BIND);
+        let limit =
+            parse_u64("limit", &self.limit, default_limit)?.clamp(1, max_limit.clamp(1, MAX_BIND));
+        let offset = parse_u64("offset", &self.offset, 0)?.min(MAX_BIND);
         Ok(Bounds {
             from_block,
             to_block,
@@ -82,7 +88,7 @@ fn parse_u64(name: &str, raw: &Option<String>, default: u64) -> Result<u64, Serv
 }
 
 /// Query a page of rows for a validated `table`, ordered by ascending block,
-/// filtered to the inclusive `[from_block, to_block]` range (serving-layer.ROWS.1/.2/.4).
+/// filtered to the inclusive `[from_block, to_block]` range.
 pub(crate) async fn query_rows(
     pool: &SqlitePool,
     table: &str,
@@ -141,6 +147,20 @@ mod tests {
             .resolve(100, 1000)
             .unwrap();
         assert_eq!(b.limit, 1);
+    }
+
+    #[test]
+    fn values_above_i64_max_clamp_to_i64_max() {
+        // Every resolved bound is later bound as i64; values in
+        // (i64::MAX, u64::MAX] must clamp rather than wrap negative.
+        let max = u64::MAX.to_string();
+        let b = params(Some(&max), Some(&max), Some(&max), Some(&max))
+            .resolve(100, u64::MAX)
+            .unwrap();
+        assert_eq!(b.from_block, i64::MAX as u64);
+        assert_eq!(b.to_block, i64::MAX as u64);
+        assert_eq!(b.limit, i64::MAX as u64);
+        assert_eq!(b.offset, i64::MAX as u64);
     }
 
     #[test]

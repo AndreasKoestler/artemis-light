@@ -42,7 +42,13 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
 
     /// Re-submit failed actions with exponential backoff, per `policy`.
     /// Transient RPC failures are the common case for a submission sink, so
-    /// this is the innermost reliability layer most executors want.
+    /// most executors want this layer near the bottom of the stack. One
+    /// exception to "innermost": the retry loop re-submits on the executor
+    /// *inside* it, so a [`rate_limit`](ExecutorExt::rate_limit) outside it
+    /// charges up to `1 + max_retries` real submissions to one window slot —
+    /// to have the cap count every attempt, put the limit inside:
+    /// `executor.rate_limit(n).retry(p)` (retries then wait out the window
+    /// like any other submission).
     fn retry(self, policy: RetryPolicy) -> Retry<A> {
         Retry::new(Box::new(self), policy)
     }
@@ -59,7 +65,11 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
 
     /// Cap submissions to `per_second` per sliding second, to respect
     /// provider limits. An action over the cap waits rather than being
-    /// dropped. A [`NonZeroU32`](std::num::NonZeroU32) rules out a zero cap.
+    /// dropped *by this wrapper*; the wait stalls the executor task, and
+    /// actions queued behind it in the lossy broadcast action channel can be
+    /// dropped if the ring wraps — size the engine's `action_channel_capacity`
+    /// for the expected backlog. A [`NonZeroU32`](std::num::NonZeroU32) rules
+    /// out a zero cap.
     fn rate_limit(self, per_second: std::num::NonZeroU32) -> RateLimit<A> {
         RateLimit::new(Box::new(self), per_second)
     }

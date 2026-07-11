@@ -6,7 +6,7 @@
 //! reconfigures it. This example demonstrates the whole story:
 //!
 //!   1. build a caller-owned multi-connection `PgPool` (the store never caps or
-//!      polices the connection count — inject-pool.STORE.5),
+//!      polices the connection count),
 //!   2. construct a `PostgresStore` from a clone of that pool with
 //!      [`PostgresStore::with_pool`] and persist 3 events,
 //!   3. rebuild a *second* store from the **same** pool to show resume/replay,
@@ -38,7 +38,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
-use artemis_light::persistence::{PersistExt, PostgresStore, Store};
+use artemis_light::persistence::{BlockPosition, PersistExt, PostgresStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
@@ -77,10 +77,9 @@ async fn main() -> Result<()> {
 
     // ---- The caller owns and configures the pool. ----
     //
-    // A multi-connection pool (max_connections(5)): `with_pool` accepts any
-    // connection count and never caps or overrides it (inject-pool.STORE.5). An
-    // unreachable database fails *here*, on the caller's own connect — not inside
-    // artemis-light.
+    // A multi-connection pool (max_connections(5)): `with_pool` accepts the
+    // connection count as-is. An unreachable database fails *here*, on the
+    // caller's own connect — not inside artemis-light.
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
@@ -127,7 +126,11 @@ async fn main() -> Result<()> {
 
     // Each event landed in its own block. A block is flushed once a higher one is
     // seen, so the resume point has advanced past the earliest events.
-    match store.last_block("value_set").await? {
+    match store
+        .stored_position("value_set")
+        .await?
+        .map(|p: BlockPosition| p.0)
+    {
         Some(block) => println!("Highest persisted block: {block}"),
         None => println!("Highest persisted block: (none yet)"),
     }
@@ -149,8 +152,8 @@ async fn main() -> Result<()> {
 
     // ---- Drop every store handle, then prove the pool is still open. ----
     //
-    // The store never calls `.close()` on a borrowed pool (inject-pool.OWNERSHIP.1),
-    // so once every store handle is gone the caller's pool is still fully usable.
+    // The store never calls `.close()` on a borrowed pool, so once every store
+    // handle is gone the caller's pool is still fully usable.
     drop(stream);
     drop(recovered);
     drop(recovered_store);

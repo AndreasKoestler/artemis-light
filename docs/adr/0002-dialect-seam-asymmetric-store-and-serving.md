@@ -64,3 +64,12 @@ with the Store unless the catalog introspection stops being structurally
 divergent (e.g. all supported backends converge on `information_schema`), at
 which point the Catalog becomes its own shareable seam — still distinct from the
 Dialect.
+
+---
+
+**Amendment (Position-trait rework):** the "monotonic-watermark upsert
+expression (`MAX` vs `GREATEST`)" is no longer a Dialect fact. A generic
+`Position`'s encoded text is not SQL-comparable, so monotonicity moved into
+`Position::advance` and the upsert writes the advanced value verbatim. The
+Dialect gained an error-classification fact instead: benign duplicate-object
+DDL races (PostgreSQL SQLSTATEs `42P07`/`42701`/`23505`; never on SQLite).

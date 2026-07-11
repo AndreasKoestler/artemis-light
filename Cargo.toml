@@ -1,6 +1,6 @@
 [package]
 name = "artemis-light"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A framework for reliable, long-running on-chain automation: event-driven agents built on Alloy and Tokio. A fork of Paradigm's Artemis."
 license = "Apache-2.0"
@@ -11,10 +11,10 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [features]
 ## Opt-in, read-only HTTP serving layer over the persisted tables. Off by
-## default so consumers who never serve pay no dependency cost (serving-layer.OPTIN.1/.2).
+## default so consumers who never serve pay no dependency cost.
 serving = ["dep:axum", "tokio/net"]
 ## Opt-in PostgreSQL store + serving backend. Off by default so consumers who
-## only use SQLite pay no PostgreSQL driver cost (postgres-store.FEATURE.1/.2).
+## only use SQLite pay no PostgreSQL driver cost.
 postgres = ["sqlx/postgres"]
 
 [dependencies]
@@ -35,8 +35,7 @@ async-stream = "0.3"
 ## serving (opt-in; compiled only under the `serving` feature).
 ## Held at 0.7 because the serving routes use axum 0.7's path-parameter syntax
 ## (`/tables/:table/...`); axum 0.8 renamed it to `/tables/{table}/...` and is a
-## separate migration. (The original serde_core pin rationale no longer applies:
-## alloy was bumped to 1.x-latest, lifting the serde 1.0.219 pin.)
+## separate migration.
 axum = { version = "0.7", optional = true }
 ## misc
 anyhow = "1.0.97"
@@ -55,7 +54,7 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 ## PostgreSQL integration tests (`tests/postgres.rs`, gated `#![cfg(feature =
 ## "postgres")]`) provision a throwaway PostgreSQL container so the default
-## `cargo test` needs no Docker (postgres-store.TESTING.1/.2).
+## `cargo test` needs no Docker.
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = "0.27"
 
@@ -92,6 +91,13 @@ name = "persistence_example"
 path = "examples/persistence_example.rs"
 
 [[example]]
+name = "hypercore_ledger_example"
+path = "examples/hypercore_ledger_example.rs"
+## No required-features: self-contained on the default in-memory SQLite store, so
+## `cargo build --examples`, clippy `--all-targets`, and the CI verified run all
+## cover it with no extra flags.
+
+[[example]]
 name = "confirmation_depth_example"
 path = "examples/confirmation_depth_example.rs"
 
@@ -115,5 +121,5 @@ path = "examples/injected_pool_example.rs"
 ## Builds only under the opt-in `postgres` feature (the example uses
 ## `PostgresStore::with_pool`); wiring it as a required-features target keeps
 ## `cargo build --examples`, clippy `--all-targets`, and CI `--all-features`
-## compiling it so it cannot silently bit-rot (inject-pool.EXAMPLE.2).
+## compiling it so it cannot silently bit-rot.
 required-features = ["postgres"]

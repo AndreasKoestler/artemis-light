@@ -1,5 +1,5 @@
 use crate::collectors::fallback::subscribe_or_poll;
-use crate::persistence::PersistableCollector;
+use crate::persistence::{BlockPosition, PersistableCollector};
 use crate::types::{Collector, CollectorStream};
 use alloy::{contract::Event, providers::Provider, rpc::types::Log, sol_types::SolEvent};
 use anyhow::Result;
@@ -103,34 +103,50 @@ where
 
 /// The [`EventCollector`] is block-aware: it recovers each event's block number
 /// from its [`Log`](alloy::rpc::types::Log) and can replay a historical range
-/// via the provider, so it can be wrapped with persistence.
+/// via the provider, so it can be wrapped with persistence. Its [`Position`] is
+/// the built-in [`BlockPosition`], so existing block code needs no custom
+/// position type; `u64` block numbers are wrapped/unwrapped at this alloy
+/// boundary.
+///
+/// [`Position`]: crate::persistence::Position
 #[async_trait]
 impl<P, E> PersistableCollector<E> for EventCollector<P, E>
 where
     P: Provider + Clone + Send + Sync,
     E: SolEvent + Send + Sync,
 {
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (u64, E)>> {
-        self.indexed_stream().await
+    type Pos = BlockPosition;
+
+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, E)>> {
+        let stream = self
+            .indexed_stream()
+            .await?
+            .map(|(block, event)| (BlockPosition(block), event));
+        Ok(Box::pin(stream))
     }
 
-    async fn query_range(&self, from: u64, to: u64) -> Result<CollectorStream<'_, (u64, E)>> {
+    async fn query_range(
+        &self,
+        from: BlockPosition,
+        to: BlockPosition,
+    ) -> Result<CollectorStream<'_, (BlockPosition, E)>> {
         // Reuse the collector's filter (address + signature), narrowed to the
         // requested block range, against a clone of the provider.
         let ranged = Event::new(self.event.provider.clone(), self.event.filter.clone())
-            .from_block(from)
-            .to_block(to);
-        let events: Vec<(u64, E)> = ranged
+            .from_block(from.0)
+            .to_block(to.0);
+        let events: Vec<(BlockPosition, E)> = ranged
             .query()
             .await?
             .into_iter()
             .filter_map(|(event, log)| indexed_event(event, &log))
+            .map(|(block, event)| (BlockPosition(block), event))
             .collect();
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
-    async fn tip(&self) -> Result<u64> {
-        Ok(self.event.provider.get_block_number().await?)
+    async fn tip(&self) -> Result<BlockPosition> {
+        Ok(BlockPosition(self.event.provider.get_block_number().await?))
     }
 }
 

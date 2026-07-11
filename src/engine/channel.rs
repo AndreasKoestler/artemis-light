@@ -31,7 +31,10 @@ where
             match result {
                 Ok(item) => Some(item),
                 Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    warn!("{label} receiver lagged, skipped {n} messages");
+                    warn!(
+                        "{label} receiver lagged, skipped {n} messages; raise the engine's \
+                         event_channel_capacity/action_channel_capacity or speed up this consumer"
+                    );
                     None
                 }
             }

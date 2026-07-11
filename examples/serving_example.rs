@@ -31,7 +31,7 @@ use alloy::sol;
 use anyhow::{Context, Result};
 use artemis_light::ServingLayer;
 use artemis_light::collectors::EventCollector;
-use artemis_light::persistence::{PersistExt, SqliteStore, Store};
+use artemis_light::persistence::{BlockPosition, PersistExt, SqliteStore, Store};
 use artemis_light::types::Collector;
 use futures::StreamExt;
 use serde_json::Value;
@@ -170,7 +170,10 @@ async fn main() -> Result<()> {
     // The writer's view agrees with what the API served.
     println!(
         "\nWriter-side highest persisted block for `value_set`: {:?}",
-        store.last_block("value_set").await?
+        store
+            .stored_position("value_set")
+            .await?
+            .map(|p: BlockPosition| p.0)
     );
     println!("Done!");
     Ok(())

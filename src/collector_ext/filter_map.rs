@@ -31,10 +31,9 @@ where
     F: Fn(E1) -> Option<E2> + Send + Sync + Clone + 'static,
 {
     let stream = collector.subscribe().await?;
-    let stream = stream.filter_map(move |event| {
-        let f = f.clone();
-        async move { f(event) }
-    });
+    // `f` runs synchronously, so wrap its result in a ready future instead of
+    // cloning `f` into an async block per event.
+    let stream = stream.filter_map(move |event| futures::future::ready(f(event)));
     Ok(Box::pin(stream))
 }
 

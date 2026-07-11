@@ -27,6 +27,18 @@ use super::schema::{
 
 /// The mapping between the event type `E` and its SQL rows. See the
 /// [module docs](crate::persistence).
+///
+/// # The freeze contract
+///
+/// Column types are fixed once — by the declared override, or from the
+/// **first** encoded event — and every later event must fit them: the store's
+/// `CREATE TABLE` runs against the frozen schema, so a value that no longer
+/// fits its column (a `u64` crossing `i64::MAX` after the column froze as
+/// `INTEGER`) cannot be bound on a strictly-typed backend such as PostgreSQL.
+/// [`encode`](Record::encode) rejects such a value with an error naming the
+/// column, its frozen type, and the value, instead of letting the backend fail
+/// opaquely mid-write. Fields that may outgrow `i64` should be declared `TEXT`
+/// or `NUMERIC` via a schema override.
 pub struct Record<E> {
     table: String,
     columns: ColumnsSource,
@@ -39,9 +51,10 @@ enum ColumnsSource {
     Declared(Vec<Column>),
     /// Inferred from the first successfully encoded event, then frozen for
     /// the lifetime of the `Record`. The store's `CREATE TABLE IF NOT EXISTS`
-    /// freezes the table on the first write anyway, so later events that
-    /// would infer differently (e.g. a `u64` crossing `i64::MAX`) only vary
-    /// in value affinity, which SQLite absorbs.
+    /// freezes the table on the first write anyway; a later event that would
+    /// infer differently (e.g. a `u64` crossing `i64::MAX`) must still fit
+    /// the frozen types — `encode` rejects it descriptively rather than
+    /// letting a strictly-typed backend fail the insert opaquely.
     Inferred(OnceLock<Vec<Column>>),
 }
 
@@ -57,25 +70,50 @@ impl<E: SolEvent> Record<E> {
     ///
     /// Without an override, the table name is derived from `E`'s Solidity
     /// signature and the columns are frozen from the first encoded event.
+    ///
+    /// This is the `E: SolEvent` entry point; it delegates to the SolEvent-free
+    /// [`declared`](Record::declared) / [`inferred`](Record::inferred)
+    /// constructors, which non-EVM event types call directly.
     pub fn new(override_: Option<TableSchema>) -> Result<Self> {
-        let (table, columns) = match override_ {
-            Some(schema) => {
-                // An override colliding with an implicit column would produce
-                // a `CREATE TABLE` with duplicate columns; surfacing it here
-                // makes the failure a clear construction error rather than an
-                // opaque SQL one.
-                if let Err(reason) = schema.ensure_no_reserved_names() {
-                    anyhow::bail!("invalid schema override: {reason}");
-                }
-                (schema.table, ColumnsSource::Declared(schema.columns))
-            }
-            None => (table_name::<E>(), ColumnsSource::Inferred(OnceLock::new())),
-        };
+        match override_ {
+            Some(schema) => Self::declared(schema),
+            None => Ok(Self::inferred(table_name::<E>())),
+        }
+    }
+}
+
+impl<E> Record<E> {
+    /// A `Record` writing to `schema`'s declared table with its declared
+    /// columns, **without** requiring `E: SolEvent` — the entry point for a
+    /// non-EVM event type that supplies its own schema.
+    ///
+    /// Errs when the schema names a reserved identifier (an implicit column the
+    /// persistence layer adds — `block_number`, `_payload` — or the store's
+    /// progress table). An override colliding with an implicit column would
+    /// otherwise produce a `CREATE TABLE` with duplicate columns; surfacing it
+    /// here makes the failure a clear construction error rather than an opaque
+    /// SQL one.
+    pub fn declared(schema: TableSchema) -> Result<Self> {
+        if let Err(reason) = schema.ensure_no_reserved_names() {
+            anyhow::bail!("invalid schema override: {reason}");
+        }
         Ok(Self {
-            table,
-            columns,
+            table: schema.table,
+            columns: ColumnsSource::Declared(schema.columns),
             _event: PhantomData,
         })
+    }
+
+    /// A `Record` whose table is `table` and whose event-field columns are
+    /// inferred from the first encoded event, **without** requiring
+    /// `E: SolEvent` — the entry point for a non-EVM event type persisted under
+    /// a caller-supplied table name.
+    pub fn inferred(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            columns: ColumnsSource::Inferred(OnceLock::new()),
+            _event: PhantomData,
+        }
     }
 }
 
@@ -123,15 +161,15 @@ impl<E> Record<E> {
         let json = event_json(event)?;
         let fields = field_map(&json)?;
         let columns = self.freeze_columns(&fields)?;
-        let mut values: Vec<SqlValue> = columns
-            .iter()
-            .map(|col| {
-                fields
-                    .get(&col.name)
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or(SqlValue::Null)
-            })
-            .collect();
+        let mut values: Vec<SqlValue> = Vec::with_capacity(columns.len() + 1);
+        for col in columns {
+            let value = fields
+                .get(&col.name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or(SqlValue::Null);
+            ensure_value_fits(col, &value)?;
+            values.push(value);
+        }
         values.push(SqlValue::Text(json.to_string()));
         Ok(Row(values))
     }
@@ -181,7 +219,7 @@ impl<E> Record<E> {
 
 /// The best-guess table name for an event type, derived from its Solidity
 /// signature: `ValueSet(uint256)` -> `value_set`.
-fn table_name<E: SolEvent>() -> String {
+pub(crate) fn table_name<E: SolEvent>() -> String {
     let signature = E::SIGNATURE;
     let name = signature.split('(').next().unwrap_or(signature);
     to_snake_case(name)
@@ -222,6 +260,27 @@ fn infer_type(value: &Value) -> SqlType {
         // Arrays, objects and null are stored as JSON text.
         _ => SqlType::Text,
     }
+}
+
+/// Reject a value that no longer fits its frozen column type (see the freeze
+/// contract on [`Record`]). Today this is one case: an `INTEGER` column
+/// receiving text — a `u64` that crossed `i64::MAX` after the column froze.
+/// SQLite's affinity would absorb it, but PostgreSQL rejects the bind with an
+/// opaque backend error that permanently halts the gap-free writer; failing
+/// here names the column, the frozen type, and the value instead.
+fn ensure_value_fits(column: &Column, value: &SqlValue) -> Result<()> {
+    if column.ty == SqlType::Integer
+        && let SqlValue::Text(text) = value
+    {
+        anyhow::bail!(
+            "value {text:?} for column {:?} does not fit its frozen INTEGER type \
+             (column types freeze from the first encoded event or the declared \
+             override; a u64 above i64::MAX encodes as text) — declare the column \
+             as TEXT or NUMERIC with a schema override",
+            column.name
+        );
+    }
+    Ok(())
 }
 
 /// Convert a serialised field value into a [`SqlValue`].
@@ -323,6 +382,37 @@ mod tests {
             json_to_sql(&json!(i64::MAX as u64)),
             SqlValue::Integer(i64::MAX)
         );
+    }
+
+    // errorPath: a column frozen as Integer from the first event later receives
+    // a u64 above i64::MAX (which encodes as decimal text). On PostgreSQL that
+    // bind would fail with an opaque backend error and permanently halt the
+    // gap-free writer; the Record must instead err descriptively, naming the
+    // column, its frozen type, and the offending value.
+    #[test]
+    fn encode_errs_when_a_value_no_longer_fits_a_frozen_integer_column() {
+        #[derive(serde::Serialize)]
+        struct Event {
+            amount: u64,
+        }
+
+        let record = Record::<Event>::inferred("t");
+        // The first event freezes `amount` as Integer.
+        record.encode(&Event { amount: 7 }).unwrap();
+        assert_eq!(
+            record.schema().unwrap().columns[0],
+            Column::new("amount", SqlType::Integer)
+        );
+
+        // A later value beyond i64::MAX no longer fits the frozen column.
+        let err = record.encode(&Event { amount: u64::MAX }).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("amount"), "{msg}");
+        assert!(msg.contains("INTEGER"), "{msg}");
+        assert!(msg.contains(&u64::MAX.to_string()), "{msg}");
+
+        // The frozen schema is untouched and fitting values still encode.
+        record.encode(&Event { amount: 8 }).unwrap();
     }
 
     #[test]

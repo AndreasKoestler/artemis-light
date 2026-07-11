@@ -30,6 +30,12 @@ impl Default for RetryPolicy {
 /// `Retry` is a wrapper around an [`Executor`] that re-submits failed actions
 /// with exponential backoff, per its [`RetryPolicy`]. Once the retries are
 /// exhausted the *last* error is returned.
+///
+/// The loop re-submits on the executor *inside* this wrapper, so layers
+/// outside see one `execute` however many attempts ran: a `RateLimit` outside
+/// a `Retry` charges up to `1 + max_retries` real submissions to one window
+/// slot. To have the cap count every attempt, compose the limit inside the
+/// retry: `executor.rate_limit(n).retry(p)`.
 pub struct Retry<A> {
     executor: Box<dyn Executor<A>>,
     policy: RetryPolicy,

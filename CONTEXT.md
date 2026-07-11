@@ -34,11 +34,11 @@ The Reconnect Policy's verdict that a Collector cannot recover. The Engine respo
 _Avoid_: crash, panic, die
 
 **Merge**:
-A combinator that interleaves two or more Collectors into one composite Collector. Events arrive in whichever order the sources produce them. All sources subscribe eagerly when the composite subscribes; any creation failure fails the composite's subscribe, so the failure feeds the Reconnect Policy's counter instead of vanishing.
+A combinator that interleaves two or more Collectors into one composite Collector. Events arrive in whichever order the sources produce them. All sources subscribe eagerly when the composite subscribes; any creation failure — including an empty source set — fails the composite's subscribe, so the failure feeds the Reconnect Policy's counter instead of vanishing.
 _Avoid_: combine, join, fan-in (the Engine's channel-level fan-in is a different thing)
 
 **Chain**:
-A combinator that delivers two or more Collectors' streams strictly in sequence — the next source's events are held back until the previous source's stream ends. Sources still subscribe eagerly at the composite's subscribe, so a later live source buffers at its source rather than missing events while earlier segments drain (the same head-buffering rationale as the Persisted Collector's subscribe). Any creation failure fails the whole subscribe.
+A combinator that delivers two or more Collectors' streams strictly in sequence — the next source's events are held back until the previous source's stream ends. Sources still subscribe eagerly at the composite's subscribe, so a later live source buffers at its source rather than missing events while earlier segments drain (the same head-buffering rationale as the Persisted Collector's subscribe). Any creation failure — including an empty source set — fails the whole subscribe.
 _Avoid_: concat, append
 
 **Retry**:
@@ -56,11 +56,11 @@ Tries a primary and re-routes to a secondary on failure. Two duals:
 _Avoid_: failover, backup executor/collector
 
 **Polling Fallback**:
-The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. While polling, event latency is the provider's poll interval rather than push-on-arrival. Distinct from **Fallback**, the executor-side wrapper.
+The collector-side downgrade from a pubsub subscription to filter polling when the subscription cannot be established (most commonly a transport without pubsub, e.g. plain HTTP). The downgrade is logged as a warning and is stateless: every subscribe attempt — one per reconnect — tries the subscription first, so a recovered pubsub endpoint upgrades back automatically. A failed poll propagates as an ordinary subscribe failure to the **Reconnect Policy**. While polling blocks, a per-block header fetch that fails is retried on subsequent poll ticks (bounded; an exhausted block is dropped with a loud warning, not fed to the Reconnect Policy). Event latency is the provider's poll interval rather than push-on-arrival. Distinct from **Fallback**, the executor-side wrapper.
 _Avoid_: failover, degraded mode
 
 **Rate Limit**:
-An Executor wrapper that caps submissions per sliding one-second window, to respect provider limits. An over-cap action waits (backpressure on the action channel) — it is never dropped. Every attempt counts against the window, including failed ones: a failed submission still spent provider quota.
+An Executor wrapper that caps submissions per sliding one-second window, to respect provider limits. An over-cap action waits — the wrapper never drops the action *in hand* — but the wait shields only that action: actions queued behind it ride the Engine's bounded broadcast channel and can be skipped if the ring wraps (raise `action_channel_capacity` to widen that margin). Every attempt through the wrapper counts against the window, including failed ones: a failed submission still spent provider quota — but a **Retry** wrapped *around* the rate limit re-submits on the inner executor, so to count every retry attempt, compose the rate limit inside the retry.
 _Avoid_: throttle, debounce
 
 **EIP-1559 Pricing**:
@@ -68,7 +68,7 @@ The Executor prices `max_fee_per_gas` and `max_priority_fee_per_gas` from the pr
 _Avoid_: gas price, legacy pricing
 
 **Replacement**:
-The opt-in loop that resubmits an unconfirmed transaction at the same nonce with escalated fees, up to `max_replacements`, after each **Confirmation Timeout**. Distinct from the Executor **Retry** wrapper: Retry resubmits on a *send* error; Replacement resubmits a *sent-but-unmined* transaction. Use one or the other, not both.
+The opt-in loop that resubmits an unconfirmed transaction at the same nonce with escalated fees, up to `max_replacements`, after each *genuine* **Confirmation Timeout** — a transport error while watching re-watches the same hash without burning an escalation step. Before any failure verdict, the loop sweeps receipts for every hash it sent: a transaction that mined behind its back is reported `Ok`, never as a failure. Distinct from the Executor **Retry** wrapper: Retry resubmits on a *send* error; Replacement resubmits a *sent-but-unmined* transaction. Use one or the other, not both.
 _Avoid_: resend, speed-up, retry (that is the wrapper)
 
 **Confirmation Timeout**:
@@ -104,7 +104,7 @@ The transparent Executor wrapper that publishes an **Execution Outcome** per act
 _Avoid_: callback, hook, notify
 
 **Channel Collector**:
-A Collector over an in-process broadcast channel: it holds the Sender and mints a fresh receiver on every subscribe, so it survives the Collector Driver's re-subscription where a single receiver could not. The seam through which an **Execution Outcome** — or any in-process source — re-enters the pipeline as events.
+A Collector over an in-process broadcast channel: it holds the Sender and mints a fresh receiver on every subscribe, so it survives the Collector Driver's re-subscription where a single receiver could not. Delivery across that survival is best-effort — events sent between a stream's death and the re-subscribe are lost (a fresh receiver sees only later sends). The seam through which an **Execution Outcome** — or any in-process source — re-enters the pipeline as events.
 _Avoid_: feedback channel, back-channel
 
 **Persisted Collector**:
@@ -112,7 +112,7 @@ A Collector wrapper that records every event it sees into a Store and, on subscr
 _Avoid_: indexer, archiver, recorder
 
 **Record**:
-The mapping between one event type and its SQL rows. It owns the table name, the column schema — declared via an override (validated at construction, where a bad override returns an error rather than panicking — see `Persisted::try_with_schema`) or frozen from the first encoded event — the encode-to-row and decode-from-payload directions, and the reserved-name invariant. The Store sees only the schemas and rows a Record produces.
+The mapping between one event type and its SQL rows. It owns the table name, the column schema — declared via an override (validated at construction, where a bad override returns an error rather than panicking — see `Persisted::try_with_schema`) or frozen from the first encoded event and enforced thereafter (a later value that no longer fits the frozen type errs loudly, naming the column and the remedy) — the encode-to-row and decode-from-payload directions, and the reserved-name invariant. The Store sees only the schemas and rows a Record produces.
 _Avoid_: codec, row mapper, serializer
 
 **Segment**:
@@ -123,25 +123,29 @@ The Segment that reconstructs stored history from the Store. Runs only on the **
 _Avoid_: re-emit, history dump
 
 **Backfill**:
-The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`, never below the configured start block) from the source, sliced into bounded block-aligned chunks queried one at a time. These are complete blocks, so all of them — including the trailing one — are persisted. When there is no gap (stored height at or past the tip) no query is issued. A chunk that fails mid-backfill ends the whole subscription — live tail included — so the stored height cannot advance over the hole; the Reconnect Policy drives the resubscribe, which backfills again from the last stored block. A reorg shallower than the **Confirmation Depth** never reaches the Store: it is absorbed in the Live Tail's confirmation window before any orphaned row is written, so the Backfill never has to re-fetch over a corrected fork (a reorg deeper than the depth still halts persistence and a restart re-syncs).
+The Segment that fetches the gap between the last stored block and the chain tip (`[last+1 ..= tip]`, never below the configured start block) from the source, sliced into bounded block-aligned chunks queried one at a time. Blocks at or below `tip − Confirmation Depth` are settled final; the trailing depth positions are written into the Live Tail's confirmation window as pending, so the subscribe-time boundary enjoys the same reorg protection as steady state. When there is no gap (stored height at or past the tip) no query is issued. A chunk that fails mid-backfill ends the whole subscription — live tail included — so the stored height cannot advance over the hole; the Reconnect Policy drives the resubscribe, which backfills again from the last stored block. A reorg shallower than the **Confirmation Depth** never reaches the Store: it is absorbed in the Live Tail's confirmation window before any orphaned row is written, so the Backfill never has to re-fetch over a corrected fork (a reorg deeper than the depth still halts persistence and a restart re-syncs).
 _Avoid_: catch-up, gap fill
 
 **Live Tail**:
-The unbounded Segment following the chain tip, strictly above the Backfill's cut (`> tip`). Persistence lags the live edge by the **Confirmation Depth**: the most recent depth blocks are buffered unwritten, and a restart re-fetches that whole window (not just a single open block) via Backfill.
+The unbounded Segment following the chain tip. The live stream is not sort-key-filtered at the Backfill's cut — the confirmation window owns the boundary: an arrival above the window is normal, a re-emission of a pending position is deduped or reorg-corrected, and an arrival at or below the settled prefix halts as a deep reorg. Persistence lags the live edge by the **Confirmation Depth**: the most recent depth blocks are buffered unwritten, and a restart re-fetches that whole window (not just a single open block) via Backfill.
 _Avoid_: live stream, subscription
 
 **Confirmation Depth**:
-The number of blocks a block must be buried under before the Persisted Collector writes it (default 1). The Live Tail buffers the most recent Confirmation-Depth blocks; a reorg shallower than the depth is corrected in the buffer before any orphaned row is written, while a reorg deeper than it halts persistence and a restart re-syncs. Events are still delivered live and immediately — only the Store write lags.
+The number of blocks a block must be buried under before the Persisted Collector writes it (default 1). The Live Tail buffers the most recent Confirmation-Depth blocks; a reorg shallower than the depth is corrected in the buffer before any orphaned row is written, while a reorg deeper than it halts persistence and a restart re-syncs. Event delivery is live except at a group boundary: the event that matures a group is yielded only after that group's Store transaction commits, so a slow store back-pressures the pipeline rather than silently falling behind.
 _Avoid_: finality, confirmations count, lag
 
 **Dialect**:
 The small, stateless set of SQL-text substitution facts that differ between the
 SQLite and PostgreSQL backends: the positional-placeholder syntax (`?` vs `$N`),
-the intra-block tie-breaker for a stable order (`rowid` vs `ctid`), the
+the intra-block tie-breaker (`rowid` vs `ctid` — approximate insertion order
+on an append-only table; `ctid` is not stable across a `VACUUM FULL`), the
 column-type keyword each `SqlType` maps to (the implicit `block_number` type
-falls out of this — INTEGER vs BIGINT), the monotonic-watermark upsert
-expression (`MAX` vs `GREATEST`), and the "nothing written yet" /
-undefined-table classification (driver message match vs SQLSTATE `42P01`). A
+falls out of this — INTEGER vs BIGINT), and the error classifications:
+"nothing written yet" / undefined-table (driver message match vs SQLSTATE
+`42P01`) and benign duplicate-object DDL races (PostgreSQL SQLSTATEs `42P07`,
+`42701`, `23505`; never on SQLite). Watermark monotonicity is not a Dialect
+concern — it lives in `Position::advance`; the upsert writes the advanced
+value verbatim. A
 trait with one adapter per backend (`SqliteDialect`, `PgDialect`); the
 query-shaping free functions, the write **Store** (generic over it,
 `SqlStore<DB, D>`), and the read serving backends (holding it as a value) all
@@ -166,12 +170,13 @@ _Avoid_: introspection, schema reader, information_schema (name the seam)
 ## Relationships
 
 - An **Engine** spawns one **Collector Driver** per **Collector**; each Driver owns one **Reconnect Policy** instance.
+- An **Engine** starts in a fixed order: executors and observers, then every **Strategy** receiver subscribed, then every Strategy synced and spawned, and only then the **Collector Drivers** — so no Collector (including a **Persisted Collector**'s replay) can broadcast before every consumer is draining. The remaining loss mode is the bounded ring itself: a consumer slower than production for more than the channel capacity lags and skips, warn-logged.
 - A **Merge** or **Chain** composite is one **Collector** to the **Engine**: its sources share one **Collector Driver** and one **Reconnect Policy** (one lifecycle). Register sources as separate Collectors instead when each should reconnect — and go **Fatal** — independently.
 - A **Collector Fallback** composite is one **Collector** to the **Engine**: mid-stream failover happens when the live stream ends and the **Collector Driver** re-subscribes — the combinator holds no health state, it just prefers the primary on every subscribe. Register sources separately if each should reconnect independently.
 - A **Reconnect Policy** counts consecutive stream failures and resets that count only when its **Collector Driver** reports a delivered event.
 - A **Persisted Collector** pairs one **Collector** (block-aware) with one Store; its subscription is the chain Replay → Backfill → Live Tail. The Live Tail's write lags the live edge by the **Confirmation Depth**, so a reorg shallower than that depth is corrected in the buffer rather than halting persistence (a deeper reorg still halts).
 - A **Persisted Collector** constructs one **Record** per subscription; every row written to or replayed from the Store passes through it.
-- A **Store** and the read-side serving backends share one **Dialect** (placeholder, tie-breaker, column type, monotonic-watermark upsert, undefined-table classification): the write side is generic over it (`SqlStore<DB, D>` owns the orchestration, the Dialect supplies the differing tokens), the read side holds it as a value. They do *not* share a **Catalog** — table enumeration stays per-backend because the catalogs are structurally different, and the write side has no catalog concern at all.
+- A **Store** and the read-side serving backends share one **Dialect** (placeholder, tie-breaker, column type, error classifications): the write side is generic over it (`SqlStore<DB, D>` owns the orchestration, the Dialect supplies the differing tokens), the read side holds it as a value. On PostgreSQL the two sides deliberately diverge on schema qualification: serving reads pin `public.`, matching their introspection, while the writer resolves via `search_path`. They do *not* share a **Catalog** — table enumeration stays per-backend because the catalogs are structurally different, and the write side has no catalog concern at all.
 - A **Fatal** verdict cancels the observe-only fatal token, then the root token shared by all **Collector**, **Strategy**, and **Executor** tasks; the binary observes the fatal token and decides to exit.
 - An **Engine** spawns one task per **Observer**, subscribed to both channels; an Observer has no feedback path into the pipeline.
 - The reliability wrappers (**Deadline**, **Retry**, **Fallback**, **Rate Limit**, **Circuit Breaker**, **Gated**) nest around one **Executor** and compose in any order, but order is meaningful: `retry` inside `fallback` retries the primary before failing over; `gated` outermost means a kill switch drops actions before any other layer sees them; `deadline` belongs innermost, so every queueing and waiting layer above it has already elapsed by the time the expiry check runs.

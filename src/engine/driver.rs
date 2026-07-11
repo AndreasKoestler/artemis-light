@@ -57,7 +57,17 @@ pub(crate) async fn run<E>(
 
     let mut policy = ReconnectPolicy::new(config);
     loop {
-        let mut stream = match collector.subscribe().await {
+        // Subscribe can stall indefinitely (a hung RPC, a long DB replay), so
+        // it is raced against the driver's token like every other await here.
+        let subscribed = tokio::select! {
+            biased;
+            _ = child.cancelled() => {
+                info!("collector shutting down");
+                return;
+            }
+            subscribed = collector.subscribe() => subscribed,
+        };
+        let mut stream = match subscribed {
             Ok(s) => s,
             Err(e) => {
                 error!("collector stream creation failed: {e}");
@@ -245,6 +255,38 @@ mod test {
         root.cancel();
 
         handle.await.unwrap();
+        assert!(
+            !fatal.is_cancelled(),
+            "a caller-initiated shutdown is not a fatal one"
+        );
+    }
+
+    /// Cancellation during a subscribe that never resolves (a hung RPC, a
+    /// stalled DB replay) must still shut the driver down promptly — subscribe
+    /// is raced against the driver's own token like every other await.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_hung_subscribe_shuts_down() {
+        /// A collector whose `subscribe` never resolves.
+        struct HungSubscribe;
+
+        #[async_trait]
+        impl Collector<u32> for HungSubscribe {
+            async fn subscribe(&self) -> Result<CollectorStream<'_, u32>> {
+                futures::future::pending().await
+            }
+        }
+
+        let (tx, _rx) = broadcast::channel::<u32>(16);
+        let (toks, fatal, root) = tokens();
+
+        let handle = tokio::spawn(run(Box::new(HungSubscribe), config(2), tx, toks));
+        tokio::task::yield_now().await;
+        root.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("driver must exit promptly while subscribe hangs")
+            .unwrap();
         assert!(
             !fatal.is_cancelled(),
             "a caller-initiated shutdown is not a fatal one"

@@ -46,7 +46,8 @@ pub struct MergeAll<E> {
 /// contract as [`Merge`]: eager subscribe, any failure fails the whole
 /// subscribe, the composite stream ends only when every source stream has
 /// ended, and the sources share one lifecycle (one Collector Driver, one
-/// Reconnect Policy).
+/// Reconnect Policy). An empty set fails subscribe outright, like
+/// [`fallback_all`](super::fallback_all).
 pub fn merge_all<E>(sources: Vec<Box<dyn Collector<E>>>) -> MergeAll<E> {
     MergeAll { sources }
 }
@@ -54,10 +55,34 @@ pub fn merge_all<E>(sources: Vec<Box<dyn Collector<E>>>) -> MergeAll<E> {
 #[async_trait]
 impl<E: Send + Sync + 'static> Collector<E> for MergeAll<E> {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
+        // An empty composite would yield an instantly-ended stream, which the
+        // reconnect driver treats as a lost stream — fail loudly instead.
+        if self.sources.is_empty() {
+            anyhow::bail!("merge_all has no sources; nothing to subscribe to");
+        }
         let mut streams = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
             streams.push(source.subscribe().await?);
         }
         Ok(Box::pin(select_all(streams)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty composite would yield an instantly-ended stream, which the
+    /// reconnect driver treats as a lost stream — reconnect-looping to Fatal
+    /// instead of naming the misconfiguration. Fail subscribe instead, like
+    /// [`fallback_all`](super::super::fallback_all).
+    #[tokio::test]
+    async fn merge_all_with_no_sources_fails_subscribe() {
+        let sources: Vec<Box<dyn Collector<i32>>> = vec![];
+        let err = match merge_all(sources).subscribe().await {
+            Ok(_) => panic!("an empty merge_all must fail subscribe, not yield an ended stream"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("no sources"), "got: {err:#}");
     }
 }

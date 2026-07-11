@@ -1,7 +1,7 @@
 //! SQLite catalog introspection: table listing, column schema, and the
 //! validated-table guard. There is no runtime table catalogue in the
 //! persistence layer, so the serving layer reads SQLite's own `sqlite_master`
-//! and `PRAGMA table_info` (serving-layer.TABLES.1/.2/.3).
+//! and `PRAGMA table_info`.
 
 use sqlx::{Row, SqlitePool};
 
@@ -28,8 +28,7 @@ pub(crate) async fn list_tables(pool: &SqlitePool) -> anyhow::Result<Vec<String>
 
 /// The validated-table guard: true only when `table` is a real event table in
 /// the catalog (not internal, not `sqlite_%`). Callers MUST check this before
-/// interpolating a table name into any SQL (serving-layer.TABLES.3 / injection
-/// guard).
+/// interpolating a table name into any SQL (injection guard).
 ///
 /// There is a check-then-use gap between this guard and the subsequent query,
 /// but it is benign: the persistence layer only ever *creates* event tables,
@@ -48,8 +47,8 @@ pub(crate) async fn table_exists(pool: &SqlitePool, table: &str) -> anyhow::Resu
 }
 
 /// Normalise a SQLite declared column type to the canonical serving type
-/// keyword, so `/schema` responses are identical across backends
-/// (postgres-store.SERVE.3). `NUMERIC` columns decode to text on both backends
+/// keyword, so `/schema` responses are identical across backends.
+/// `NUMERIC` columns decode to text on both backends
 /// (a `Numeric` value round-trips as `SqlValue::Text`), and the PostgreSQL
 /// store stores them as `TEXT`, so they report `TEXT` here rather than the raw
 /// `NUMERIC` affinity declared in `CREATE TABLE`. The remaining writer types
@@ -62,8 +61,8 @@ fn normalize_type(declared: &str) -> String {
 }
 
 /// Column `(name, type)` pairs for `table`, in declared order, from
-/// `PRAGMA table_info` (serving-layer.TABLES.2). `table` MUST have passed
-/// [`table_exists`] first; it is quoted defensively before interpolation.
+/// `PRAGMA table_info`. `table` MUST have passed [`table_exists`] first; it is
+/// quoted defensively before interpolation.
 pub(crate) async fn table_columns(
     pool: &SqlitePool,
     table: &str,
@@ -82,8 +81,8 @@ pub(crate) async fn table_columns(
 }
 
 /// Per-table watermarks `(table_name, last_block)` from `_artemis_progress`,
-/// sorted by table name (serving-layer.STATUS.1). A missing progress table
-/// (nothing written yet) yields an empty list rather than an error.
+/// sorted by table name. A missing progress table (nothing written yet) yields
+/// an empty list rather than an error.
 pub(crate) async fn table_watermarks(pool: &SqlitePool) -> anyhow::Result<Vec<(String, i64)>> {
     let rows = match sqlx::query(
         "SELECT table_name, last_block FROM _artemis_progress ORDER BY table_name",
@@ -169,7 +168,7 @@ mod tests {
     async fn table_columns_reports_numeric_as_text() {
         // A `Numeric` column decodes to text and the PostgreSQL store stores it
         // as TEXT, so the SQLite `/schema` path must report TEXT too — otherwise
-        // the two backends would disagree on the column type (SERVE.3).
+        // the two backends would disagree on the column type.
         let pool = mem_pool().await;
         sqlx::query(
             "CREATE TABLE evt (block_number INTEGER NOT NULL, amount NUMERIC, \

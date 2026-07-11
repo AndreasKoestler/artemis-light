@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 
@@ -77,6 +77,14 @@ struct StatusResponse {
     tables: Vec<TableStatus>,
 }
 
+/// Render a database failure as the opaque 500, logging the full error chain
+/// server-side first — the client sees only "database error" (no internals),
+/// the operator's logs see why.
+fn database_error(what: &str, e: anyhow::Error) -> Response {
+    tracing::error!("serving: {what} failed: {e:#}");
+    ServingError::Database(e).into_response()
+}
+
 /// Build the serving-layer router backed by `state`.
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
@@ -89,24 +97,27 @@ pub(crate) fn router(state: AppState) -> Router {
 }
 
 /// `GET /health` — liveness probe; 200 `{"status":"ok"}` when the database is
-/// reachable, 503 otherwise (serving-layer.STATUS.2).
+/// reachable, 503 otherwise.
 pub async fn get_health_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.backend.health().await {
         Ok(()) => Json(HealthResponse { status: "ok" }).into_response(),
-        Err(_) => ServingError::Unavailable.into_response(),
+        Err(e) => {
+            tracing::warn!("serving: health probe failed, reporting unavailable: {e:#}");
+            ServingError::Unavailable.into_response()
+        }
     }
 }
 
-/// `GET /tables` — list the persisted event tables (serving-layer.TABLES.1/.3).
+/// `GET /tables` — list the persisted event tables.
 pub async fn list_tables_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.backend.list_tables().await {
         Ok(tables) => Json(TablesResponse { tables }).into_response(),
-        Err(e) => ServingError::Database(e).into_response(),
+        Err(e) => database_error("table listing", e),
     }
 }
 
-/// `GET /tables/{table}/schema` — column names and types for a known table
-/// (serving-layer.TABLES.2/.3); 404 `UnknownTable` for an absent table.
+/// `GET /tables/{table}/schema` — column names and types for a known table;
+/// 404 `UnknownTable` for an absent table.
 pub async fn get_schema_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
@@ -114,7 +125,7 @@ pub async fn get_schema_handler(
     match state.backend.table_exists(&table).await {
         Ok(true) => {}
         Ok(false) => return ServingError::UnknownTable(table).into_response(),
-        Err(e) => return ServingError::Database(e).into_response(),
+        Err(e) => return database_error("table existence check", e),
     }
     match state.backend.table_columns(&table).await {
         Ok(cols) => Json(SchemaResponse {
@@ -125,13 +136,13 @@ pub async fn get_schema_handler(
                 .collect(),
         })
         .into_response(),
-        Err(e) => ServingError::Database(e).into_response(),
+        Err(e) => database_error("schema read", e),
     }
 }
 
 /// `GET /tables/{table}/rows` — paged, block-range-filtered rows as JSON in
-/// ascending block order (serving-layer.ROWS.1/.2/.3/.4); 404 for unknown table,
-/// 400 for invalid query parameters.
+/// ascending block order; 404 for unknown table, 400 for invalid query
+/// parameters.
 pub async fn query_rows_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
@@ -140,7 +151,7 @@ pub async fn query_rows_handler(
     match state.backend.table_exists(&table).await {
         Ok(true) => {}
         Ok(false) => return ServingError::UnknownTable(table).into_response(),
-        Err(e) => return ServingError::Database(e).into_response(),
+        Err(e) => return database_error("table existence check", e),
     }
     let bounds = match params.resolve(state.default_limit, state.max_limit) {
         Ok(b) => b,
@@ -153,12 +164,12 @@ pub async fn query_rows_handler(
             offset: bounds.offset,
         })
         .into_response(),
-        Err(e) => ServingError::Database(e).into_response(),
+        Err(e) => database_error("row query", e),
     }
 }
 
-/// `GET /status` — per-table last-processed block from `_artemis_progress`
-/// (serving-layer.STATUS.1); empty list before anything is written.
+/// `GET /status` — per-table last-processed block from `_artemis_progress`;
+/// empty list before anything is written.
 pub async fn get_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.backend.watermarks().await {
         Ok(watermarks) => Json(StatusResponse {
@@ -171,6 +182,6 @@ pub async fn get_status_handler(State(state): State<AppState>) -> impl IntoRespo
                 .collect(),
         })
         .into_response(),
-        Err(e) => ServingError::Database(e).into_response(),
+        Err(e) => database_error("watermark read", e),
     }
 }

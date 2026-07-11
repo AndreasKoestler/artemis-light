@@ -2,10 +2,9 @@
 //!
 //! The route handlers are written against the [`ServingBackend`] trait rather
 //! than a concrete pool, so the same routes and JSON responses can be served
-//! over different storage engines selected by URL scheme
-//! (postgres-store.SERVE.1/.2/.3). [`SqliteBackend`] is the SQLite
-//! implementation; it delegates to the existing SQLite catalog/rows/json
-//! helpers, so SQLite serving behaviour is unchanged (postgres-store.FEATURE.2).
+//! over different storage engines selected by URL scheme. [`SqliteBackend`] is
+//! the SQLite implementation; it delegates to the existing SQLite
+//! catalog/rows/json helpers.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -40,7 +39,7 @@ pub(crate) trait ServingBackend: Send + Sync {
 }
 
 /// A [`ServingBackend`] backed by a read-only SQLite pool, delegating to the
-/// SQLite catalog/rows helpers so behaviour is byte-for-byte unchanged.
+/// SQLite catalog/rows helpers.
 pub(crate) struct SqliteBackend {
     pool: SqlitePool,
 }
@@ -88,8 +87,10 @@ impl ServingBackend for SqliteBackend {
 
 /// A [`ServingBackend`] backed by a read-only PostgreSQL pool. Introspects via
 /// `information_schema`, decodes `PgRow` cells to the same JSON shape as the
-/// SQLite backend (postgres-store.SERVE.1/.3), and enforces a read-only session
-/// so the serving layer cannot mutate the archive (postgres-store.SERVE.4).
+/// SQLite backend, and enforces a read-only session so the serving layer
+/// cannot mutate the archive. Reads pin the `public` schema; the writer
+/// intentionally writes unqualified via the session `search_path` (see
+/// [`PostgresStore`](crate::persistence::PostgresStore)).
 /// Compiled only when both `serving` and `postgres` are enabled.
 #[cfg(feature = "postgres")]
 pub(crate) use pg::PgBackend;
@@ -104,7 +105,39 @@ mod pg {
     use super::super::json;
     use super::super::rows::Bounds;
     use super::ServingBackend;
-    use crate::persistence::{Dialect, PROGRESS_TABLE, PgDialect, range_query};
+    use crate::persistence::{Dialect, PROGRESS_TABLE, PgDialect, quote_ident, range_query};
+
+    /// The `information_schema` existence probe behind
+    /// [`ServingBackend::table_exists`]. Filters to `BASE TABLE` exactly like
+    /// `list_tables`, so a view can never pass the guard while being invisible
+    /// in `/tables`.
+    const TABLE_EXISTS_SQL: &str = "SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+         AND table_name = $1 AND table_name <> $2";
+
+    /// The watermark query behind [`ServingBackend::watermarks`],
+    /// schema-qualified like [`range_query_public`].
+    fn watermarks_sql() -> String {
+        format!("SELECT table_name, last_block FROM public.{PROGRESS_TABLE} ORDER BY table_name")
+    }
+
+    /// The paged range query behind [`ServingBackend::query_rows`]: the shared
+    /// [`range_query`] shape with the table reference pinned to the `public`
+    /// schema. Introspection filters `table_schema = 'public'`, so the data
+    /// read must resolve the same relation regardless of the pool's
+    /// `search_path` (an injected pool may front another schema). Note the
+    /// writer intentionally writes unqualified via the session `search_path`
+    /// (documented on `PostgresStore`); pinning here is read-side only.
+    fn range_query_public(table: &str) -> String {
+        let ident = quote_ident(table);
+        // `range_query` interpolates the quoted table exactly once, in its
+        // FROM clause; qualify that occurrence.
+        range_query(table, &PgDialect).replacen(
+            &format!("FROM {ident}"),
+            &format!("FROM public.{ident}"),
+            1,
+        )
+    }
 
     /// A read-only PostgreSQL serving backend.
     pub(crate) struct PgBackend {
@@ -114,8 +147,7 @@ mod pg {
     impl PgBackend {
         /// Open a read-only pool to `url`. Every pooled connection runs
         /// `SET default_transaction_read_only = on` so writes through the
-        /// serving layer are rejected at the session level
-        /// (postgres-store.SERVE.4).
+        /// serving layer are rejected at the session level.
         pub(crate) async fn connect(url: &str, max_connections: u32) -> anyhow::Result<Self> {
             let pool = PgPoolOptions::new()
                 .max_connections(max_connections)
@@ -138,8 +170,7 @@ mod pg {
         /// Unlike [`connect`](Self::connect), this installs **no**
         /// `after_connect` hook (no `SET default_transaction_read_only = on`)
         /// and does no connect round-trip: the borrowed pool is used as-is and
-        /// never reconfigured (inject-pool.SERVING.1, inject-pool.OWNERSHIP.2).
-        /// Stays `pub(crate)` — not public API (§3 Option A).
+        /// never reconfigured.
         pub(crate) fn with_pool(pool: PgPool) -> Self {
             Self { pool }
         }
@@ -153,8 +184,8 @@ mod pg {
     /// Normalise a PostgreSQL `information_schema` `data_type` to the same
     /// column-type keyword the SQLite backend reports, so `/schema` responses
     /// match across backends and the keyword drives cell decoding uniformly.
-    /// `Numeric` columns are stored as `TEXT` (postgres-store.TYPES.1), so a
-    /// PostgreSQL-served Numeric column reports `TEXT` here.
+    /// `Numeric` columns are stored as `TEXT`, so a PostgreSQL-served Numeric
+    /// column reports `TEXT` here.
     fn normalize_type(data_type: &str) -> String {
         match data_type {
             "bigint" => "INTEGER".to_string(),
@@ -167,8 +198,8 @@ mod pg {
 
     // Extract typed, nullable cells from a `PgRow` so the shared
     // [`json::row_to_json`] decoder renders PostgreSQL rows identically to
-    // SQLite (postgres-store.SERVE.3). The decode *rule* lives in `json`; the
-    // macro supplies only the per-type extraction, shared with `SqliteRow`.
+    // SQLite. The decode *rule* lives in `json`; the macro supplies only the
+    // per-type extraction, shared with `SqliteRow`.
     json::impl_cell!(PgRow);
 
     #[async_trait]
@@ -194,14 +225,11 @@ mod pg {
         }
 
         async fn table_exists(&self, table: &str) -> anyhow::Result<bool> {
-            let row = sqlx::query(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = 'public' AND table_name = $1 AND table_name <> $2",
-            )
-            .bind(table)
-            .bind(PROGRESS_TABLE)
-            .fetch_optional(&self.pool)
-            .await?;
+            let row = sqlx::query(TABLE_EXISTS_SQL)
+                .bind(table)
+                .bind(PROGRESS_TABLE)
+                .fetch_optional(&self.pool)
+                .await?;
             Ok(row.is_some())
         }
 
@@ -230,7 +258,7 @@ mod pg {
             bounds: &Bounds,
         ) -> anyhow::Result<Vec<Map<String, Value>>> {
             let columns = self.table_columns(table).await?;
-            let sql = range_query(table, &PgDialect);
+            let sql = range_query_public(table);
             let rows = sqlx::query(&sql)
                 .bind(bounds.from_block as i64)
                 .bind(bounds.to_block as i64)
@@ -244,12 +272,7 @@ mod pg {
         }
 
         async fn watermarks(&self) -> anyhow::Result<Vec<(String, i64)>> {
-            let rows = match sqlx::query(&format!(
-                "SELECT table_name, last_block FROM {PROGRESS_TABLE} ORDER BY table_name"
-            ))
-            .fetch_all(&self.pool)
-            .await
-            {
+            let rows = match sqlx::query(&watermarks_sql()).fetch_all(&self.pool).await {
                 Ok(rows) => rows,
                 // Nothing written yet: the progress table does not exist.
                 Err(e) if PgDialect.is_undefined_table(&e) => return Ok(Vec::new()),
@@ -266,6 +289,47 @@ mod pg {
                 .collect())
         }
     }
+
+    /// SQL-string tests for the PostgreSQL backend's queries; no live server
+    /// needed (the Docker-backed behavioural tests live in `pg_backend_tests`).
+    #[cfg(test)]
+    mod sql_tests {
+        use super::*;
+
+        /// The existence guard must apply the same `BASE TABLE` filter as
+        /// `list_tables`, so a view can never pass the guard while being
+        /// invisible in `/tables` (and then break on the `ctid` tie-breaker).
+        #[test]
+        fn table_exists_filters_to_base_tables() {
+            assert!(
+                TABLE_EXISTS_SQL.contains("table_type = 'BASE TABLE'"),
+                "table_exists must filter to BASE TABLE like list_tables, got: {TABLE_EXISTS_SQL}"
+            );
+        }
+
+        /// Data queries must pin the `public` schema so an injected pool whose
+        /// `search_path` fronts another schema still reads the relation that
+        /// introspection (which filters `table_schema = 'public'`) validated.
+        #[test]
+        fn data_queries_are_schema_qualified() {
+            let sql = range_query_public("transfer");
+            assert!(
+                sql.contains("FROM public.\"transfer\""),
+                "range query must read public.\"transfer\", got: {sql}"
+            );
+            // The table name stays quoted; only the FROM clause is qualified.
+            let quoted = range_query_public("a\"b");
+            assert!(
+                quoted.contains("FROM public.\"a\"\"b\""),
+                "quoting must survive qualification, got: {quoted}"
+            );
+            let wm = watermarks_sql();
+            assert!(
+                wm.contains(&format!("FROM public.{PROGRESS_TABLE}")),
+                "watermark query must read public.{PROGRESS_TABLE}, got: {wm}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "postgres"))]
@@ -277,7 +341,7 @@ mod pg_backend_tests {
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
     /// Every connection in the PostgreSQL serving pool is read-only, so a write
-    /// issued through it fails at the session level (postgres-store.SERVE.4).
+    /// issued through it fails at the session level.
     #[tokio::test]
     async fn read_only_serving_pool_rejects_writes() {
         let node = Postgres::default()
@@ -300,8 +364,8 @@ mod pg_backend_tests {
     /// The PostgreSQL backend decodes each column type to the same JSON shape as
     /// the SQLite backend (the shared `json::row_to_json` rule, exercised here
     /// through `PgRow`): integer → number, real → number, bytea → `0x`-hex, NULL
-    /// → null, and `_payload` → nested JSON (postgres-store.SERVE.3). The SQLite
-    /// twin is `serving::json::tests::converts_cells_payload_and_blob`.
+    /// → null, and `_payload` → nested JSON. The SQLite twin is
+    /// `serving::json::tests::converts_cells_payload_and_blob`.
     #[tokio::test]
     async fn pg_decodes_each_column_type_to_the_shared_json_shape() {
         let node = Postgres::default()

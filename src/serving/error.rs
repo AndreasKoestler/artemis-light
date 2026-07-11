@@ -14,9 +14,9 @@ pub struct ErrorBody {
 /// Errors the serving layer can surface, each mapped to an HTTP status.
 #[derive(Debug)]
 pub enum ServingError {
-    /// Requested table is not present in the catalog → 404 (serving-layer.ERRORS.1).
+    /// Requested table is not present in the catalog → 404.
     UnknownTable(String),
-    /// A query parameter failed validation → 400 (serving-layer.ERRORS.2).
+    /// A query parameter failed validation → 400.
     InvalidQuery(String),
     /// A read against the database failed → 500.
     Database(anyhow::Error),
