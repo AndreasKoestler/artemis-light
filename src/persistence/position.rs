@@ -245,9 +245,13 @@ impl Position for TimeFrontier {
     }
 
     fn encode(&self) -> String {
-        // Compact JSON, e.g. {"time_ms":2000,"seen":["0xc1"]}. Serializing a
-        // struct of a u64 and a BTreeSet<String> to JSON cannot fail.
-        serde_json::to_string(self).expect("TimeFrontier serializes to JSON")
+        // Compact JSON, e.g. {"time_ms":2000,"seen":["0xc1"]}. `to_string` only
+        // fails for a map with non-string keys or a `Serialize` impl that
+        // errors — neither applies to `{u64, BTreeSet<String>}` — so the
+        // fallback below is unreachable in practice; it exists so encoding
+        // itself can never panic.
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| format!("{{\"time_ms\":{},\"seen\":[]}}", self.time_ms))
     }
 
     fn decode(encoded: &str) -> Result<Self> {

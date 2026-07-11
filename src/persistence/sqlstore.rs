@@ -357,14 +357,15 @@ where
         // partial chunk needs its own.
         let params_per_row = 1 + schema.columns.len();
         let chunk_rows = rows_per_chunk(params_per_row);
-        let full_chunk_insert = (rows.len() >= chunk_rows)
-            .then(|| query::insert_statement(schema, &self.dialect, chunk_rows));
+        let mut full_chunk_insert: Option<String> = None;
         for chunk in rows.chunks(chunk_rows) {
             let partial_chunk_insert;
             let insert = if chunk.len() == chunk_rows {
                 full_chunk_insert
-                    .as_deref()
-                    .expect("a full chunk implies the cached statement")
+                    .get_or_insert_with(|| {
+                        query::insert_statement(schema, &self.dialect, chunk_rows)
+                    })
+                    .as_str()
             } else {
                 partial_chunk_insert = query::insert_statement(schema, &self.dialect, chunk.len());
                 &partial_chunk_insert

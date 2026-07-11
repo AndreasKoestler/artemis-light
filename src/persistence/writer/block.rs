@@ -77,7 +77,8 @@ where
             self.buffer.clear();
             return true;
         };
-        if let Some(cur_key) = self.current.as_ref().map(Position::sort_key) {
+        if let Some(cur) = self.current.clone() {
+            let cur_key = cur.sort_key();
             let pos_key = position.sort_key();
             // A backwards position means the open group's completeness can no
             // longer be trusted: flushing it would advance the stored watermark
@@ -87,7 +88,6 @@ where
             // above): the single-group writer cannot reorder, so it halts too —
             // the watermark stays put and a restart's backfill re-fetches it.
             if pos_key < cur_key {
-                let cur = self.current.as_ref().expect("current is Some");
                 self.core.fail(format_args!(
                     "position {position:?} arrived after {cur:?} (reorg or \
                      unordered source)"
@@ -99,7 +99,7 @@ where
             // flush leaves this event's group unwritable without a gap, so stop
             // (the buffer was already taken, so nothing is left to drop).
             if pos_key > cur_key {
-                let cur = self.current.take().expect("current is Some");
+                self.current = None;
                 if !self
                     .core
                     .flush(cur.clone(), std::mem::take(&mut self.buffer))

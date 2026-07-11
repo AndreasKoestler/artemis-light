@@ -298,7 +298,14 @@ impl<M: Provider> MempoolExecutor<M> {
                 .with_timeout(Some(policy.confirmation_timeout))
                 .watch()
                 .await;
-            match schedule.next_step(WatchOutcome::classify(&watched)) {
+            let outcome = WatchOutcome::classify(&watched);
+            // `NextStep::Rewatch` only follows `WatchOutcome::TransportError`,
+            // which `classify` only returns for `watched: Err(_)` — so
+            // `watched.err()` below is always `Some` on that branch. Matched
+            // explicitly rather than `expect`-ed so a future change to that
+            // invariant surfaces as a returned error, not a panic.
+            let transport_err = watched.err();
+            match schedule.next_step(outcome) {
                 NextStep::Confirmed => return Ok(()),
                 NextStep::GiveUp => {
                     if self.any_mined(&sent).await {
@@ -310,11 +317,17 @@ impl<M: Provider> MempoolExecutor<M> {
                     ));
                 }
                 NextStep::Rewatch => {
+                    let Some(err) = transport_err else {
+                        return Err(anyhow::anyhow!(
+                            "rewatch requested without a transport error"
+                        ));
+                    };
+                    let Some(&hash) = sent.last() else {
+                        return Err(anyhow::anyhow!("no transaction hash recorded to re-watch"));
+                    };
                     // `watch` consumed the builder (alloy's
                     // `PendingTransactionBuilder` is not `Clone`); mint a fresh
                     // watcher on the same hash rather than resending.
-                    let err = watched.expect_err("Rewatch only follows a failed watch");
-                    let hash = *sent.last().expect("at least the original was sent");
                     tracing::warn!(%hash, "confirmation watch failed ({err:#}); re-watching");
                     pending = PendingTransactionBuilder::new(self.client.root().clone(), hash);
                 }
