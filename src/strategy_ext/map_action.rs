@@ -11,8 +11,6 @@ pub struct MapAction<E, A, F> {
 }
 
 impl<E, A, F> MapAction<E, A, F> {
-    /// Creates a new `MapAction` wrapping `strategy` with the lifting
-    /// function `f`.
     pub fn new(strategy: Box<dyn Strategy<E, A>>, f: F) -> Self {
         Self { strategy, f }
     }

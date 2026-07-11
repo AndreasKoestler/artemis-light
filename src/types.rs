@@ -13,12 +13,6 @@ pub type ActionStream<'a, A> = Pin<Box<dyn Stream<Item = A> + Send + 'a>>;
 pub trait Collector<E>: Send + Sync {
     /// Returns the core event stream for the collector.
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>>;
-
-    /// Deprecated alias for [`subscribe`](Collector::subscribe).
-    #[deprecated(since = "0.1.0", note = "Use `subscribe` instead")]
-    async fn get_event_stream(&self) -> Result<CollectorStream<'_, E>> {
-        self.subscribe().await
-    }
 }
 
 /// Strategy trait, which defines an agent's decision logic: events in,

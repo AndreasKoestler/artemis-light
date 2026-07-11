@@ -208,18 +208,13 @@ impl Position for TimeFrontier {
     }
 
     fn advance(prev: Option<Self>, next: Self) -> Self {
-        // Fold the newly-flushed frontier into the stored watermark — the max
-        // instant wins and the seen-set unions only within that instant, so
-        // stale identities below the boundary are dropped.
+        // See the "Frontier laws" on the type doc.
         let Some(prev) = prev else {
             return next;
         };
         match next.time_ms.cmp(&prev.time_ms) {
-            // A strictly later instant wins and drops the stale seen-set.
             std::cmp::Ordering::Greater => next,
-            // An earlier instant is a no-op: the watermark never regresses.
             std::cmp::Ordering::Less => prev,
-            // The same instant: union the seen-sets.
             std::cmp::Ordering::Equal => {
                 let mut seen = prev.seen;
                 seen.extend(next.seen);
@@ -320,7 +315,7 @@ mod tests {
         assert_eq!(BlockPosition(u64::MAX).resume_key(), u64::MAX);
     }
 
-    // errorPath: a non-numeric column value fails loudly (anyhow Err), never a
+    // A non-numeric column value fails loudly (anyhow Err), never a
     // panic and never a silent genesis re-sync.
     #[test]
     fn decode_rejects_non_numeric() {
@@ -338,7 +333,7 @@ mod tests {
     }
 
     // A strictly later instant wins and drops the stale seen-set.
-    // Discriminating: a "union across all history" model would
+    // A "union across all history" model would
     // keep 0xa1/0xa2, and a "keep prev" model would keep instant 1000 — both
     // ruled out by asserting exactly (2000, {0xc1}).
     #[test]
@@ -354,7 +349,7 @@ mod tests {
     }
 
     // An equal instant unions the seen-sets.
-    // Discriminating: "later/next wins dropping seen" would give {0xa2} and
+    // A "later/next wins dropping seen" model would give {0xa2} and
     // "keep prev" would give {0xa1}; the union asserts both survive.
     #[test]
     fn frontier_advance_equal_instant_unions() {
@@ -364,7 +359,7 @@ mod tests {
     }
 
     // An earlier instant is a no-op (monotone).
-    // Discriminating: a "next wins" model would regress the watermark to
+    // A "next wins" model would regress the watermark to
     // (1000, {0xa1}); the assertion pins it at the earlier prev value.
     #[test]
     fn frontier_advance_earlier_is_noop() {
@@ -385,8 +380,7 @@ mod tests {
     }
 
     // decode∘encode == id for a rich, multi-element seen-set. This is the
-    // round-trip that MalformedStoredPosition relies on at
-    // subscribe; a lossy encoding of the set would fail this.
+    // round-trip that a resumed subscribe relies on; a lossy encoding of the set would fail this.
     #[test]
     fn frontier_round_trips_multi_element_seen_set() {
         let position = frontier(2500, &["0xc1", "0xc2", "0xd1"]);
@@ -447,8 +441,8 @@ mod tests {
         assert_eq!(TimeFrontier::REOBSERVATION, Reobservation::Dedupe);
     }
 
-    // errorPath: invalid JSON fails loudly (anyhow Err) — the same loud-failure
-    // contract MalformedStoredPosition relies on at subscribe.
+    // Invalid JSON fails loudly (anyhow Err) — the same loud-failure
+    // contract a resumed subscribe relies on.
     #[test]
     fn frontier_decode_rejects_invalid_json() {
         assert!(TimeFrontier::decode("not-json").is_err());

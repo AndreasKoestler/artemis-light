@@ -17,6 +17,7 @@ pub use merge::*;
 /// This trait adds methods for transforming and combining collector streams:
 pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     /// Map events from type `E` to type `E2` using a function `f`.
+    #[must_use]
     fn map<F, E2>(self, f: F) -> Map<E, F>
     where
         F: Fn(E) -> E2 + Send + Sync + Clone + 'static,
@@ -25,6 +26,7 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     }
 
     /// Filter and transform events from type `E` to type `E2` using a function `f`.
+    #[must_use]
     fn filter_map<F, E2>(self, f: F) -> FilterMap<E, F>
     where
         F: Fn(E) -> Option<E2> + Send + Sync + Clone + 'static,
@@ -34,6 +36,7 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
 
     /// Interleave this collector with `other`: events arrive in whichever
     /// order the sources produce them. See [`Merge`] for the full contract.
+    #[must_use]
     fn merge<C>(self, other: C) -> Merge<Self, C>
     where
         C: Collector<E> + Send + Sync + 'static,
@@ -43,6 +46,7 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
 
     /// Deliver all of this collector's events, then all of `other`'s. Both
     /// subscribe eagerly. See [`Chain`] for the full contract.
+    #[must_use]
     fn chain<C>(self, other: C) -> Chain<Self, C>
     where
         C: Collector<E> + Send + Sync + 'static,
@@ -53,6 +57,7 @@ pub trait CollectorExt<E>: Collector<E> + Send + Sync + Sized + 'static {
     /// Subscribe to this collector; if its subscribe fails, fall back to
     /// `other`. Prefers this collector on every (re)subscribe, and subscribes
     /// `other` only when this one fails. See [`Fallback`] for the full contract.
+    #[must_use]
     fn fallback<C>(self, other: C) -> Fallback<Self, C>
     where
         C: Collector<E> + Send + Sync + 'static,

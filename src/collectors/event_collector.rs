@@ -1,5 +1,5 @@
 use crate::collectors::fallback::subscribe_or_poll;
-use crate::persistence::{BlockPosition, PersistableCollector};
+use crate::persistence::{BlockPosition, Indexed, PersistableCollector};
 use crate::types::{Collector, CollectorStream};
 use alloy::{contract::Event, providers::Provider, rpc::types::Log, sol_types::SolEvent};
 use anyhow::Result;
@@ -18,26 +18,36 @@ impl<P, E> EventCollector<P, E> {
     }
 }
 
-/// The `(block, event)` to deliver for one decoded log, or `None` to skip it.
+/// The live-stream item for one decoded log, or `None` to skip it.
 ///
 /// A log re-sent with `removed: true` is a reorg *retraction*: the node is
 /// telling us the event no longer happened. Delivering it as a fresh event
 /// would hand strategies a second occurrence — and persist a duplicate row
-/// that replays forever after. A log with no block number cannot be indexed.
-fn indexed_event<E>(event: E, log: &alloy::rpc::types::Log) -> Option<(u64, E)> {
-    if log.removed {
+/// that replays forever after — so it becomes an [`Indexed::Retract`] the
+/// persistence window uses to drop the orphaned buffered rows (the only signal
+/// a same-height reorg gives). A log with no block number cannot be indexed.
+fn live_item<E>(event: E, log: &alloy::rpc::types::Log) -> Option<Indexed<BlockPosition, E>> {
+    let Some(block) = log.block_number else {
         tracing::warn!(
-            block = log.block_number,
-            "skipping reorged (removed) event log"
+            removed = log.removed,
+            "Event log missing block number; skipping"
         );
         return None;
+    };
+    if log.removed {
+        tracing::warn!(block, "reorged (removed) event log: retracting");
+        return Some(Indexed::Retract(BlockPosition(block)));
     }
-    match log.block_number {
-        Some(block) => Some((block, event)),
-        None => {
-            tracing::warn!("Event log missing block number; skipping");
-            None
-        }
+    Some(Indexed::Event(BlockPosition(block), event))
+}
+
+/// The `(block, event)` for one decoded *historical* log, or `None` to skip
+/// it. A `query_range` snapshot never carries retractions — a removed log
+/// there is simply not part of the canonical range — so it is dropped.
+fn indexed_event<E>(event: E, log: &alloy::rpc::types::Log) -> Option<(u64, E)> {
+    match live_item(event, log)? {
+        Indexed::Event(position, event) => Some((position.0, event)),
+        Indexed::Retract(_) => None,
     }
 }
 
@@ -71,14 +81,14 @@ where
         Ok(Box::pin(self.event.watch().await?.into_stream()))
     }
 
-    /// The decoded, reorg-filtered `(block, event)` stream behind both
-    /// `subscribe` and `subscribe_indexed`. The single site that drops decode
-    /// failures and reorg retractions (via [`indexed_event`]); the live
-    /// `subscribe` projects the block number away, persistence keeps it.
-    async fn indexed_stream(&self) -> Result<CollectorStream<'_, (u64, E)>> {
+    /// The decoded live stream behind both `subscribe` and
+    /// `subscribe_indexed`: positioned events plus reorg retractions (via
+    /// [`live_item`]). The single site that drops decode failures; the live
+    /// `subscribe` keeps only events, persistence consumes retractions too.
+    async fn indexed_stream(&self) -> Result<CollectorStream<'_, Indexed<BlockPosition, E>>> {
         let stream = self.raw_stream().await?;
         let stream = stream.filter_map(|el| match el {
-            Ok((event, log)) => indexed_event(event, &log),
+            Ok((event, log)) => live_item(event, &log),
             Err(e) => {
                 tracing::warn!("Failed to decode event log: {}", e);
                 None
@@ -88,7 +98,6 @@ where
     }
 }
 
-/// Implementation of the [Collector](Collector) trait for the [EventCollector](EventCollector).
 #[async_trait]
 impl<P, E> Collector<E> for EventCollector<P, E>
 where
@@ -96,7 +105,12 @@ where
     E: SolEvent + Send + Sync,
 {
     async fn subscribe(&self) -> Result<CollectorStream<'_, E>> {
-        let stream = self.indexed_stream().await?.map(|(_, event)| event);
+        // Retractions cannot be delivered to strategies (an event cannot be
+        // un-happened downstream); only fresh events flow.
+        let stream = self.indexed_stream().await?.filter_map(|item| match item {
+            Indexed::Event(_, event) => Some(event),
+            Indexed::Retract(_) => None,
+        });
         Ok(Box::pin(stream))
     }
 }
@@ -117,12 +131,8 @@ where
 {
     type Pos = BlockPosition;
 
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, E)>> {
-        let stream = self
-            .indexed_stream()
-            .await?
-            .map(|(block, event)| (BlockPosition(block), event));
-        Ok(Box::pin(stream))
+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, Indexed<BlockPosition, E>>> {
+        self.indexed_stream().await
     }
 
     async fn query_range(
@@ -163,20 +173,34 @@ mod tests {
         }
     }
 
-    /// On a reorg, nodes re-send previously delivered logs with
-    /// `removed: true` to signal *retraction*. Treating one as a fresh event
-    /// would hand strategies a second occurrence of something that no longer
-    /// happened — and persist a duplicate row that replays forever after.
+    /// A `removed: true` log becomes an [`Indexed::Retract`] on the live path
+    /// (see [`live_item`]); one with no block number cannot be positioned and
+    /// is skipped.
     #[test]
-    fn removed_logs_are_retractions_not_events() {
-        assert_eq!(indexed_event((), &log_at(Some(5), true)), None);
+    fn removed_logs_become_retractions_on_the_live_path() {
+        assert_eq!(
+            live_item((), &log_at(Some(5), true)),
+            Some(Indexed::Retract(BlockPosition(5)))
+        );
+        assert_eq!(live_item((), &log_at(None, true)), None);
     }
 
     /// A live log carries its block number through; one with no block number
     /// cannot be indexed and is skipped.
     #[test]
     fn live_logs_carry_their_block_number() {
+        assert_eq!(
+            live_item((), &log_at(Some(5), false)),
+            Some(Indexed::Event(BlockPosition(5), ()))
+        );
+        assert_eq!(live_item((), &log_at(None, false)), None);
+    }
+
+    /// A historical `query_range` snapshot never carries retractions: a
+    /// removed log there is simply not part of the canonical range.
+    #[test]
+    fn historical_removed_logs_are_dropped() {
+        assert_eq!(indexed_event((), &log_at(Some(5), true)), None);
         assert_eq!(indexed_event((), &log_at(Some(5), false)), Some((5, ())));
-        assert_eq!(indexed_event((), &log_at(None, false)), None);
     }
 }

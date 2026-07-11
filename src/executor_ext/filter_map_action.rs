@@ -11,8 +11,6 @@ pub struct FilterMapAction<A, F> {
 }
 
 impl<A, F> FilterMapAction<A, F> {
-    /// Creates a new `FilterMapAction` wrapping `executor` with the routing
-    /// function `f`.
     pub fn new(executor: Box<dyn Executor<A>>, f: F) -> Self {
         Self { executor, f }
     }

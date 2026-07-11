@@ -24,15 +24,9 @@ pub struct ReconnectConfig {
     /// `base_delay * 2^N`.
     pub base_delay: Duration,
     /// How long a stream must have stayed open before it ended for the end to
-    /// count as a *healthy* drop rather than a failure. A stream that lived at
-    /// least this long is treated as a connection the provider merely recycled
-    /// (load-balanced RPC WebSocket endpoints routinely close idle/long-lived
-    /// subscriptions after a TTL), so its end resets the consecutive-failure
-    /// counter — exactly like a delivered event — instead of advancing it toward
-    /// [`Fatal`](Decision::Fatal). A stream that ends sooner is a flap or a
-    /// never-opening zombie and still counts. The driver measures the uptime and
-    /// hands it to [`on_stream_ended`](ReconnectPolicy::on_stream_ended); the
-    /// policy keeps no clock.
+    /// count as a *healthy* drop rather than a failure. See
+    /// [`on_stream_ended`](ReconnectPolicy::on_stream_ended) for the full
+    /// contract; the driver measures the uptime, the policy keeps no clock.
     pub healthy_uptime: Duration,
 }
 
@@ -68,7 +62,6 @@ pub struct ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    /// Creates a policy with the given configuration.
     pub fn new(config: ReconnectConfig) -> Self {
         Self {
             config,
@@ -76,10 +69,11 @@ impl ReconnectPolicy {
         }
     }
 
-    /// Records that the collector delivered a real event. This is the *only*
-    /// thing that resets the failure counter: a stream that connects but never
-    /// delivers must still march toward [`Fatal`](Decision::Fatal), so an
-    /// orchestrator restarts the process rather than leaving a silent zombie.
+    /// Records that the collector delivered a real event, resetting the
+    /// failure counter. A stream that connects but never delivers (and never
+    /// reaches [`healthy_uptime`](ReconnectConfig::healthy_uptime)) still
+    /// marches toward [`Fatal`](Decision::Fatal), so an orchestrator restarts
+    /// the process rather than leaving a silent zombie.
     pub fn on_events_received(&mut self) {
         self.failures = 0;
     }

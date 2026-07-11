@@ -48,10 +48,13 @@ where
     }
 
     async fn process_event(&mut self, event: E) -> Result<ActionStream<'_, A>> {
+        // A poisoned lock still holds a valid `Option<Instant>` (the panicking
+        // thread can only have completed or skipped the store), so recover the
+        // value rather than propagating the panic.
         let cooling = self
             .last_fired
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some_and(|fired| fired.elapsed() < self.duration);
         // The inner strategy processes the event either way, so its state
         // stays current through the cooldown.
@@ -66,7 +69,9 @@ where
         // not refresh the cooldown.
         let last_fired = &self.last_fired;
         Ok(Box::pin(stream.inspect(move |_| {
-            *last_fired.lock().unwrap() = Some(Instant::now());
+            *last_fired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         })))
     }
 }

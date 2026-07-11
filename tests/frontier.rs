@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use artemis_light::persistence::{
-    BlockPosition, PAYLOAD_COLUMN, PersistExt, PersistableCollector, Position, Row, SqlType,
-    SqlValue, SqliteStore, Store, TableSchema, TimeFrontier,
+    BlockPosition, Indexed, PAYLOAD_COLUMN, PersistExt, PersistableCollector, Position, Row,
+    SqlType, SqlValue, SqliteStore, Store, TableSchema, TimeFrontier,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -100,11 +100,20 @@ impl FakeFrontierCollector {
 impl PersistableCollector<LedgerEvent> for FakeFrontierCollector {
     type Pos = TimeFrontier;
 
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (TimeFrontier, LedgerEvent)>> {
+    async fn subscribe_indexed(
+        &self,
+    ) -> Result<CollectorStream<'_, Indexed<TimeFrontier, LedgerEvent>>> {
         // Bounded (`with_to_block`) runs never poll the live tail; the scripted
-        // entries are returned here anyway so the collector is complete on its own.
-        let items: Vec<(TimeFrontier, LedgerEvent)> =
-            self.events.iter().map(|(t, h)| Self::item(*t, h)).collect();
+        // entries are returned here anyway so the collector is complete on its
+        // own. An append-only ledger feed never reorgs, so no `Retract` items.
+        let items: Vec<Indexed<TimeFrontier, LedgerEvent>> = self
+            .events
+            .iter()
+            .map(|(t, h)| {
+                let (position, event) = Self::item(*t, h);
+                Indexed::Event(position, event)
+            })
+            .collect();
         Ok(Box::pin(futures::stream::iter(items)))
     }
 
@@ -328,7 +337,7 @@ async fn frontier_resume_point_round_trips_with_no_gap() {
     );
 
     // No gap: every distinct identity across both runs is stored, none skipped.
-    // Discriminating on 0xc2 — a NEW identity AT the resume boundary instant
+    // The key assertion is 0xc2 — a NEW identity AT the resume boundary instant
     // 2000: it is present only because the backfill re-read the boundary
     // (resume_key = the boundary itself, not last+1). A "+1" resume would have
     // skipped instant 2000 entirely, losing 0xc2 and leaving a gap.
@@ -371,7 +380,7 @@ async fn re_observed_frontier_event_has_exactly_one_row() {
 }
 
 /// A corrupt / wrong-typed stored position must fail the subscribe loudly
-/// (`MalformedStoredPosition`), never silently re-sync from genesis. Seeds a
+/// (the `Position::decode` failure propagated verbatim), never silently re-sync from genesis. Seeds a
 /// decimal position cell (as an old BlockPosition archive would hold) and reads
 /// it back under a `TimeFrontier` subscription — the JSON decode fails verbatim.
 #[tokio::test]

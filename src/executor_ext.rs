@@ -33,6 +33,7 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     /// Route only matching actions to this executor: `f` projects each engine
     /// action down to this executor's action type. A `None` action is skipped
     /// with `Ok(())` — the inner executor never sees it.
+    #[must_use]
     fn filter_map_action<F, A2>(self, f: F) -> FilterMapAction<A, F>
     where
         F: Fn(A2) -> Option<A> + Send + Sync + 'static,
@@ -40,15 +41,10 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
         FilterMapAction::new(Box::new(self), f)
     }
 
-    /// Re-submit failed actions with exponential backoff, per `policy`.
-    /// Transient RPC failures are the common case for a submission sink, so
-    /// most executors want this layer near the bottom of the stack. One
-    /// exception to "innermost": the retry loop re-submits on the executor
-    /// *inside* it, so a [`rate_limit`](ExecutorExt::rate_limit) outside it
-    /// charges up to `1 + max_retries` real submissions to one window slot —
-    /// to have the cap count every attempt, put the limit inside:
-    /// `executor.rate_limit(n).retry(p)` (retries then wait out the window
-    /// like any other submission).
+    /// Re-submit failed actions with exponential backoff, per `policy`. See
+    /// [`Retry`] for how it interacts with an outside
+    /// [`rate_limit`](ExecutorExt::rate_limit).
+    #[must_use]
     fn retry(self, policy: RetryPolicy) -> Retry<A> {
         Retry::new(Box::new(self), policy)
     }
@@ -56,6 +52,7 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     /// Try this executor first; on error, re-submit the action to `other` —
     /// primary RPC → backup RPC, or private relay → public mempool. The
     /// primary's error is logged; only the fallback's verdict is returned.
+    #[must_use]
     fn fallback<E2>(self, other: E2) -> Fallback<A>
     where
         E2: Executor<A> + 'static,
@@ -64,12 +61,8 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     }
 
     /// Cap submissions to `per_second` per sliding second, to respect
-    /// provider limits. An action over the cap waits rather than being
-    /// dropped *by this wrapper*; the wait stalls the executor task, and
-    /// actions queued behind it in the lossy broadcast action channel can be
-    /// dropped if the ring wraps — size the engine's `action_channel_capacity`
-    /// for the expected backlog. A [`NonZeroU32`](std::num::NonZeroU32) rules
-    /// out a zero cap.
+    /// provider limits. See [`RateLimit`] for the backpressure contract.
+    #[must_use]
     fn rate_limit(self, per_second: std::num::NonZeroU32) -> RateLimit<A> {
         RateLimit::new(Box::new(self), per_second)
     }
@@ -79,6 +72,7 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     /// [`handle`](CircuitBreaker::handle) before handing the executor to the
     /// engine. A [`NonZeroU32`](std::num::NonZeroU32) rules out a zero
     /// threshold (a circuit that starts open).
+    #[must_use]
     fn circuit_breaker(self, max_failures: std::num::NonZeroU32) -> CircuitBreaker<A> {
         CircuitBreaker::new(Box::new(self), max_failures)
     }
@@ -86,6 +80,7 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     /// Guard this executor with a kill switch the caller keeps: while `flag`
     /// is `true` actions execute normally; while it is `false` they are
     /// logged and dropped with `Ok(())`.
+    #[must_use]
     fn gated(self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Gated<A> {
         Gated::new(Box::new(self), flag)
     }
@@ -93,21 +88,17 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     /// Paper-trading mode: every action is logged and dropped; none ever
     /// reach this executor. A [`gated`](ExecutorExt::gated) whose flag is
     /// permanently off.
+    #[must_use]
     fn dry_run(self) -> Gated<A> {
         self.gated(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )))
     }
 
-    /// Drop actions whose deadline has passed instead of submitting them:
-    /// the deadline travels with each action via [`Expires`], stamped by the
-    /// strategy that priced it. Place it innermost in the reliability stack —
-    /// the check runs at every `execute`, so every queueing or waiting layer
-    /// outside has already elapsed, and each [`retry`](ExecutorExt::retry)
-    /// attempt re-checks. An expired action is logged and dropped with
-    /// `Ok(())`: invisible to `retry` and
-    /// [`circuit_breaker`](ExecutorExt::circuit_breaker), because expiry is
-    /// normal operation, not a fault.
+    /// Drop actions whose [`Expires`] deadline has passed instead of
+    /// submitting them. Place it innermost in the reliability stack; see
+    /// [`Deadline`] for the full contract.
+    #[must_use]
     fn deadline(self) -> Deadline<A>
     where
         A: Expires,
@@ -116,12 +107,9 @@ pub trait ExecutorExt<A>: Executor<A> + Send + Sync + Sized + 'static {
     }
 
     /// Publish each action's verdict to `outcomes` after submitting it, then
-    /// return the inner executor's result unchanged. Transparent — it never
-    /// alters control flow — so it composes anywhere; place it outermost to
-    /// report the stack's final post-retry/post-fallback verdict. Pair it with
-    /// a [`ChannelCollector`](crate::collectors::ChannelCollector) over the
-    /// same channel to feed verdicts back to strategies as events. Reporting
-    /// is best-effort: a dropped receiver is logged and ignored.
+    /// return the inner executor's result unchanged. Place it outermost for
+    /// the stack's final verdict; see [`Report`] for the full contract.
+    #[must_use]
     fn report(self, outcomes: tokio::sync::broadcast::Sender<ExecutionOutcome<A>>) -> Report<A>
     where
         A: Clone,

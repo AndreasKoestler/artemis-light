@@ -26,6 +26,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
     /// projects each engine event down to this strategy's event type,
     /// returning `None` for events this strategy doesn't consume. A `None`
     /// event yields an empty action stream — it is not an error.
+    #[must_use]
     fn filter_map_event<F, E2>(self, f: F) -> FilterMapEvent<E, A, F>
     where
         F: Fn(E2) -> Option<E> + Send + Sync + 'static,
@@ -35,6 +36,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
 
     /// Lift this strategy's actions into a wider action type `A2` — typically
     /// an umbrella-enum constructor: `.map_action(Action::Submit)`.
+    #[must_use]
     fn map_action<F, A2>(self, f: F) -> MapAction<E, A, F>
     where
         F: Fn(A) -> A2 + Send + Sync + 'static,
@@ -46,6 +48,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
     /// — minimum profit, maximum notional, allowlisted targets. As a
     /// combinator the risk policy is visible at composition time rather than
     /// buried inside strategy logic.
+    #[must_use]
     fn filter_actions<P>(self, predicate: P) -> FilterActions<E, A, P>
     where
         P: Fn(&A) -> bool + Send + Sync + 'static,
@@ -56,6 +59,7 @@ pub trait StrategyExt<E, A>: Strategy<E, A> + Send + Sync + Sized + 'static {
     /// Suppress this strategy's actions for `duration` after it fires. A
     /// cooling strategy still sees every event — only its actions are
     /// dropped — and an actionless event does not start the cooldown.
+    #[must_use]
     fn cooldown(self, duration: std::time::Duration) -> Cooldown<E, A> {
         Cooldown::new(Box::new(self), duration)
     }

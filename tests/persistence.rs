@@ -12,8 +12,8 @@ use alloy::sol;
 use anyhow::Result;
 use artemis_light::collectors::EventCollector;
 use artemis_light::persistence::{
-    BlockPosition, Column, PersistExt, PersistableCollector, Record, Row, SqlType, SqlValue,
-    SqliteStore, Store, TableSchema,
+    BlockPosition, Column, Indexed, PersistExt, PersistableCollector, Record, Row, SqlType,
+    SqlValue, SqliteStore, Store, TableSchema,
 };
 use artemis_light::types::{Collector, CollectorStream};
 use async_trait::async_trait;
@@ -122,11 +122,13 @@ fn value_event(value: u64) -> ValueSet {
 impl PersistableCollector<ValueSet> for FakeCollector {
     type Pos = BlockPosition;
 
-    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (BlockPosition, ValueSet)>> {
+    async fn subscribe_indexed(
+        &self,
+    ) -> Result<CollectorStream<'_, Indexed<BlockPosition, ValueSet>>> {
         let events: Vec<_> = self
             .live
             .iter()
-            .map(|&(b, v)| (BlockPosition(b), value_event(v)))
+            .map(|&(b, v)| Indexed::Event(BlockPosition(b), value_event(v)))
             .collect();
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -240,7 +242,7 @@ async fn sqlite_store_uses_wal_for_file_databases() {
     assert_eq!(mode.to_lowercase(), "wal");
 }
 
-/// Slice 1: a written block can be read back via `replay`.
+/// A written block can be read back via `replay`.
 #[tokio::test]
 async fn write_block_then_replay_reads_rows_back() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
@@ -268,7 +270,7 @@ async fn write_block_then_replay_reads_rows_back() {
     );
 }
 
-/// Slice 2: `stored_position` reports the highest written block, `None` when empty.
+/// `stored_position` reports the highest written block, `None` when empty.
 #[tokio::test]
 async fn last_block_tracks_highest_written_block() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
@@ -307,7 +309,7 @@ async fn last_block_tracks_highest_written_block() {
     );
 }
 
-/// Slice 3: a failing row in a batch rolls back the whole block, leaving prior
+/// A failing row in a batch rolls back the whole block, leaving prior
 /// committed data and the last processed block untouched.
 #[tokio::test]
 async fn write_block_is_atomic_on_failure() {
@@ -350,7 +352,7 @@ async fn write_block_is_atomic_on_failure() {
     );
 }
 
-/// Slice 4: a Record without a declared schema is a best guess from the event
+/// A Record without a declared schema is a best guess from the event
 /// type — table name from the Solidity signature, columns frozen from the
 /// first encoded event (named after its fields, ordered deterministically by
 /// field name), no schema reported before that.
@@ -512,7 +514,7 @@ fn decode_errors_on_unreadable_text() {
     assert!(record.decode("not a valid payload").is_err());
 }
 
-/// Slice 7: a `Persisted` collector records live events one transaction per
+/// A `Persisted` collector records live events one transaction per
 /// complete block, while passing the plain events downstream. The final
 /// in-progress block stays unflushed (no higher block seen yet), so a restart
 /// re-fetches it.
@@ -551,7 +553,7 @@ async fn seed(store: &SqliteStore, block: u64, value: u64) {
         .unwrap();
 }
 
-/// Slice 8: on subscribe, stored history is replayed first (reconstructed from
+/// On subscribe, stored history is replayed first (reconstructed from
 /// the database), then the live tip follows — a single chained stream.
 #[tokio::test]
 async fn persisted_replays_db_then_live() {
@@ -568,7 +570,7 @@ async fn persisted_replays_db_then_live() {
     assert_eq!(events, vec![value_event(1), value_event(2), value_event(3)]);
 }
 
-/// Slice 9: the RPC gap between the last stored block and the tip is backfilled
+/// The RPC gap between the last stored block and the tip is backfilled
 /// and chained as [DB replay][backfill][live]. Backfilled blocks are persisted;
 /// the open live block is not.
 #[tokio::test]
@@ -800,7 +802,7 @@ async fn mid_backfill_chunk_failure_ends_the_stream_without_corrupting_progress(
     assert_eq!(stored_values(&store).await, vec!["0x1".to_string()]);
 }
 
-/// Slice 5: a schema override declared on the Persisted Collector changes the
+/// A schema override declared on the Persisted Collector changes the
 /// table name and column types; events persist under the overridden table.
 #[tokio::test]
 async fn override_schema_redirects_table_and_types() {
@@ -834,7 +836,7 @@ async fn override_schema_redirects_table_and_types() {
     assert_eq!(rows, vec![Row(vec![SqlValue::Text("0x7".into())])]);
 }
 
-/// Slice 10: against a real chain, an `EventCollector` wrapped with persistence
+/// Against a real chain, an `EventCollector` wrapped with persistence
 /// forwards typed events downstream and records them with their block numbers.
 #[tokio::test]
 async fn event_collector_with_persistence_records_against_anvil() {
@@ -1398,7 +1400,7 @@ async fn pre_migration_archive_resumes_to_the_same_block() {
 /// Migration error path: a `position` cell that
 /// `BlockPosition::decode` cannot parse (a wrong-typed / corrupt value, e.g. a
 /// JSON frontier read back under a block store) surfaces as a loud read error
-/// (`MalformedStoredPosition`, the `Position::decode` failure propagated verbatim),
+/// (the `Position::decode` failure propagated verbatim),
 /// never a silent genesis re-sync.
 #[tokio::test]
 async fn malformed_position_cell_errors_on_read() {

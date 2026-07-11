@@ -57,7 +57,7 @@ The **Engine** fans-out every event to every strategy via a `tokio::sync::broadc
 | **Collector** | `BlockCollector` | Subscribes to new blocks via WebSocket (falls back to polling) |
 | | `MempoolCollector` | Subscribes to pending transactions in the mempool |
 | | `LogCollector` | Subscribes to on-chain event logs matching a filter |
-| | `EventCollector` | Subscribes to an arbitrary `alloy` subscription |
+| | `EventCollector` | Subscribes to a typed `alloy` contract event filter, decoding one `SolEvent` type |
 | **Strategy** | `Strategy<E, A>` | User-defined: receives events, produces action streams |
 | **Executor** | `MempoolExecutor` | Submits EIP-1559-priced transactions to the public mempool; optionally watches for confirmation and replaces a stuck transaction at an escalated fee |
 | **Observer** | `Observer<E, A>` | Passive consumer of every event and action crossing the channels |
@@ -105,8 +105,8 @@ nor keeps a retry loop alive:
 let executor = mempool_executor
     .deadline()
     .retry(RetryPolicy::default())
-    .rate_limit(5)
-    .circuit_breaker(3)
+    .rate_limit(NonZeroU32::new(5).unwrap())
+    .circuit_breaker(NonZeroU32::new(3).unwrap())
     .gated(kill_switch);
 ```
 
@@ -195,7 +195,8 @@ On `subscribe`, a `Persisted` collector chains three segments into one stream:
 
 Events must be `serde::Serialize + Deserialize`. The table name and columns are
 derived from the event's Solidity signature and field names; register a
-`TableSchema` override on the store to rename or retype columns. A full lossless
+`TableSchema` override on the `Persisted` wrapper (`.try_with_schema(..)`) to
+rename or retype columns. A full lossless
 JSON payload is stored alongside the derived columns so replay reconstructs the
 exact event. Writes are one transaction per complete block, and the stored block
 height only advances over a gap-free prefix.
@@ -209,7 +210,9 @@ By default a block is persisted once the next block arrives. Set
 `.with_confirmation_depth(n)` to persist a block only once it is `n` blocks
 deep: events are still delivered to strategies live and immediately, but the
 write to the store lags `n` blocks, so a reorg shallower than `n` is corrected
-in the buffer before any orphaned row is written. A reorg deeper than `n` halts
+in the buffer before any orphaned row is written — including a same-height
+reorg (block `N` replaced by `N′`), which the node signals with `removed` logs
+that the pipeline turns into buffer retractions. A reorg deeper than `n` halts
 persistence and a restart re-syncs, so choose `n` above the deepest reorg you
 expect. [`examples/confirmation_depth_example.rs`](examples/confirmation_depth_example.rs)
 shows the resulting write lag (`cargo run --example confirmation_depth_example`).
@@ -255,7 +258,7 @@ cargo run --example hypercore_ledger_example
 the generic `Position` trait. **The breaking surface is confined to the `Store`
 and `PersistableCollector` traits** (plus the internal `Dialect` seam). If you
 only use the built-ins — `EventCollector`, `SqliteStore`, `PostgresStore`,
-`with_persistence` / `persisted!` over a `SolEvent` — **your code is
+`with_persistence` / `.persisted(..)` / `persisted_event_collector!` over a `SolEvent` — **your code is
 source-compatible and needs no changes**: `Store` and `PersistableCollector`
 default their position type to `BlockPosition`, so `dyn Store` and `S: Store`
 still mean `Store<BlockPosition>`, and the concrete store aliases are unchanged.
@@ -287,16 +290,20 @@ type, and stays atomic with the row write.
 -    async fn query_range(&self, from: u64, to: u64) -> Result<CollectorStream<'_, (u64, MyEvent)>> { .. }
 -    async fn tip(&self) -> Result<u64> { .. }
 +    type Pos = BlockPosition;  // or your custom Position
-+    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, (Self::Pos, MyEvent)>> { .. }
++    async fn subscribe_indexed(&self) -> Result<CollectorStream<'_, Indexed<Self::Pos, MyEvent>>> { .. }
 +    async fn query_range(&self, from: Self::Pos, to: Self::Pos) -> Result<CollectorStream<'_, (Self::Pos, MyEvent)>> { .. }
 +    async fn tip(&self) -> Result<Self::Pos> { .. }
  }
 ```
 
-`tip()` now returns the current frontier / finality boundary as a `Pos`, and the
-`(Pos, E)` pairs replace the old `(u64, E)`. For a block source, set
-`type Pos = BlockPosition` and wrap/unwrap `u64` at the boundary
-(`BlockPosition(n)` / `position.sort_key()`).
+`tip()` now returns the current frontier / finality boundary as a `Pos`, and
+positioned items replace the old `(u64, E)` pairs. The live stream's item is
+`Indexed<Pos, E>` — yield `Indexed::Event(pos, event)` for each event, and
+`Indexed::Retract(pos)` when the source signals a reorg retraction (an EVM
+node's `removed` log); a source with no retraction signal simply never yields
+one. `query_range` still yields plain `(Pos, E)` pairs — a historical snapshot
+carries no retractions. For a block source, set `type Pos = BlockPosition` and
+wrap/unwrap `u64` at the boundary (`BlockPosition(n)` / `position.sort_key()`).
 
 ### Worked port of a custom `Store`
 
@@ -323,7 +330,8 @@ impl Store for MyStore {           // `Store` == `Store<BlockPosition>` by defau
         let next = BlockPosition::advance(prev, position);
         self.upsert_progress(&mut tx, &schema.table, next.sort_key(), &next.encode()).await?;
 
-        tx.commit().await
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn stored_position(&self, table: &str) -> Result<Option<BlockPosition>> {
@@ -335,7 +343,6 @@ impl Store for MyStore {           // `Store` == `Store<BlockPosition>` by defau
     async fn replay(&self, schema: &TableSchema, up_to: BlockPosition) -> Result<Vec<Row>> {
         let to = up_to.sort_key();  // was the `to: u64` argument
         // ... SELECT rows with sort_key <= `to`, ascending ...
-        # Ok(vec![])
     }
 }
 ```

@@ -148,9 +148,23 @@ where
     pub(super) async fn finish(&mut self) {
         if self.core.healthy()
             && let Some(cur) = self.current.take()
+            && self
+                .core
+                .flush(cur.clone(), std::mem::take(&mut self.buffer))
+                .await
         {
-            self.core.flush(cur, std::mem::take(&mut self.buffer)).await;
+            // Fold the trailing group too, so the watermark handed to the
+            // confirmation window covers everything this writer stored.
+            self.watermark = Some(P::advance(self.watermark.take(), cur));
         }
+    }
+
+    /// The finalized watermark after [`finish`](Self::finish): everything this
+    /// writer stored, folded over the seed. The window above the settled range
+    /// absorbs it so a live re-delivery of a boundary-instant identity dedupes
+    /// instead of storing a second row.
+    pub(super) fn watermark(&self) -> Option<P> {
+        self.watermark.clone()
     }
 
     /// Rows currently buffered for the open group.
@@ -263,10 +277,10 @@ mod tests {
         BlockWriter::new(store, record(), seed)
     }
 
-    /// DEDUP.1/.2: a re-observed identity already covered by the open group's
+    /// A re-observed identity already covered by the open group's
     /// fold is suppressed downstream (`record` returns false) and stored zero
     /// additional times — exactly-once persisted effect over an at-least-once
-    /// re-read. Discriminating: without the dedupe skip, `total_rows` would be 2.
+    /// re-read. Without the dedupe skip, `total_rows` would be 2.
     #[tokio::test]
     async fn dedupe_skip_stores_one_row_and_suppresses_downstream() {
         let store = RecordingStore::<TestFrontier>::default();
@@ -293,7 +307,7 @@ mod tests {
         );
     }
 
-    /// DEDUP.1/.2: the backfill watermark seeded from the stored position
+    /// The backfill watermark seeded from the stored position
     /// dedupes an overlapping re-read while still storing a genuinely new
     /// identity at the same instant — the real resume/overlap scenario.
     #[tokio::test]
@@ -357,7 +371,7 @@ mod tests {
 
     /// The open group folds (unions) every event sharing one sort key into a
     /// single group whose position is the union of their identities.
-    /// Discriminating: an overwrite or first-wins fold would leave a singleton.
+    /// An overwrite or first-wins fold would leave a singleton.
     #[tokio::test]
     async fn same_key_group_fold_unions_events() {
         let store = RecordingStore::<TestFrontier>::default();
