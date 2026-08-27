@@ -168,7 +168,7 @@ macro_rules! persisted_event_collector {
 
 /// The default upper bound on positions (by sort key) per backfill `query_range`
 /// call. Sized to fit within common provider `eth_getLogs` range caps.
-const DEFAULT_BACKFILL_CHUNK_SIZE: u64 = 10_000;
+const DEFAULT_BACKFILL_CHUNK_SIZE: u64 = 1_000;
 
 /// A [`PersistableCollector`] paired with a [`Store`].
 pub struct Persisted<C, S> {
@@ -278,7 +278,7 @@ impl<C, S> Persisted<C, S> {
     }
 
     /// Slice the backfill into `query_range` windows of at most `blocks`
-    /// positions (by sort key, default 10,000), queried one at a
+    /// positions (by sort key, default 1,000), queried one at a
     /// time, so no single RPC call exceeds provider range caps or buffers an
     /// unbounded result. A [`NonZeroU64`] makes a zero-width chunk (which could
     /// never make progress) unrepresentable at the call site.
@@ -592,10 +592,10 @@ where
     // Eager first window: a window that can't be queried at all fails the
     // subscribe (feeding the Reconnect Policy). A provider response-size cap is
     // *not* such a failure — `query_range_split` bisects and retries it.
-    let first = query_range_split(collector, from, first_to).await?;
+    let mut first = query_range_split(collector, from, first_to).await?;
 
     let stream = async_stream::stream! {
-        for item in first {
+        while let Some(item) = first.next().await {
             yield item;
         }
         let mut next_from = first_to.saturating_add(1);
@@ -604,8 +604,8 @@ where
         while next_from <= to {
             let next_to = window_end(next_from, to, chunk);
             match query_range_split(collector, next_from, next_to).await {
-                Ok(window) => {
-                    for item in window {
+                Ok(mut window) => {
+                    while let Some(item) = window.next().await {
                         yield item;
                     }
                 }
@@ -627,7 +627,7 @@ where
 /// The boxed, position-indexed result future of one (possibly bisected)
 /// backfill window query -- factored out to keep the recursive
 /// `query_range_split` signature under the type-complexity bar.
-type WindowFuture<'a, P, E> = futures::future::BoxFuture<'a, Result<Vec<(P, E)>>>;
+type WindowFuture<'a, P, E> = futures::future::BoxFuture<'a, Result<CollectorStream<'a, (P, E)>>>;
 
 /// Query the inclusive sort-key range `[from ..= to]`, **bisecting and
 /// retrying** when the provider rejects the window for exceeding its
@@ -652,13 +652,7 @@ where
             <C::Pos as Position>::from_sort_key(to),
         );
         match query.await {
-            Ok(mut stream) => {
-                let mut events = Vec::new();
-                while let Some(item) = stream.next().await {
-                    events.push(item);
-                }
-                Ok(events)
-            }
+            Ok(stream) => Ok(stream),
             Err(e) if from < to && is_response_size_error(&e) => {
                 let mid = from + (to - from) / 2;
                 tracing::warn!(
@@ -667,10 +661,10 @@ where
                     to,
                     "splitting backfill window over provider response-size cap: {e}"
                 );
-                let mut lo = query_range_split(collector, from, mid).await?;
+                let lo = query_range_split(collector, from, mid).await?;
                 let hi = query_range_split(collector, mid + 1, to).await?;
-                lo.extend(hi);
-                Ok(lo)
+                let joined: CollectorStream<'a, (C::Pos, E)> = Box::pin(lo.chain(hi));
+                Ok(joined)
             }
             Err(e) => Err(e),
         }

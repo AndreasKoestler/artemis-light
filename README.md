@@ -201,10 +201,11 @@ JSON payload is stored alongside the derived columns so replay reconstructs the
 exact event. Writes are one transaction per complete block, and the stored block
 height only advances over a gap-free prefix.
 
-The backfill is sliced into bounded `eth_getLogs` windows (default 10,000
+The backfill is sliced into bounded `eth_getLogs` windows (default 1,000
 blocks, `.with_backfill_chunk_size(..)`) so no single call exceeds provider
-range caps, and `.with_start_block(..)` sets where the very first sync begins
-instead of genesis.
+range caps; a window a provider still refuses on volume is bisected and
+retried, streaming through rather than buffering. `.with_start_block(..)` sets
+where the very first sync begins instead of genesis.
 
 By default a block is persisted once the next block arrives. Set
 `.with_confirmation_depth(n)` to persist a block only once it is `n` blocks
